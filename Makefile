@@ -1,6 +1,6 @@
 .PHONY: fleet
 
-STAGE_DIR = stage
+STAGE_DIR = neuvector/stage
 BASE_IMAGE_TAG = latest
 BUILD_IMAGE_TAG = latest
 
