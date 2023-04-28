@@ -33,6 +33,7 @@ const CLUSLockScannerKey string = CLUSLockStore + "scanner"
 const CLUSLockCrdQueueKey string = CLUSLockStore + "crd_queue"
 const CLUSLockCloudKey string = CLUSLockStore + "cloud"
 const CLUSLockFedScanDataKey string = CLUSLockStore + "fed_scan_data"
+const CLUSLockApikeyKey string = CLUSLockStore + "apikey"
 
 //const CLUSLockResponseRuleKey string = CLUSLockStore + "response_rule"
 
@@ -69,6 +70,7 @@ const (
 	CFGEndpointVulnerability    = "vulnerability"
 	CFGEndpointUserRole         = "user_role"
 	CFGEndpointPwdProfile       = "pwd_profile"
+	CFGEndpointApikey           = "apikey"
 )
 const CLUSConfigStore string = CLUSObjectStore + "config/"
 const CLUSConfigSystemKey string = CLUSConfigStore + CFGEndpointSystem
@@ -98,6 +100,7 @@ const CLUSConfigVulnerabilityStore string = CLUSConfigStore + CFGEndpointVulnera
 const CLUSConfigDomainStore string = CLUSConfigStore + CFGEndpointDomain + "/"
 const CLUSConfigUserRoleStore string = CLUSConfigStore + CFGEndpointUserRole + "/"
 const CLUSConfigPwdProfileStore string = CLUSConfigStore + CFGEndpointPwdProfile + "/"
+const CLUSConfigApikeyStore string = CLUSConfigStore + CFGEndpointApikey + "/"
 
 // !!! NOTE: When adding new config items, update the import/export list as well !!!
 
@@ -123,6 +126,7 @@ const CLUSThrottledEventStore string = CLUSObjectStore + "throttled/"
 // network
 const PolicyIPRulesDefaultName string = "GroupIPRules"
 const PolicyIPRulesVersionID string = "NeuVectorPolicyVersion" // used for indicate policy version changed
+const DlpRulesVersionID string = "NeuVectorDlpVersion"         // used for indicate dlp version changed
 const DlpRulesDefaultName string = "DlpWorkloadRules"
 const DlpRuleName string = "dlprule"
 const DlpRuleStore string = CLUSNetworkStore + DlpRuleName + "/"
@@ -201,6 +205,7 @@ const CLUSScannerDBStore string = CLUSScanStore + "database/"
 
 //recalculate
 const CLUSRecalPolicyStore string = CLUSRecalculateStore + "policy/" //not to be watched by consul
+const CLUSRecalDlpStore string = CLUSRecalculateStore + "dlp/"       //not to be watched by consul
 
 func CLUSPolicyIPRulesKey(name string) string {
 	return fmt.Sprintf("%s%s", CLUSNetworkStore, name)
@@ -208,6 +213,10 @@ func CLUSPolicyIPRulesKey(name string) string {
 
 func CLUSRecalPolicyIPRulesKey(name string) string {
 	return fmt.Sprintf("%s%s", CLUSRecalPolicyStore, name)
+}
+
+func CLUSRecalDlpWlRulesKey(name string) string {
+	return fmt.Sprintf("%s%s", CLUSRecalDlpStore, name)
 }
 
 //fqdn
@@ -444,6 +453,10 @@ func CLUSFileAccessRuleNetworkKey(name string) string {
 	return fmt.Sprintf("%s%s", ProfileFileAccessStore, name)
 }
 
+func CLUSApikeyKey(name string) string {
+    return fmt.Sprintf("%s%s", CLUSConfigApikeyStore, name)
+}
+
 // Host ID is included in the workload key to helps us retrieve all workloads on a host
 // quickly. Without it, we have to loop through all workload keys; using agent ID is
 // also problematic, as a new agent has no idea of the agent ID when the workload
@@ -654,6 +667,7 @@ type CLUSSyslogConfig struct {
 	SyslogEnable     bool     `json:"syslog_enable"`
 	SyslogCategories []string `json:"syslog_categories"`
 	SyslogInJSON     bool     `json:"syslog_in_json"`
+	SyslogServerCert string   `json:"syslog_server_cert"`
 }
 
 type CLUSSystemUsageReport struct {
@@ -742,6 +756,8 @@ type CLUSSystemConfig struct {
 	CfgType              TCfgType                  `json:"cfg_type"`
 	NetServiceStatus     bool                      `json:"net_service_status"`
 	NetServicePolicyMode string                    `json:"net_service_policy_mode"`
+	DisableNetPolicy     bool                      `json:"disable_net_policy"`
+	DetectUnmanagedWl    bool                      `json:"detect_unmanaged_wl"`
 	ModeAutoD2M          bool                      `json:"mode_auto_d2m"`
 	ModeAutoD2MDuration  int64                     `json:"mode_auto_d2m_duration"`
 	ModeAutoM2P          bool                      `json:"mode_auto_m2p"`
@@ -807,10 +823,11 @@ type CLUSServerLDAP struct {
 
 type CLUSServerSAML struct {
 	CLUSServerAuth
-	SSOURL     string `json:"sso_url"`
-	Issuer     string `json:"issuer"`
-	X509Cert   string `json:"x509_cert,cloak"`
-	GroupClaim string `json:"group_claim"`
+	SSOURL        string   `json:"sso_url"`
+	Issuer        string   `json:"issuer"`
+	X509Cert      string   `json:"x509_cert,cloak"`
+	GroupClaim    string   `json:"group_claim"`
+	X509CertExtra []string `json:"x509_cert_extra"`
 }
 
 type CLUSServerOIDC struct {
@@ -996,6 +1013,7 @@ type CLUSCriteriaEntry struct {
 type CLUSFqdnIp struct {
 	FqdnName string   `json:"fqdn_name"`
 	FqdnIP   []net.IP `json:"fqdn_ip"`
+	Vhost    bool     `json:"vhost,omitempty"`
 }
 
 type TCfgType int
@@ -1092,6 +1110,7 @@ var CLUSWLModeGroup string = "nv.mode_group"
 var CLUSWLAddressGroup string = "nv.address_group"
 var CLUSHostAddrGroup string = "nv.hostaddr_group" //used as wlid for "nodes" in policy calculation
 var CLUSWLFqdnPrefix string = "fqdn:"
+var CLUSWLFqdnVhPrefix string = "vh:"
 var CLUSLearnedHostPrefix string = "Host:"
 var CLUSLearnedWorkloadPrefix string = "Workload:"
 var CLUSEndpointIngress string = "ingress"
@@ -1144,6 +1163,14 @@ type CLUSGroupIPPolicyVer struct {
 	RulesLen             int    `json:"rules_len"`
 	WorkloadSlot         int    `json:"workload_slot,omitempty"`
 	WorkloadLen          int    `json:"workload_len,omitempty"`
+}
+
+type CLUSDlpRuleVer struct {
+	Key             string `json:"key"`
+	DlpRulesVersion string `json:"dlp_version"`
+	SlotNo          int    `json:"slot_no"`
+	RulesLen        int    `json:"rules_len"`
+	WorkloadLen     int    `json:"workload_len"`
 }
 
 type CLUSSubnet struct {
@@ -1782,6 +1809,7 @@ type CLUSAdmissionRule struct { // see type RESTAdmissionRule
 	CfgType           TCfgType                `json:"cfg_type"`
 	RuleType          string                  `json:"rule_type"` // "exception", "deny"
 	UseAsRiskyRoleTag bool                    `json:"use_as_risky_role_tag"`
+	RuleMode          string                  `json:"rule_mode"` // "", "monitor", "protect"
 }
 
 type CLUSAdmissionRules struct {
@@ -2074,11 +2102,29 @@ type CLUSFedSettings struct { // stored on each cluster (master & joint cluster)
 }
 
 type CLUSFedClusterStatus struct {
-	Status int `json:"status"` // status of a joint cluster
+	Status            int       `json:"status"` // status of a joint cluster
+	CspType           TCspType  `json:"csp_type"`
+	Nodes             int       `json:"nodes"`               // total nodes count in this cluster
+	LastConnectedTime time.Time `json:"last_connected_time"` // only for master's connection status on joint cluster
 }
 
 type CLUSFedJoinedClusterList struct { // only available on master cluster
 	IDs []string `json:"ids,omitempty"` // all non-master clusters' id in the federation
+}
+
+type TCspType int
+
+const (
+	CSP_NONE = iota
+	CSP_EKS
+	CSP_GKE
+	CSP_AKS
+	CSP_IBM
+)
+
+type CLUSClusterCspUsage struct {
+	CspType TCspType `json:"csp_type"`
+	Nodes   int      `json:"nodes"` // total nodes count in this cluster
 }
 
 // fed ruleTypes' revision data. stored under object/config/federation/rules_revision
@@ -2650,4 +2696,18 @@ type CLUSCheckUpgradeInfo struct {
 // throttled events/logs
 type CLUSThrottledEvents struct {
 	LastReportTime map[TLogEvent]int64 `json:"last_report_at"` // key is event id, value is time.Unix()
+}
+
+type CLUSApikey struct {
+	ExpirationType      string              `json:"expiration_type"`
+	ExpirationHours     uint32              `json:"expiration_hours"`
+	Name                string              `json:"name"`
+	SecretKeyHash       string              `json:"secret_key_hash"`
+	Description         string              `json:"description"`
+	Locale              string              `json:"locale"`
+	Role                string              `json:"role"`
+	RoleDomains         map[string][]string `json:"role_domains"`
+	ExpirationTimestamp int64               `json:"expiration_timestamp"`
+	CreatedTimestamp    int64               `json:"created_timestamp"`
+	CreatedByEntity     string              `json:"created_by_entity"`	 // it could be username or apikey (access key)
 }

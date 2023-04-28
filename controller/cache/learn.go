@@ -297,6 +297,9 @@ func addConnectToGraph(conn *share.CLUSConnection, ca, sa *nodeAttr, stip *serve
 			// Check app action will be reported only if the session is already closed
 			// Treat this as action allow
 			conn.PolicyAction = C.DP_POLICY_ACTION_ALLOW
+		case C.DP_POLICY_ACTION_CHECK_VH:
+			// Treat this as action allow
+			conn.PolicyAction = C.DP_POLICY_ACTION_ALLOW
 		}
 	}
 
@@ -1241,6 +1244,10 @@ func startPolicyThread() {
 			case <-dlpCalculatingTimer.C:
 				updateDlpRuleNetwork()
 			case <-policyCalculatingTimer.C:
+				//check whether network policy is disabled
+				if getDisableNetPolicyStatus() {
+					continue
+				}
 				if isLeader() == false {
 					policyCalculated = false
 					continue

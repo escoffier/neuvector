@@ -94,6 +94,8 @@ var restErrWorkloadNotFound error = errors.New("Container is not found")
 var restErrAgentNotFound error = errors.New("Enforcer is not found")
 var restErrAgentDisconnected error = errors.New("Enforcer is disconnected")
 
+var checkCrdSchemaFunc func(lead, create bool, cspType share.TCspType) []string
+
 var restErrMessage = []string{
 	api.RESTErrNotFound:              "URL not found",
 	api.RESTErrMethodNotAllowed:      "Method not allowed",
@@ -124,7 +126,7 @@ var restErrMessage = []string{
 	api.RESTErrFailRegistryScan:      "Fail to scan registry",
 	api.RESTErrFailKubernetesApi:     "Kubernetes API error",
 	api.RESTErrAdmCtrlUnSupported:    "Admission control is not supported on non-Kubernetes environment",
-	api.RESTErrK8sNvRBAC:             "Kubernetes clusterrole/clusterrolebinding required for NeuVector is not configured correctly",
+	api.RESTErrK8sNvRBAC:             "Kubernetes RBAC settings required for NeuVector is not configured correctly",
 	api.RESTErrWebhookSvcForAdmCtrl:  "The neuvector-svc-admission-webhook service required for NeuVector Admission Control is not configured correctly",
 	api.RESTErrNoUpdatePermission:    "NeuVector controller doesn't have UPDATE permission for service resource",
 	api.RESTErrK8sApiSrvToWebhook:    "Failed to receive a request from Kube-apiserver. Please try different client mode",
@@ -1228,22 +1230,28 @@ func (l restLogger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type Context struct {
-	LocalDev         *common.LocalDevice
-	EvQueue          cluster.ObjectQueueInterface
-	AuditQueue       cluster.ObjectQueueInterface
-	Messenger        cluster.MessengerInterface
-	Cacher           cache.CacheInterface
-	Scanner          scan.ScanInterface
-	FedPort          uint
-	RESTPort         uint
-	PwdValidUnit     uint
-	TeleNeuvectorURL string
-	TeleCurrentVer   string
-	TeleFreq         uint
+	LocalDev           *common.LocalDevice
+	EvQueue            cluster.ObjectQueueInterface
+	AuditQueue         cluster.ObjectQueueInterface
+	Messenger          cluster.MessengerInterface
+	Cacher             cache.CacheInterface
+	Scanner            scan.ScanInterface
+	FedPort            uint
+	RESTPort           uint
+	PwdValidUnit       uint
+	TeleNeuvectorURL   string
+	TeleCurrentVer     string
+	TeleFreq           uint
+	CspType            share.TCspType
+	CspPauseInterval   uint // in minutes
+	CheckCrdSchemaFunc func(leader, create bool, cspType share.TCspType) []string
 }
+
+var cctx *Context
 
 // InitContext() must be called before StartRESTServer(), StartFedRestServer or AdmissionRestServer()
 func InitContext(ctx *Context) {
+	cctx = ctx
 	localDev = ctx.LocalDev
 	cacher = ctx.Cacher
 	scanner = ctx.Scanner
@@ -1259,6 +1267,7 @@ func InitContext(ctx *Context) {
 	_fedPort = ctx.FedPort
 	_fedServerChan = make(chan bool, 1)
 	crdEventProcTicker = time.NewTicker(crdEventProcPeriod)
+	checkCrdSchemaFunc = ctx.CheckCrdSchemaFunc
 
 	if ctx.PwdValidUnit < _pwdValidPerDayUnit && ctx.PwdValidUnit > 0 {
 		_pwdValidUnit = time.Duration(ctx.PwdValidUnit)
@@ -1620,6 +1629,16 @@ func StartRESTServer() {
 	r.PATCH("/v1/user_role/:name", handlerRoleConfig)
 	r.DELETE("/v1/user_role/:name", handlerRoleDelete)
 
+	// api key
+	r.GET("/v1/api_key", handlerApikeyList)
+	r.GET("/v1/api_key/:name", handlerApikeyShow)
+	r.POST("/v1/api_key", handlerApikeyCreate)
+	r.DELETE("/v1/api_key/:name", handlerApikeyDelete)
+	r.GET("/v1/selfapikey", handlerSelfApikeyShow) // Skip API document
+
+	// csp billing adapter integration
+	r.POST("/v1/csp/file/support", handlerCspSupportExport) // Skip API document. For downloading the tar ball that can be submitted to support portal
+
 	access.CompileUriPermitsMapping()
 
 	log.WithFields(log.Fields{"port": _restPort}).Info("Start REST server")
@@ -1671,6 +1690,7 @@ func startFedRestServer(fedPingInterval uint32) {
 	r.POST("/v1/fed/poll_internal", handlerPollFedRulesInternal)         // Skip API document, called from joint cluster to master cluster
 	r.POST("/v1/fed/scan_data_internal", handlerPollFedScanDataInternal) // Skip API document, called from joint cluster to master cluster
 	r.POST("/v1/fed/leave_internal", handlerLeaveFedInternal)            // Skip API document, called from joint cluster to master cluster
+	r.POST("/v1/fed/csp_support_internal", handlerCspSupportInternal)    // Skip API document, called from joint cluster to master cluster for collecting support config
 	r.GET("/v1/fed/healthcheck", handlerFedHealthCheck)                  // for fed master REST server health-check. no token required
 
 	config := &tls.Config{MinVersion: tls.VersionTLS11}

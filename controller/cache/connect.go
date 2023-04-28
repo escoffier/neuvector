@@ -41,6 +41,7 @@ const (
 	DP_POLICY_ACTION_OPEN      = C.DP_POLICY_ACTION_OPEN
 	DP_POLICY_ACTION_LEARN     = C.DP_POLICY_ACTION_LEARN
 	DP_POLICY_ACTION_ALLOW     = C.DP_POLICY_ACTION_ALLOW
+	DP_POLICY_ACTION_CHECK_VH  = C.DP_POLICY_ACTION_CHECK_VH
 	DP_POLICY_ACTION_CHECK_APP = C.DP_POLICY_ACTION_CHECK_APP
 	DP_POLICY_ACTION_VIOLATE   = C.DP_POLICY_ACTION_VIOLATE
 	DP_POLICY_ACTION_DENY      = C.DP_POLICY_ACTION_DENY
@@ -930,6 +931,11 @@ func preProcessConnect(conn *share.CLUSConnection) (*nodeAttr, *nodeAttr, *serve
 			ca.workload = true
 			ca.managed = true
 			return &ca, &sa, &stip, true
+		} else if conn.TmpOpen {
+			cctx.ConnLog.WithFields(log.Fields{
+				"client": net.IP(conn.ClientIP), "server": net.IP(conn.ServerIP),
+			}).Debug("Ignore ingress temporary open connection")
+			return &ca, &sa, &stip, false
 		} else if isDeviceIP(conn.ClientIP) {
 			cctx.ConnLog.WithFields(log.Fields{
 				"client": net.IP(conn.ClientIP), "server": net.IP(conn.ServerIP),
@@ -1003,6 +1009,11 @@ func preProcessConnect(conn *share.CLUSConnection) (*nodeAttr, *nodeAttr, *serve
 			sa.workload = true
 			sa.managed = true
 			return &ca, &sa, &stip, true
+		} else if conn.TmpOpen {
+			cctx.ConnLog.WithFields(log.Fields{
+				"client": net.IP(conn.ClientIP), "server": net.IP(conn.ServerIP),
+			}).Debug("Ignore egress temporary open connection")
+			return &ca, &sa, &stip, false
 		} else if isDeviceIP(conn.ServerIP) {
 			cctx.ConnLog.WithFields(log.Fields{
 				"client": net.IP(conn.ClientIP), "server": net.IP(conn.ServerIP),

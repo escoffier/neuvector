@@ -185,14 +185,15 @@ typedef struct {
     uint32_t CurIPSess;
 } DPMsgSessionCount;
 
-#define DPSESS_FLAG_INGRESS       0x01
-#define DPSESS_FLAG_TAP           0x02
-#define DPSESS_FLAG_MID           0x04
-#define DPSESS_FLAG_EXTERNAL      0x08 // remote peer is not local
-#define DPSESS_FLAG_XFF           0x10 // virtual xff connection
-#define DPSESS_FLAG_SVC_EXTIP     0x20 // service externalIP
-#define DPSESS_FLAG_MESH_TO_SVR   0x40 // mesh traffic to svr
-#define DPSESS_FLAG_LINK_LOCAL    0x80 // link local(169.254.0.0)
+#define DPSESS_FLAG_INGRESS       0x0001
+#define DPSESS_FLAG_TAP           0x0002
+#define DPSESS_FLAG_MID           0x0004
+#define DPSESS_FLAG_EXTERNAL      0x0008 // remote peer is not local
+#define DPSESS_FLAG_XFF           0x0010 // virtual xff connection
+#define DPSESS_FLAG_SVC_EXTIP     0x0020 // service externalIP
+#define DPSESS_FLAG_MESH_TO_SVR   0x0040 // mesh traffic to svr
+#define DPSESS_FLAG_LINK_LOCAL    0x0080 // link local(169.254.0.0)
+#define DPSESS_FLAG_TMP_OPEN      0x0100 // temp open connection
 
 #define DP_POLICY_APPLY_EGRESS  0x1
 #define DP_POLICY_APPLY_INGRESS 0x2
@@ -200,9 +201,10 @@ typedef struct {
 #define DP_POLICY_ACTION_OPEN          0
 #define DP_POLICY_ACTION_LEARN         1
 #define DP_POLICY_ACTION_ALLOW         2
-#define DP_POLICY_ACTION_CHECK_APP     3
-#define DP_POLICY_ACTION_VIOLATE       4
-#define DP_POLICY_ACTION_DENY          5
+#define DP_POLICY_ACTION_CHECK_VH      3
+#define DP_POLICY_ACTION_CHECK_APP     4
+#define DP_POLICY_ACTION_VIOLATE       5
+#define DP_POLICY_ACTION_DENY          6
 
 #define DP_POLICY_APP_ANY      0
 #define DP_POLICY_APP_UNKNOWN  0xffffffff
@@ -234,7 +236,8 @@ typedef struct {
     uint8_t  ICMPCode;
     uint8_t  ICMPType;
     uint8_t  IPProto;
-    uint8_t  Flags;
+    uint16_t Flags;
+    uint8_t  Padding[3];
     uint32_t ClientPkts;
     uint32_t ServerPkts;
     uint32_t ClientBytes;
@@ -401,6 +404,7 @@ typedef struct {
 #define DPCONN_FLAG_SVC_EXTIP     0x08
 #define DPCONN_FLAG_MESH_TO_SVR   0x10
 #define DPCONN_FLAG_LINK_LOCAL    0x20
+#define DPCONN_FLAG_TMP_OPEN      0x40
 
 typedef struct {
     uint8_t  EPMAC[6];
@@ -434,10 +438,12 @@ typedef struct {
     uint8_t  FqdnIP[16];
 } DPMsgFqdnIp;
 
+#define DPFQDN_IP_FLAG_VH       0x01
 typedef struct {
     char  FqdnName[DP_POLICY_FQDN_NAME_MAX_LEN];
     uint16_t IpCnt;
     uint16_t Reserved;
+    uint8_t Flags;
 } DPMsgFqdnIpHdr;
 
 #endif

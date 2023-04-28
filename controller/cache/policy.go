@@ -1230,7 +1230,7 @@ func preparePolicySlots(rules []share.CLUSGroupIPPolicy) ([][]byte, int, int, er
 	} else if wlen < clusterMedium {
 		beginSlot = beginSlotMedium
 	} else if wlen < clusterLarge {
-		beginSlot = clusterLarge
+		beginSlot = beginSlotLarge
 	} else {
 		beginSlot = beginSlotSuper
 	}
@@ -1383,6 +1383,10 @@ func putPolicyIPRulesToCluster(rules []share.CLUSGroupIPPolicy) {
 
 func scheduleIPPolicyCalculation(fast bool) {
 	log.WithFields(log.Fields{"fast": fast, "policyCalculated": policyCalculated}).Debug("")
+	//no need to reset timer if network policy is disabled
+	if getDisableNetPolicyStatus() {
+		return
+	}
 
 	if !policyCalculated {
 		policyCalculated = true

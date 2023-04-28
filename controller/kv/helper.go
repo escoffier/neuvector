@@ -79,6 +79,7 @@ type ClusterHelper interface {
 	DeletePolicyRule(id uint32) error
 	DeletePolicyRuleTxn(txn *cluster.ClusterTransact, id uint32) error
 	PutPolicyVer(s *share.CLUSGroupIPPolicyVer) error
+	PutDlpVer(s *share.CLUSDlpRuleVer) error
 
 	GetResponseRuleList(policyName string) []*share.CLUSRuleHead
 	PutResponseRuleList(policyName string, crhs []*share.CLUSRuleHead) error
@@ -103,6 +104,11 @@ type ClusterHelper interface {
 	PutUser(user *share.CLUSUser) error
 	CreateUser(user *share.CLUSUser) error
 	DeleteUser(fullname string) error
+
+	GetApikeyRev(name string, acc *access.AccessControl) (*share.CLUSApikey, uint64, error)
+	CreateApikey(apikey *share.CLUSApikey) error
+	GetAllApikeysNoAuth() map[string]*share.CLUSApikey
+	DeleteApikey(name string) error
 
 	GetProcessProfile(group string) *share.CLUSProcessProfile
 	PutProcessProfile(group string, pg *share.CLUSProcessProfile) error
@@ -874,6 +880,11 @@ func (m clusterHelper) PutPolicyVer(s *share.CLUSGroupIPPolicyVer) error {
 	return cluster.Put(key, value)
 }
 
+func (m clusterHelper) PutDlpVer(s *share.CLUSDlpRuleVer) error {
+	key := share.CLUSDlpWorkloadRulesKey(s.Key)
+	value, _ := enc.Marshal(s)
+	return cluster.Put(key, value)
+}
 // event policy
 
 func (m clusterHelper) GetResponseRuleList(policyName string) []*share.CLUSRuleHead {
@@ -2858,4 +2869,43 @@ func (m clusterHelper) PutImportTask(importTask *share.CLUSImportTask) error {
 	key := share.CLUSImportOpKey(share.CLUSImportStatusSubKey)
 	value, _ := json.Marshal(importTask)
 	return cluster.Put(key, value)
+}
+
+func (m clusterHelper) GetApikeyRev(name string, acc *access.AccessControl) (*share.CLUSApikey, uint64, error) {
+    key := share.CLUSApikeyKey(url.QueryEscape(name))
+    if value, rev, _ := m.get(key); value != nil {
+        var apikey share.CLUSApikey
+        json.Unmarshal(value, &apikey)
+        if !acc.Authorize(&apikey, nil) {    
+            return nil, 0, common.ErrObjectAccessDenied
+        }
+        return &apikey, rev, nil
+    }
+    return nil, 0, common.ErrObjectNotFound
+}
+
+func (m clusterHelper) CreateApikey(apikey *share.CLUSApikey) error {
+    key := share.CLUSApikeyKey(url.QueryEscape(apikey.Name))
+    value, _ := json.Marshal(apikey)
+    // secret_key is already hashed
+    return cluster.PutIfNotExist(key, value, false)
+}
+
+// caller needs to decide whether to authorize accessing each returned apikey object
+func (m clusterHelper) GetAllApikeysNoAuth() map[string]*share.CLUSApikey {
+    apikeys := make(map[string]*share.CLUSApikey)
+    keys, _ := cluster.GetStoreKeys(share.CLUSConfigApikeyStore)
+    for _, key := range keys {
+        if value, _, _ := m.get(key); value != nil {
+            var apikey share.CLUSApikey
+            json.Unmarshal(value, &apikey)
+            apikeys[apikey.Name] = &apikey
+        }
+    }
+    return apikeys
+}
+
+func (m clusterHelper) DeleteApikey(name string) error {
+	key := share.CLUSApikeyKey(url.QueryEscape(name))
+	return cluster.Delete(key)
 }

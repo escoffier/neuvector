@@ -10,6 +10,7 @@ const RESTTokenHeader string = "X-Auth-Token"
 const RESTNvPageHeader string = "X-Nv-Page"
 const RESTRancherTokenHeader string = "X-R-Sess"
 const RESTMaskedValue string = "The value is masked"
+const RESTAPIKeyHeader string = "X-Auth-Apikey"
 
 const RESTNvPageDashboard string = "dashboard"
 
@@ -121,6 +122,7 @@ const AllContainerGroup string = "containers"
 const LearnedHostPrefix string = "Host:"
 const LearnedWorkloadPrefix string = "Workload:"
 const WorkloadTunnelIF string = "Workload:ingress"
+const AddrGrpValVhPrefix string = "vh:"
 
 const PolicyDomainNameMaxLen int = 256
 const DlpSensorNameMaxLen int = 256
@@ -326,11 +328,19 @@ type RESTServerLDAP struct {
 	GroupMappedRoles []*share.GroupRoleMapping `json:"group_mapped_roles,omitempty"` // group -> (role -> domains)
 }
 
+type RESTX509CertInfo struct {
+	X509Cert          string `json:"x509_cert"`
+	IssuerCommonName  string `json:"issuer_cn"`
+	SubjectCommonName string `json:"subject_cn"`
+	ValidityNotAfter  uint64 `json:"subject_notafter"`
+}
+
 type RESTServerSAML struct {
 	SSOURL     string `json:"sso_url"`
 	Issuer     string `json:"issuer"`
 	X509Cert   string `json:"x509_cert,cloak"`
 	GroupClaim string `json:"group_claim"`
+	X509Certs  []RESTX509CertInfo `json:"x509_certs"`
 
 	Enable           bool                      `json:"enable"`
 	DefaultRole      string                    `json:"default_role"`
@@ -409,6 +419,7 @@ type RESTServerSAMLConfig struct {
 	DefaultRole      *string                    `json:"default_role,omitempty"`
 	RoleGroups       *map[string][]string       `json:"role_groups,omitempty"`        // role -> groups. deprecated since 4.2
 	GroupMappedRoles *[]*share.GroupRoleMapping `json:"group_mapped_roles,omitempty"` // group -> (role -> domains)
+	X509CertExtra    *[]string                  `json:"x509_cert_extra,omitempty"`
 }
 
 type RESTServerSAMLConfigCfgMap struct {
@@ -1626,6 +1637,7 @@ type RESTSystemConfigConfig struct {
 	SyslogEnable              *bool                            `json:"syslog_status,omitempty"`
 	SyslogCategories          *[]string                        `json:"syslog_categories,omitempty"`
 	SyslogInJSON              *bool                            `json:"syslog_in_json,omitempty"`
+	SyslogServerCert          *string                          `json:"syslog_server_cert,omitempty"`
 	SingleCVEPerSyslog        *bool                            `json:"single_cve_per_syslog"`
 	AuthOrder                 *[]string                        `json:"auth_order,omitempty"`
 	AuthByPlatform            *bool                            `json:"auth_by_platform,omitempty"`
@@ -1651,6 +1663,8 @@ type RESTSystemConfigConfig struct {
 type RESTSysNetConfigConfig struct {
 	NetServiceStatus     *bool   `json:"net_service_status,omitempty"`
 	NetServicePolicyMode *string `json:"net_service_policy_mode,omitempty"`
+	DisableNetPolicy     *bool   `json:"disable_net_policy,omitempty"`
+	DetectUnmanagedWl    *bool   `json:"detect_unmanaged_wl,omitempty"`
 }
 
 type RESTSysAtmoConfigConfig struct {
@@ -1667,6 +1681,8 @@ type RESTSystemConfigConfigCfgMap struct {
 	ScanConfig   *RESTScanConfigConfig `json:"scan_config,omitempty"`
 	AlwaysReload bool                  `json:"always_reload"`
 }
+
+const SyslogProtocolTCPTLS = 66
 
 type RESTSystemConfigConfigData struct {
 	Config     *RESTSystemConfigConfig   `json:"config,omitempty"`
@@ -1690,6 +1706,7 @@ type RESTSystemConfigSyslogCfgV2 struct {
 	SyslogCategories   *[]string `json:"syslog_categories,omitempty"`
 	SyslogInJSON       *bool     `json:"syslog_in_json,omitempty"`
 	SingleCVEPerSyslog *bool     `json:"single_cve_per_syslog"`
+	SyslogServerCert   *string   `json:"syslog_server_cert,omitempty"`
 }
 
 type RESTSystemConfigAuthCfgV2 struct {
@@ -1762,6 +1779,7 @@ type RESTSystemConfig struct {
 	SyslogEnable              bool                      `json:"syslog_status"`
 	SyslogCategories          []string                  `json:"syslog_categories"`
 	SyslogInJSON              bool                      `json:"syslog_in_json"`
+	SyslogServerCert          string                    `json:"syslog_server_cert"`
 	SingleCVEPerSyslog        bool                      `json:"single_cve_per_syslog"`
 	AuthOrder                 []string                  `json:"auth_order"`
 	AuthByPlatform            bool                      `json:"auth_by_platform"`
@@ -1782,6 +1800,8 @@ type RESTSystemConfig struct {
 	XffEnabled                bool                      `json:"xff_enabled"`
 	NetServiceStatus          bool                      `json:"net_service_status"`
 	NetServicePolicyMode      string                    `json:"net_service_policy_mode"`
+	DisableNetPolicy          bool                      `json:"disable_net_policy"`
+	DetectUnmanagedWl         bool                      `json:"detect_unmanaged_wl"`
 	ModeAutoD2M               bool                      `json:"mode_auto_d2m"`
 	ModeAutoD2MDuration       int64                     `json:"mode_auto_d2m_duration"`
 	ModeAutoM2P               bool                      `json:"mode_auto_m2p"`
@@ -1809,6 +1829,7 @@ type RESTSystemConfigSyslogV2 struct {
 	SyslogCategories   []string `json:"syslog_categories"`
 	SyslogInJSON       bool     `json:"syslog_in_json"`
 	SingleCVEPerSyslog bool     `json:"single_cve_per_syslog"`
+	SyslogServerCert   string   `json:"syslog_server_cert"`
 }
 
 type RESTSystemConfigAuthV2 struct {
@@ -1825,6 +1846,7 @@ type RESTSystemConfigMiscV2 struct {
 	MonitorServiceMesh bool     `json:"monitor_service_mesh"`
 	XffEnabled         bool     `json:"xff_enabled"`
 	NoTelemetryReport  bool     `json:"no_telemetry_report"`
+	CspType            string   `json:"csp_type"`
 }
 
 // for scanner autoscaling
@@ -1857,6 +1879,8 @@ type RESTSystemConfigIBMSAV2 struct {
 type RESTSystemConfigNetSvcV2 struct {
 	NetServiceStatus     bool   `json:"net_service_status"`
 	NetServicePolicyMode string `json:"net_service_policy_mode"`
+	DisableNetPolicy     bool   `json:"disable_net_policy"`
+	DetectUnmanagedWl    bool   `json:"detect_unmanaged_wl"`
 }
 
 type RESTSystemConfigModeAutoV2 struct {
@@ -3142,6 +3166,7 @@ type RESTAdmissionRule struct { // see type CLUSAdmissionRule
 	Critical bool                    `json:"critical"`
 	CfgType  string                  `json:"cfg_type"`  // CfgTypeLearned / CfgTypeUserCreated / CfgTypeGround / CfgTypeFederal (see above)
 	RuleType string                  `json:"rule_type"` // ValidatingExceptRuleType / ValidatingDenyRuleType (see above)
+	RuleMode string                  `json:"rule_mode"` // "" / share.AdmCtrlModeMonitor / share.AdmCtrlModeProtect
 }
 
 type RESTAdmissionRuleData struct {
@@ -3160,8 +3185,9 @@ type RESTAdmissionRuleConfig struct {
 	Criteria []*RESTAdmRuleCriterion `json:"criteria,omitempty"`
 	Disable  *bool                   `json:"disable,omitempty"`
 	Actions  *[]string               `json:"actions,omitempty"`
-	CfgType  string                  `json:"cfg_type"`  // CfgTypeLearned / CfgTypeUserCreated / CfgTypeGround / CfgTypeFederal (see above)
-	RuleType string                  `json:"rule_type"` // ValidatingExceptRuleType / ValidatingDenyRuleType (see above)
+	CfgType  string                  `json:"cfg_type"`            // CfgTypeLearned / CfgTypeUserCreated / CfgTypeGround / CfgTypeFederal (see above)
+	RuleType string                  `json:"rule_type"`           // ValidatingExceptRuleType / ValidatingDenyRuleType (see above)
+	RuleMode *string                 `json:"rule_mode,omitempty"` // only for deny rules: "" / share.AdmCtrlModeMonitor / share.AdmCtrlModeProtect
 }
 
 type RESTAdmissionRuleConfigData struct {
@@ -3384,4 +3410,50 @@ type RESTAdminCustomCriteriaOptions struct {
 type RESTAdminCriteriaTemplate struct {
 	Kind    string `json:"kind"`
 	RawJson string `json:"rawjson"`
+}
+
+const (
+	ApikeyExpireNever       string = "never"
+	ApikeyExpireOneDay      string = "oneday"
+	ApikeyExpireOneMonth    string = "onemonth"
+	ApikeyExpireOneYear     string = "oneyear"
+	ApikeyExpireCustomHour  string = "hours"
+)
+
+type RESTApikeyData struct {
+	Apikey *RESTApikey `json:"apikey"`
+}
+
+type RESTApikey struct {
+	ExpirationType        string              `json:"expiration_type"`
+	ExpirationHours       uint32              `json:"expiration_hours"`
+	Name                  string              `json:"apikey_name"`
+	SecretKey             string              `json:"apikey_secret,cloak"`
+	Description           string              `json:"description"`
+	Role                  string              `json:"role"`
+	RoleDomains           map[string][]string `json:"role_domains,omitempty"` // role -> domains
+	ExpirationTimestamp   int64               `json:"expiration_timestamp"`   // used in GET
+	CreatedTimestamp      int64               `json:"created_timestamp"`      // used in GET
+	CreatedByEntity       string              `json:"created_by_entity"`	  // it could be username or apikey (access key)
+}
+
+type RESTApikeyPreGeneratedData struct {
+	Apikey *RESTApikeyPreGenerated `json:"apikey"`
+}
+
+type RESTApikeyPreGenerated struct {
+	Name       string  `json:"apikey_name"`
+	SecretKey  string  `json:"apikey_secret"`
+}
+
+type RESTApikeysData struct {
+	Apikeys     []*RESTApikey `json:"apikeys"`
+	GlobalRoles []string      `json:"global_roles"`
+	DomainRoles []string      `json:"domain_roles"`
+}
+
+type RESTSelfApikeyData struct {
+	Apikey              *RESTApikey                      `json:"apikey"`
+	GlobalPermits       []*RESTRolePermission            `json:"global_permissions,omitempty"`
+	DomainPermits       map[string][]*RESTRolePermission `json:"domain_permissions,omitempty"` // domain -> permissions
 }
