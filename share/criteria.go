@@ -49,6 +49,8 @@ const (
 	CriteriaKeyHasPssViolation     string = "violatePssPolicy"
 	CriteriaKeyCustomPath          string = "customPath"
 	CriteriaKeySaBindRiskyRole     string = "saBindRiskyRole"
+	CriteriaKeyImageVerifiers      string = "imageVerifiers"
+	CriteriaKeyAnnotations         string = "annotations"
 )
 
 const (
@@ -61,22 +63,24 @@ const (
 )
 
 const (
-	CriteriaOpEqual             string = "="
-	CriteriaOpNotEqual          string = "!="
-	CriteriaOpContains          string = "contains"
-	CriteriaOpPrefix            string = "prefix"
-	CriteriaOpRegex             string = "regex"
-	CriteriaOpNotRegex          string = "!regex"
-	CriteriaOpBiggerEqualThan   string = ">="
-	CriteriaOpBiggerThan        string = ">"
-	CriteriaOpLessEqualThan     string = "<="
-	CriteriaOpContainsAll       string = "containsAll"
-	CriteriaOpContainsAny       string = "containsAny"
-	CriteriaOpNotContainsAny    string = "notContainsAny"
-	CriteriaOpContainsOtherThan string = "containsOtherThan"
-	CriteriaOpExist             string = "exist"
-	CriteriaOpNotExist          string = "notExist"
-	CriteriaOpContainsTagAny    string = "containsTagAny"
+	CriteriaOpEqual               string = "="
+	CriteriaOpNotEqual            string = "!="
+	CriteriaOpContains            string = "contains"
+	CriteriaOpPrefix              string = "prefix"
+	CriteriaOpRegex               string = "regex"
+	CriteriaOpNotRegex            string = "!regex"
+	CriteriaOpBiggerEqualThan     string = ">="
+	CriteriaOpBiggerThan          string = ">"
+	CriteriaOpLessEqualThan       string = "<="
+	CriteriaOpContainsAll         string = "containsAll"
+	CriteriaOpContainsAny         string = "containsAny"
+	CriteriaOpNotContainsAny      string = "notContainsAny"
+	CriteriaOpContainsOtherThan   string = "containsOtherThan"
+	CriteriaOpRegexContainsAny    string = "regexContainsAny"
+	CriteriaOpRegexNotContainsAny string = "!regexContainsAny"
+	CriteriaOpExist               string = "exist"
+	CriteriaOpNotExist            string = "notExist"
+	CriteriaOpContainsTagAny      string = "containsTagAny"
 )
 
 const (
@@ -167,7 +171,9 @@ func IsGroupMember(group *CLUSGroup, workload *CLUSWorkload, domain *CLUSDomain)
 }
 
 // For criteria of same type, apply 'or' if there is at least one positive match;
-//                            apply 'and' if all are negative match;
+//
+//	apply 'and' if all are negative match;
+//
 // For different criteria type, apply 'and'
 func IsWorkloadSelected(workload *CLUSWorkload, selector []CLUSCriteriaEntry, domain *CLUSDomain) bool {
 	var ret, positive bool

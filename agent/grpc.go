@@ -54,7 +54,7 @@ func (ss *ScanService) ScanGetFiles(ctx context.Context, req *share.ScanRunningR
 	log.WithFields(log.Fields{"id": req.ID}).Info("")
 
 	if ss.setScanStart(req.ID) {
-		log.WithFields(log.Fields{"id": req.ID}).Info("scan in propress")
+		log.WithFields(log.Fields{"id": req.ID}).Info("scan in progress")
 		return &share.ScanData{Error: share.ScanErrorCode_ScanErrInProgress}, nil
 	}
 
@@ -62,16 +62,19 @@ func (ss *ScanService) ScanGetFiles(ctx context.Context, req *share.ScanRunningR
 
 	var pid int
 	var data share.ScanData
+	var pidHost bool
 
 	gInfoRLock()
 	if req.Type == share.ScanObjectType_HOST {
 		pid = 1
+		pidHost = true   // default
 		if gInfo.hostScanCache != nil {
 			data.Buffer = gInfo.hostScanCache
 			data.Error = share.ScanErrorCode_ScanErrNone
 		}
 	} else if c, ok := gInfo.activeContainers[req.ID]; ok {
 		pid = c.pid
+		pidHost = (c.info.PidMode == "host")
 		if c.scanCache != nil {
 			data.Buffer = c.scanCache
 			data.Error = share.ScanErrorCode_ScanErrNone
@@ -97,6 +100,7 @@ func (ss *ScanService) ScanGetFiles(ctx context.Context, req *share.ScanRunningR
 		Id:      req.ID,
 		Kernel:  Host.Kernel,
 		ObjType: req.Type,
+		PidHost: pidHost,
 	}
 
 	bytesValue, _, err := walkerTask.Run(taskReq, req.ID)

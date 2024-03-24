@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"time"
+	"strconv"
 
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/cluster"
@@ -119,16 +120,13 @@ func clusterStart(clusterCfg *cluster.ClusterConfig) error {
 		}
 	}
 
+	cluster.RegisterLeadChangeWatcher(leadChangeHandler, leadAddr)
 	if err = waitForAdmission(); err != nil {
 		return err
 	}
 
 	admitted = true
 	selfAddr = cluster.GetSelfAddress()
-
-	// Remove host relative data: let enforcer report them again
-	// workload: object/workload/<host-id>
-	cluster.DeleteTree(fmt.Sprintf("%s%s", share.CLUSWorkloadStore, Host.ID))
 	return nil
 }
 
@@ -216,11 +214,28 @@ func logWorkload(ev share.TLogEvent, wl *share.CLUSWorkload, msg *string) {
 	evqueue.Append(&clog)
 }
 
-var curMemoryPressure uint64
+var snapshotIndex int
+func memorySnapshot(usage uint64) {
+	if agentEnv.autoProfieCapture > 0 {
+		log.WithFields(log.Fields{"usage": usage}).Debug()
+		if usage > agentEnv.peakMemoryUsage {
+			agentEnv.peakMemoryUsage = usage + agentEnv.snapshotMemStep  // level up
+			label := "p"  // peak
+			if snapshotIndex < 4 { // keep atmost 4 copies + an extra peak copy
+				snapshotIndex++
+				label = strconv.Itoa(snapshotIndex)
+			}
+			log.WithFields(log.Fields{"label": label, "next": agentEnv.peakMemoryUsage}).Debug()
+			utils.PerfSnapshot(Agent.Pid, agentEnv.memoryLimit, agentEnv.autoProfieCapture, usage, share.SnaphotFolder, Agent.ID, "enf.", label)
+		}
+	}
+}
 
+var curMemoryPressure uint64
 func memoryPressureNotification(rpt *system.MemoryPressureReport) {
-	if rpt.Level > 2 { // cap its maximum
+	if rpt.Level >= 2 { // cap its maximum
 		rpt.Level = 2
+		memorySnapshot(rpt.Stats.WorkingSet)
 	}
 
 	if rpt.Level == curMemoryPressure {
@@ -413,6 +428,7 @@ func createWorkload(info *container.ContainerMetaExtra, svc, domain *string) *sh
 		HostID:       Host.ID,
 		Image:        info.Image,
 		ImageID:      info.ImageID,
+		ImgCreateAt:  info.ImgCreateAt,
 		Author:       info.Author,
 		NetworkMode:  info.NetMode,
 		Privileged:   info.Privileged,
@@ -452,7 +468,8 @@ func createWorkload(info *container.ContainerMetaExtra, svc, domain *string) *sh
 	}
 
 	if svc != nil && domain != nil {
-		wl.Service = utils.MakeServiceName(*domain, *svc)
+		// It must be a full service name, like "iperf.demo".
+		wl.Service = *svc
 		wl.Domain = *domain
 	}
 	return &wl
@@ -584,8 +601,13 @@ func clusterStopContainer(ev *ClusterEvent) {
 		if ev.info == nil {
 			return
 		}
+
 		// Container might not be intercepted and reported yet.
 		wl := createWorkload(ev.info, ev.service, ev.domain)
+		if _, ok := getNeuVectorRole(ev.info); ok {
+			// nuVector pod
+			wl.PlatformRole = container.PlatformContainerNeuVector
+		}
 		putWorkload(wl)
 		wlCacheMap[ev.id] = &workloadInfo{wl: wl}
 
@@ -687,11 +709,13 @@ func leadChangeHandler(newLead, oldLead string) {
 		if clusterFailed {
 			clusterFailed = false
 			uploadCurrentInfo()
-			if Host.CapDockerBench {
-				bench.RerunDocker(false)
-			}
-			if Host.CapKubeBench {
-				bench.RerunKube("", "", false)
+			if bench != nil {
+				if Host.CapDockerBench {
+					bench.RerunDocker(false)
+				}
+				if Host.CapKubeBench {
+					bench.RerunKube("", "", false)
+				}
 			}
 			cluster.ResumeAllWatchers()
 		}
@@ -730,14 +754,18 @@ func getLeadGRPCEndpoint() string {
 
 func clusterLoop(existing utils.Set) {
 	// Remove non-existing containers from cluster
-	store := share.CLUSWorkloadHostStore(Host.ID)
-	keys, _ := cluster.GetStoreKeys(store)
+	keys, _ := cluster.GetStoreKeys(share.CLUSWorkloadHostStore(Host.ID))
+	txn := cluster.Transact()
 	for _, key := range keys {
-		id := share.CLUSWorkloadKey2ID(key)
-		if !existing.Contains(id) {
-			cluster.Delete(key)
+		if !existing.Contains(share.CLUSWorkloadKey2ID(key)) {
+			txn.Delete(key)
 		}
 	}
+
+	if ok, err := txn.Apply(); err != nil {
+		log.WithFields(log.Fields{"ok": ok, "error": err}).Error("Remove workloads")
+	}
+	txn.Close()
 
 	// Start event loop first so existing containers can be posted
 	go func() {
@@ -778,10 +806,10 @@ func clusterLoop(existing utils.Set) {
 		// command, because they can only applied to known objects.
 		cluster.RegisterStoreWatcher(share.CLUSUniconfTargetStore(Host.ID), uniconfHandler, false)
 		cluster.RegisterStoreWatcher(share.CLUSNetworkStore, systemUpdateHandler, false)
+		cluster.RegisterStoreWatcher(share.CLUSNodeRulesKey(Host.ID), systemUpdateHandler, false)
 		cluster.RegisterStoreWatcher(share.CLUSNodeCommonProfileStore, systemUpdateHandler, agentEnv.kvCongestCtrl)
 		cluster.RegisterStoreWatcher(share.CLUSNodeProfileStoreKey(Host.ID), systemUpdateHandler, agentEnv.kvCongestCtrl)
 		cluster.RegisterStoreWatcher(share.CLUSConfigDomainStore, domainConfigUpdate, false)
-		cluster.RegisterLeadChangeWatcher(leadChangeHandler, leadAddr)
 	}()
 }
 

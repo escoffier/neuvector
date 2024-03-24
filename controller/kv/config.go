@@ -371,7 +371,7 @@ func (c *configHelper) Restore() (string, error) {
 	eps.Remove(fedCfgEndpoint)
 
 	// restore process profile/file monitor/access rule endpoints to avoid unnecessary kv PutIfNotExists calls when groups are updated in cache
-	priorityCfgEndpoints := utils.NewSet(pprofileCfgEndpoint, fmonitorCfgEndpoint, faccessCfgEndpoint, registryCfgEndpoint)
+	priorityCfgEndpoints := utils.NewSet(pprofileCfgEndpoint, fmonitorCfgEndpoint, faccessCfgEndpoint, sigstoreCfgEndpoint, registryCfgEndpoint)
 	if rc := restoreEPs(priorityCfgEndpoints, ch, &importInfo); rc != nil {
 		err = rc
 	}
@@ -601,6 +601,25 @@ func (c *configHelper) importInternal(rpcEps []*common.RPCEndpoint, localCtrlerI
 		return nil
 	}, importTask)
 
+	// delete/reset scan/state/scan_revisions key when necessary
+	if currFedRole == api.FedRoleJoint {
+		for _, s := range header.Sections {
+			if s == api.ConfSectionAll || s == api.ConfSectionConfig {
+				key := share.CLUSScanStateKey(share.CLUSFedScanDataRevSubKey)
+				if importFedRole == api.FedRoleNone {
+					cluster.Delete(key)
+				} else if importFedRole == api.FedRoleJoint {
+					scanRevs := share.CLUSFedScanRevisions{
+						ScannedRegRevs: make(map[string]uint64),
+					}
+					value, _ := json.Marshal(&scanRevs)
+					cluster.Put(key, value)
+				}
+				break
+			}
+		}
+	}
+
 	importTask.Percentage += 1
 	importTask.LastUpdateTime = time.Now().UTC()
 	clusHelper.PutImportTask(importTask)
@@ -751,7 +770,7 @@ func (c *configHelper) importInternal(rpcEps []*common.RPCEndpoint, localCtrlerI
 											},
 										},
 									}
-									admission.ConfigK8sAdmissionControl(k8sResInfo, ctrlState)
+									admission.ConfigK8sAdmissionControl(&k8sResInfo, ctrlState)
 								}
 							}
 						}
@@ -799,6 +818,13 @@ func (c *configHelper) importInternal(rpcEps []*common.RPCEndpoint, localCtrlerI
 		KVVersion:   header.KVVersion,
 	}
 	clusHelper.UpgradeClusterImport(importVer)
+
+	profile := &share.CLUSVulnerabilityProfile{
+		Name:    share.DefaultVulnerabilityProfileName,
+		Entries: make([]*share.CLUSVulnerabilityProfileEntry, 0),
+	}
+	clusHelper.PutVulnerabilityProfileIfNotExist(profile)
+	createDefaultComplianceProfile()
 
 	if len(importInfo.fedRulesRevValue) > 0 {
 		var fedRulesRev share.CLUSFedRulesRevision

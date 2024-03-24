@@ -2,6 +2,7 @@ package scan
 
 import (
 	"fmt"
+	"math/rand"
 	"regexp"
 	"strconv"
 	"strings"
@@ -51,6 +52,7 @@ var severityID2String = map[int8]string{
 // other info can get from cvedb
 type VulTrait struct {
 	Name     string
+	fileName string
 	pkgName  string
 	pkgVer   string
 	fixVer   string
@@ -60,8 +62,16 @@ type VulTrait struct {
 	filtered bool
 }
 
+type FixedVulInfo struct {
+	PubTS int64
+}
+
 func (v VulTrait) IsFiltered() bool {
 	return v.filtered
+}
+
+func (v VulTrait) GetPubTS() int64 {
+	return v.pubTS
 }
 
 func SetScannerDB(newDB *share.CLUSScannerDB) {
@@ -86,6 +96,7 @@ func ScanVul2REST(cvedb CVEDBType, baseOS string, vul *share.ScanVulnerability) 
 		Vectors:        vul.Vectors,
 		Description:    vul.Description,
 		PackageName:    vul.PackageName,
+		FileName:       vul.FileName,
 		PackageVersion: vul.PackageVersion,
 		FixedVersion:   vul.FixedVersion,
 		Link:           vul.Link,
@@ -342,6 +353,22 @@ func ImageBench2REST(cmds []string, secrets []*api.RESTScanSecret, setids []*api
 }
 */
 
+// This is use when grpc structure is returned
+func FillVul(vul *share.ScanVulnerability) {
+	sdb := GetScannerDB()
+
+	if vul.DBKey != "" {
+		if vr, ok := sdb.CVEDB[vul.DBKey]; ok {
+			vul.Score = vr.Score
+			vul.Vectors = vr.Vectors
+			vul.ScoreV3 = vr.ScoreV3
+			vul.VectorsV3 = vr.VectorsV3
+			vul.Description = vr.Description
+			vul.Link = vr.Link
+		}
+	}
+}
+
 func ScanRepoResult2REST(result *share.ScanResult, tagMap map[string][]string) *api.RESTScanRepoReport {
 	sdb := GetScannerDB()
 
@@ -388,7 +415,7 @@ func ScanRepoResult2REST(result *share.ScanResult, tagMap map[string][]string) *
 
 	checks := ImageBench2REST(result.Cmds, result.Secrets.Logs, result.SetIdPerms, tagMap)
 
-	return &api.RESTScanRepoReport{
+	report := &api.RESTScanRepoReport{
 		CVEDBVersion:    result.Version,
 		CVEDBCreateTime: result.CVEDBCreateTime,
 		ImageID:         result.ImageID,
@@ -398,6 +425,7 @@ func ScanRepoResult2REST(result *share.ScanResult, tagMap map[string][]string) *
 		Digest:          result.Digest,
 		Size:            result.Size,
 		Author:          result.Author,
+		CreatedAt:       result.Created,
 		BaseOS:          result.Namespace,
 		Layers:          layers,
 		RESTScanReport: api.RESTScanReport{
@@ -411,6 +439,16 @@ func ScanRepoResult2REST(result *share.ScanResult, tagMap map[string][]string) *
 			Cmds:    result.Cmds,
 		},
 	}
+	if result.SignatureInfo != nil {
+		report.RESTScanReport.SignatureInfo = &api.RESTScanSignatureInfo{
+			Verifiers:             result.SignatureInfo.Verifiers,
+			VerificationTimestamp: result.SignatureInfo.VerificationTimestamp,
+		}
+	} else {
+		report.RESTScanReport.SignatureInfo = &api.RESTScanSignatureInfo{}
+	}
+
+	return report
 }
 
 func fillVulFields(vr *share.ScanVulnerability, v *api.RESTVulnerability) {
@@ -464,21 +502,25 @@ func normalizeBaseOS(baseOS string) string {
 	return baseOS
 }
 
-func FillVulDetails(cvedb CVEDBType, baseOS string, vts []*VulTrait, showTag string) []*api.RESTVulnerability {
+func FillVulTraits(cvedb CVEDBType, baseOS string, vts []*VulTrait, showTag string, includeFiltered bool) []*api.RESTVulnerability {
 	baseOS = normalizeBaseOS(baseOS)
 
 	vuls := make([]*api.RESTVulnerability, 0, len(vts))
 
 	for _, vt := range vts {
-		if vt.filtered && showTag == "" {
-			continue
+		if !includeFiltered {
+			if vt.filtered && showTag == "" {
+				continue
+			}
 		}
 
 		vul := &api.RESTVulnerability{
 			Name:           vt.Name,
 			PackageName:    vt.pkgName,
+			FileName:       vt.fileName,
 			PackageVersion: vt.pkgVer,
 			FixedVersion:   vt.fixVer,
+			DbKey:          vt.dbKey,
 		}
 		if sev, ok := severityID2String[vt.severity]; ok {
 			vul.Severity = sev
@@ -518,6 +560,7 @@ func FillVulDetails(cvedb CVEDBType, baseOS string, vts []*VulTrait, showTag str
 }
 
 func ExtractVulnerability(vuls []*share.ScanVulnerability) []*VulTrait {
+	sdb := GetScannerDB()
 	traits := make([]*VulTrait, len(vuls))
 	for i, v := range vuls {
 		s, ok := serverityString2ID[v.Severity]
@@ -531,7 +574,19 @@ func ExtractVulnerability(vuls []*share.ScanVulnerability) []*VulTrait {
 			if t, err := time.Parse(time.RFC3339, v.PublishedDate); err == nil {
 				pubTS = t.Unix()
 			} else {
-				log.WithFields(log.Fields{"publish": v.PublishedDate}).Error()
+				log.WithFields(log.Fields{"publish": v.PublishedDate, "name": v.Name}).Error()
+			}
+		} else {
+			if len(sdb.CVEDB) > 0 {
+				if vr, ok := sdb.CVEDB[v.DBKey]; ok {
+					if t, err := time.Parse(time.RFC3339, vr.PublishedDate); err == nil {
+						publishedTS := t.Unix()
+						if publishedTS != pubTS {
+							// found a same-key entry in scannerDB but with different publishDate value than tne entry in vuls(scanResult).
+							pubTS = publishedTS
+						}
+					}
+				}
 			}
 		}
 
@@ -540,6 +595,7 @@ func ExtractVulnerability(vuls []*share.ScanVulnerability) []*VulTrait {
 			severity: s,
 			dbKey:    v.DBKey,
 			pubTS:    pubTS,
+			fileName: v.FileName,
 			pkgName:  v.PackageName, pkgVer: v.PackageVersion, fixVer: v.FixedVersion,
 		}
 	}
@@ -562,29 +618,38 @@ func CountVulTrait(traits []*VulTrait) (int, int) {
 	return highs, meds
 }
 
-func GatherVulTrait(traits []*VulTrait) ([]string, []string) {
+func GatherVulTrait(traits []*VulTrait) ([]string, []string, []string, []FixedVulInfo) {
 	highs := make([]string, 0)
 	meds := make([]string, 0)
+	lows := make([]string, 0)
+	fixedHighsInfo := make([]FixedVulInfo, 0)
 	for _, t := range traits {
 		if !t.filtered {
 			switch t.severity {
 			case vulnSeverityHigh:
+				if t.fixVer != "" {
+					fixedHighsInfo = append(fixedHighsInfo, FixedVulInfo{PubTS: t.pubTS})
+				}
 				highs = append(highs, t.Name)
 			case vulnSeverityMedium:
 				meds = append(meds, t.Name)
+			case vulnSeverityLow:
+				lows = append(lows, t.Name)
+
 			}
 		}
 	}
-	return highs, meds
+	return highs, meds, lows, fixedHighsInfo
 }
 
 // ----
 
 type VPFInterface interface {
 	GetUpdatedTime() time.Time
-	filterOneVulnerability(vul *api.RESTVulnerability, domains []string, image string) bool
-	FilterVulnerabilities(vuls []*api.RESTVulnerability, idns []api.RESTIDName, showTag string) []*api.RESTVulnerability
+	filterOneVulREST(vul *api.RESTVulnerability, domains []string, image string) bool
+	FilterVulREST(vuls []*api.RESTVulnerability, idns []api.RESTIDName, showTag string) []*api.RESTVulnerability
 	FilterVulTraits(traits []*VulTrait, idns []api.RESTIDName) utils.Set
+	FilterVuls(vuls []*share.ScanVulnerability, idns []api.RESTIDName) []*share.ScanVulnerability
 }
 
 type vpfEntry struct {
@@ -711,7 +776,7 @@ func (vpf vpFilter) filterOneVulTrait(vul *VulTrait, domains []string, image str
 	return false
 }
 
-func (vpf vpFilter) filterOneVulnerability(vul *api.RESTVulnerability, domains []string, image string) bool {
+func (vpf vpFilter) filterOneVulREST(vul *api.RESTVulnerability, domains []string, image string) bool {
 	for i, e := range vpf.vf.Entries {
 		f := vpf.filters[i]
 
@@ -777,8 +842,80 @@ func (vpf vpFilter) filterOneVulnerability(vul *api.RESTVulnerability, domains [
 	return false
 }
 
+func (vpf vpFilter) filterOneVul(vul *share.ScanVulnerability, domains []string, image string) bool {
+	for i, e := range vpf.vf.Entries {
+		f := vpf.filters[i]
+
+		if e.Name == api.VulnerabilityNameRecent {
+			pubTS, err := strconv.ParseInt(vul.PublishedDate, 0, 64)
+			if err == nil {
+				if uint(time.Since(time.Unix(pubTS, 0)).Hours()/24) >= e.Days {
+					continue
+				}
+			}
+		} else if e.Name == api.VulnerabilityNameRecentWithoutFix {
+			pubTS, err := strconv.ParseInt(vul.PublishedDate, 0, 64)
+			if err == nil {
+				if vul.FixedVersion != "" || uint(time.Since(time.Unix(pubTS, 0)).Hours()/24) >= e.Days {
+					continue
+				}
+			}
+		} else {
+			// case insensitive
+			if f.isNameRegexp && !f.name.MatchString(vul.Name) {
+				continue
+			} else if !f.isNameRegexp && !strings.EqualFold(e.Name, vul.Name) {
+				continue
+			}
+		}
+
+		// if one of domains/images matches move to the next field
+		if len(e.Domains) > 0 {
+			if len(domains) == 0 {
+				continue
+			}
+			for j, fdomain := range e.Domains {
+				if f.isDomainRegexp[j] {
+					for _, domain := range domains {
+						if f.domains[j].MatchString(domain) {
+							goto MATCH_IMAGE
+						}
+					}
+				} else {
+					for _, domain := range domains {
+						if fdomain == domain {
+							goto MATCH_IMAGE
+						}
+					}
+				}
+			}
+			continue
+		}
+
+	MATCH_IMAGE:
+		if len(e.Images) > 0 {
+			if image == "" {
+				continue
+			}
+			for j, fimage := range e.Images {
+				if f.isImageRegexp[j] && f.images[j].MatchString(image) {
+					goto MATCH
+				} else if !f.isImageRegexp[j] && fimage == image {
+					goto MATCH
+				}
+			}
+			continue
+		}
+
+	MATCH:
+		return true
+	}
+
+	return false
+}
+
 // Use Domains as namespace and DisplayName as image name
-func (vpf vpFilter) FilterVulnerabilities(vuls []*api.RESTVulnerability, idns []api.RESTIDName, showTag string) []*api.RESTVulnerability {
+func (vpf vpFilter) FilterVulREST(vuls []*api.RESTVulnerability, idns []api.RESTIDName, showTag string) []*api.RESTVulnerability {
 	if vpf.vf == nil || len(vpf.vf.Entries) == 0 {
 		return vuls
 	}
@@ -787,10 +924,10 @@ func (vpf vpFilter) FilterVulnerabilities(vuls []*api.RESTVulnerability, idns []
 	for _, v := range vuls {
 		skip := false
 		if len(idns) == 0 {
-			skip = vpf.filterOneVulnerability(v, nil, "")
+			skip = vpf.filterOneVulREST(v, nil, "")
 		} else {
 			for _, s := range idns {
-				if vpf.filterOneVulnerability(v, s.Domains, s.DisplayName) {
+				if vpf.filterOneVulREST(v, s.Domains, s.DisplayName) {
 					skip = true
 					break
 				}
@@ -838,4 +975,91 @@ func (vpf vpFilter) FilterVulTraits(traits []*VulTrait, idns []api.RESTIDName) u
 	}
 
 	return alives
+}
+
+// This is used when grpc struct is returned.
+func (vpf vpFilter) FilterVuls(vuls []*share.ScanVulnerability, idns []api.RESTIDName) []*share.ScanVulnerability {
+	if vpf.vf == nil || len(vpf.vf.Entries) == 0 {
+		return vuls
+	}
+
+	list := make([]*share.ScanVulnerability, 0, len(vuls))
+	for _, v := range vuls {
+		skip := false
+		if len(idns) == 0 {
+			skip = vpf.filterOneVul(v, nil, "")
+		} else {
+			for _, s := range idns {
+				if vpf.filterOneVul(v, s.Domains, s.DisplayName) {
+					skip = true
+					break
+				}
+			}
+		}
+		if !skip {
+			list = append(list, v)
+		}
+	}
+
+	return list
+}
+
+func GetCVERecord(name, dbKey, baseOS string) *api.RESTVulnerability {
+	sdb := GetScannerDB()
+	baseOS = normalizeBaseOS(baseOS)
+
+	vul := &api.RESTVulnerability{
+		Name: name,
+	}
+
+	cvedb := sdb.CVEDB
+	if dbKey != "" {
+		if vr, ok := cvedb[dbKey]; ok {
+			fillVulFields(vr, vul)
+		}
+	} else {
+		key := fmt.Sprintf("%s:%s", baseOS, vul.Name)
+		if vr, ok := cvedb[key]; ok {
+			fillVulFields(vr, vul)
+		} else {
+			// lookup apps
+			key = fmt.Sprintf("apps:%s", vul.Name)
+			if vr, ok := cvedb[key]; ok {
+				fillVulFields(vr, vul)
+			} else {
+				if vr, ok := cvedb[vul.Name]; ok {
+					fillVulFields(vr, vul)
+				}
+			}
+		}
+	}
+
+	return vul
+}
+
+// load simulation
+func Perf_getRandomCVEs(count int) []string {
+	sdb := GetScannerDB()
+	cvedb := sdb.CVEDB
+
+	rand.Seed(time.Now().UnixNano())
+
+	// Get all cve names
+	keys := make([]string, 0, len(cvedb))
+	for key := range cvedb {
+		keys = append(keys, key)
+	}
+
+	// Shuffle the keys
+	rand.Shuffle(len(keys), func(i, j int) {
+		keys[i], keys[j] = keys[j], keys[i]
+	})
+
+	// Pick the first 'count' keys
+	if count > len(keys) {
+		count = len(keys)
+	}
+	selectedKeys := keys[:count]
+
+	return selectedKeys
 }

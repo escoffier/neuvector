@@ -16,6 +16,7 @@ import (
 	"github.com/neuvector/neuvector/controller/api"
 	"github.com/neuvector/neuvector/controller/common"
 	"github.com/neuvector/neuvector/controller/scheduler"
+	"github.com/neuvector/neuvector/db"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/cluster"
 	"github.com/neuvector/neuvector/share/httptrace"
@@ -47,21 +48,23 @@ type pollContext struct {
 
 // This structure is derived from image summary and scan report. Mostly used for admisssion control
 type imageInfoCache struct {
-	highVuls        int
-	medVuls         int
-	highVulsWithFix int
-	vulScore        float32
-	vulTraits       []*scanUtils.VulTrait
-	vulInfo         map[string]map[string]share.CLUSScannedVulInfo // 1st key is "high"/"medium". 2nd key is "{vul_name}::{package_name}"
-	lowVulInfo      []share.CLUSScannedVulInfoSimple
-	layers          []string
-	envs            []string
-	cmds            []string
-	labels          map[string]string
-	modules         []*share.ScanModule
-	secrets         []*share.ScanSecretLog
-	setIDPerm       []*share.ScanSetIdPermLog
-	filteredTime    time.Time
+	highVuls                       int
+	medVuls                        int
+	highVulsWithFix                int
+	vulScore                       float32
+	vulTraits                      []*scanUtils.VulTrait
+	vulInfo                        map[string]map[string]share.CLUSScannedVulInfo // 1st key is "high"/"medium". 2nd key is "{vul_name}::{package_name}"
+	lowVulInfo                     []share.CLUSScannedVulInfoSimple
+	layers                         []string
+	envs                           []string
+	cmds                           []string
+	labels                         map[string]string
+	modules                        []*share.ScanModule
+	secrets                        []*share.ScanSecretLog
+	setIDPerm                      []*share.ScanSetIdPermLog
+	filteredTime                   time.Time
+	signatureVerifiers             []string
+	signatureVerificationTimestamp string
 }
 
 type Registry struct {
@@ -432,7 +435,9 @@ func RegistryStateUpdate(name string, state *share.CLUSRegistryState) {
 	}
 }
 
-func RegistryImageStateUpdate(name, id string, sum *share.CLUSRegistryImageSummary, vpf scanUtils.VPFInterface) (utils.Set, []string, []string) {
+func RegistryImageStateUpdate(name, id string, sum *share.CLUSRegistryImageSummary, calculateLayers bool, vpf scanUtils.VPFInterface) (
+	utils.Set, []string, []string, []scanUtils.FixedVulInfo, map[string][]string, map[string][]string) {
+
 	smd.scanLog.WithFields(log.Fields{"registry": name, "id": id}).Debug()
 
 	var rs *Registry
@@ -443,12 +448,15 @@ func RegistryImageStateUpdate(name, id string, sum *share.CLUSRegistryImageSumma
 	} else if name == common.RegistryFedRepoScanName {
 		rs = repoFedScanRegistry
 	} else if rs, _ = regMapLookup(name); rs == nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil, nil, nil
 	}
 
 	var c *imageInfoCache
-	var highs, meds []string
+	var highs, meds, lows []string
 	var alives utils.Set // vul names that are not filtered
+	layerHighMap := make(map[string][]string, 0)
+	layerMedMap := make(map[string][]string, 0)
+	fixedHighsInfo := make([]scanUtils.FixedVulInfo, 0) // fixed high vul info
 
 	if sum != nil && sum.Status == api.ScanStatusFinished {
 		key := share.CLUSRegistryImageDataKey(name, id)
@@ -467,7 +475,14 @@ func RegistryImageStateUpdate(name, id string, sum *share.CLUSRegistryImageSumma
 				}
 			}
 
-			highs, meds, c.highVulsWithFix, c.vulScore, c.vulInfo, c.lowVulInfo = countVuln(report.Vuls, alives)
+			highs, meds, lows, c.highVulsWithFix, c.vulScore, c.vulInfo, c.lowVulInfo = countVuln(report.Vuls, c.vulTraits, alives)
+			if info, ok := c.vulInfo[share.VulnSeverityHigh]; ok {
+				fixedHighsInfo = make([]scanUtils.FixedVulInfo, 0, len(info))
+				for _, v := range info {
+					// ks is in format "{vul name}::{package name}"
+					fixedHighsInfo = append(fixedHighsInfo, scanUtils.FixedVulInfo{PubTS: v.PublishDate})
+				}
+			}
 			c.highVuls = len(highs)
 			c.medVuls = len(meds)
 			c.envs = report.Envs
@@ -478,11 +493,75 @@ func RegistryImageStateUpdate(name, id string, sum *share.CLUSRegistryImageSumma
 				c.secrets = report.Secrets.Logs
 			}
 			c.setIDPerm = report.SetIdPerms
+			if report.SignatureInfo != nil {
+				c.signatureVerifiers = report.SignatureInfo.Verifiers
+				c.signatureVerificationTimestamp = report.SignatureInfo.VerificationTimestamp
+			}
 
 			c.layers = make([]string, len(report.Layers))
 			for i, l := range report.Layers {
 				c.layers[i] = l.Digest
+
+				if calculateLayers {
+					// calculate highs and meds in layers
+					layerHighs := make([]string, 0)
+					layerMeds := make([]string, 0)
+					var layerAlives utils.Set // vul names that are not filtered
+
+					if vpf != nil {
+						layerAlives = vpf.FilterVulTraits(c.vulTraits, images2IDNames(rs, sum))
+					} else {
+						layerAlives = utils.NewSet()
+						for _, t := range c.vulTraits {
+							layerAlives.Add(t.Name)
+						}
+					}
+
+					for _, v := range l.Vuls {
+						if !layerAlives.Contains(v.Name) {
+							continue
+						}
+
+						if v.Severity == share.VulnSeverityHigh {
+							layerHighs = append(layerHighs, v.Name)
+						} else if v.Severity == share.VulnSeverityMedium {
+							layerMeds = append(layerMeds, v.Name)
+						}
+					}
+
+					layerHighMap[l.Digest] = layerHighs
+					layerMedMap[l.Digest] = layerMeds
+				}
 			}
+
+			sdb := scanUtils.GetScannerDB()
+			vuls := scanUtils.FillVulTraits(sdb.CVEDB, sum.BaseOS, c.vulTraits, "", false)
+			dbAssetVul := getImageDbAssetVul(c, sum, highs, meds, lows)
+
+			// extract all package info, and assign to dbAssetVul
+			dbAssetVul.Packages = make([]*db.DbVulnResourcePackageVersion2, 0)
+			var cveLists utils.Set = utils.NewSet()
+			for _, vul := range vuls {
+				vulPackage := &db.DbVulnResourcePackageVersion2{
+					CVEName:        vul.Name,
+					PackageName:    vul.PackageName,
+					PackageVersion: vul.PackageVersion,
+					FixedVersion:   vul.FixedVersion,
+				}
+
+				fix := "nf"
+				if len(vul.FixedVersion) > 0 {
+					fix = "wf"
+				}
+				cveLists.Add(fmt.Sprintf("%s;%s;%s", vul.Name, vul.DbKey, fix))
+				dbAssetVul.Packages = append(dbAssetVul.Packages, vulPackage)
+			}
+
+			b, err := json.Marshal(cveLists.ToStringSlice())
+			if err == nil {
+				dbAssetVul.CVE_lists = string(b)
+			}
+			db.PopulateAssetVul(dbAssetVul)
 		}
 	}
 
@@ -503,12 +582,20 @@ func RegistryImageStateUpdate(name, id string, sum *share.CLUSRegistryImageSumma
 		for _, image := range sum.Images {
 			delete(rs.image2ID, image)
 		}
+
+		// delete records in database
+		if _, exist := rs.cache[id]; exist {
+			if err := db.DeleteAssetByID(db.AssetImage, id); err != nil {
+				log.WithFields(log.Fields{"err": err, "id": id}).Error("Delete asset in db failed.")
+			}
+		}
+
 		delete(rs.digest2ID, sum.Digest)
 		delete(rs.summary, id)
 		delete(rs.cache, id)
 	}
 
-	return alives, highs, meds
+	return alives, highs, meds, fixedHighsInfo, layerHighMap, layerMedMap
 }
 
 func RegistryScanCacheRefresh(ctx context.Context, vpf scanUtils.VPFInterface) {
@@ -567,10 +654,14 @@ func isPublicRegistry(cfg *share.CLUSRegistryConfig) bool {
 func newRegistryDriver(cfg *share.CLUSRegistryConfig, public bool, tracer httptrace.HTTPTrace) registryDriver {
 	baseDriver := base{
 		regURL:      cfg.Registry,
-		proxy:       GetProxy(cfg.Registry),
 		scanLayers:  cfg.ScanLayers,
 		scanSecrets: !cfg.DisableFiles,
 		tracer:      tracer,
+		ignoreProxy: cfg.IgnoreProxy,
+	}
+
+	if !baseDriver.ignoreProxy {
+		baseDriver.proxy = GetProxy(cfg.Registry)
 	}
 
 	if cfg.Type == share.RegistryTypeJFrog {
@@ -804,6 +895,10 @@ func (rs *Registry) getScanImages(sctx *scanContext, drv registryDriver, dryrun 
 					continue
 				}
 
+				if info.IsSignatureImage {
+					continue
+				}
+
 				image := share.CLUSImage{Domain: itf.Domain, Repo: itf.Repo, Tag: tag, RegMod: itf.RegMod}
 				if exist, ok := imageMap[info.ID]; ok {
 					exist.Add(image)
@@ -836,42 +931,109 @@ func (rs *Registry) checkAndPutImageResult(sctx *scanContext, id string, result 
 		// not canceled, continue
 	}
 
+	if result.ScanTypesRequested == nil {
+		// assume this is an older version of scanner returning a vuln scan
+		result.ScanTypesRequested = &share.ScanTypeMap{
+			Vulnerability: true,
+		}
+	}
+
 	if sum, ok := rs.summary[id]; ok {
 		sum.ScannedAt = time.Now().UTC()
 
-		sum.Provider = result.Provider
-		sum.BaseOS = result.Namespace
-		sum.Version = result.Version
-		sum.Result = result.Error
-		if result.Error == share.ScanErrorCode_ScanErrNone {
-			sum.Status = api.ScanStatusFinished
-		} else if result.Error == share.ScanErrorCode_ScanErrNotSupport {
-			sum.Status = api.ScanStatusFinished
-		} else if retAction == scheduler.TaskActionRequeue {
-			sum.Status = api.ScanStatusScheduled
+		// handle sum for vuln scan
+		if result.ScanTypesRequested.Vulnerability {
+			sum.Provider = result.Provider
+			sum.BaseOS = result.Namespace
+			sum.Version = result.Version
+			sum.Author = result.Author
+			sum.Size = result.Size
+			sum.Result = result.Error // this represents the vuln scan error
+			if result.Error == share.ScanErrorCode_ScanErrNone {
+				sum.Status = api.ScanStatusFinished
+			} else if result.Error == share.ScanErrorCode_ScanErrNotSupport {
+				sum.Status = api.ScanStatusFinished
+			} else if retAction == scheduler.TaskActionRequeue {
+				sum.Status = api.ScanStatusScheduled
+			} else {
+				sum.Status = api.ScanStatusFailed
+			}
+
+			if sum.Status == api.ScanStatusFinished {
+				sum.ScanFlags |= share.ScanFlagCVE
+				if len(result.Layers) != 0 {
+					sum.ScanFlags |= share.ScanFlagLayers
+				}
+				if result.Secrets != nil {
+					sum.ScanFlags |= share.ScanFlagFiles
+				}
+			}
+		}
+
+		// handle sum for signature scan
+		if result.ScanTypesRequested.Signature {
+			if result.SignatureInfo == nil {
+				result.SignatureInfo = &share.ScanSignatureInfo{}
+				sum.SignatureResult = share.ScanErrorCode_ScanErrSignatureScanError
+			} else {
+				sum.SignatureResult = result.SignatureInfo.VerificationError
+			}
+
+			if !result.ScanTypesRequested.Vulnerability { // this was a signature scan only
+				// we need to set sum.Status here since it is used later for general scan
+				// control flow, when the scan is for signatures only, always set to
+				// ScanStatusFinished, signature scan specific errors are handled via
+				// the field sum.SignatureStatus
+				sum.Status = api.ScanStatusFinished
+			}
+
+			if sum.SignatureResult == share.ScanErrorCode_ScanErrNone {
+				sum.SignatureStatus = api.ScanStatusFinished
+			} else {
+				sum.SignatureStatus = api.ScanStatusFailed
+			}
+		}
+
+		// generate the scan report to be written to clus
+		vulnResultUpdated := result.ScanTypesRequested.Vulnerability && sum.Status == api.ScanStatusFinished
+		signatureResultUpdated := result.ScanTypesRequested.Signature && sum.SignatureStatus == api.ScanStatusFinished
+
+		scanReportKey := share.CLUSRegistryImageDataKey(rs.config.Name, id)
+		var previousReport *share.CLUSScanReport
+		if !(vulnResultUpdated && signatureResultUpdated) {
+			// we only have partial results, we'll need to fetch the previous scan result
+			// in order to merge the new partial scan results into it
+			previousReport = clusHelper.GetScanReport(scanReportKey)
+
+			// possible if image has never been vuln scanned
+			if previousReport == nil {
+				previousReport = &share.CLUSScanReport{}
+			}
+
+			// possible if image has never been signature scanned
+			if previousReport.ScanResult.SignatureInfo == nil {
+				previousReport.ScanResult.SignatureInfo = &share.ScanSignatureInfo{}
+			}
+		}
+
+		report := &share.CLUSScanReport{
+			ScannedAt: sum.ScannedAt,
+		}
+
+		if vulnResultUpdated {
+			report.ScanResult = *result
 		} else {
-			sum.Status = api.ScanStatusFailed
-		}
-		sum.Author = result.Author
-		sum.Size = result.Size
-
-		if sum.Status == api.ScanStatusFinished {
-			sum.ScanFlags |= share.ScanFlagCVE
-			if len(result.Layers) != 0 {
-				sum.ScanFlags |= share.ScanFlagLayers
-			}
-			if result.Secrets != nil {
-				sum.ScanFlags |= share.ScanFlagFiles
-			}
+			report.ScanResult = previousReport.ScanResult
 		}
 
-		report := share.CLUSScanReport{
-			ScannedAt:  sum.ScannedAt,
-			ScanResult: *result,
+		if signatureResultUpdated {
+			report.ScanResult.SignatureInfo = result.SignatureInfo
+		} else {
+			report.ScanResult.SignatureInfo = previousReport.SignatureInfo
 		}
 
-		if sum.Status == api.ScanStatusFinished {
-			clusHelper.PutRegistryImageSummaryAndReport(rs.config.Name, id, smd.fedRole, sum, &report)
+		if vulnResultUpdated || signatureResultUpdated {
+			clusHelper.PutRegistryImageSummaryAndReport(rs.config.Name, id, smd.fedRole, sum, report)
 
 			if len(rs.summary) > api.ScanPersistImageMax+scanPersistImageExtra {
 				rs.cleanupOldImages()
@@ -1231,7 +1393,7 @@ func (rs *Registry) removeImageWithDifferentID(meta *imageMeta) {
 	}
 }
 
-func (rs *Registry) bSkipScanImage(sum *share.CLUSRegistryImageSummary) bool {
+func (rs *Registry) bSkipVulnScanForImage(sum *share.CLUSRegistryImageSummary) bool {
 	// smd.scanLog.WithFields(log.Fields{"sum": sum, "config": rs.config, "dbv": smd.db.CVEDBVersion}).Debug("SCT")
 
 	// has not succeeded before
@@ -1290,7 +1452,7 @@ func (rs *Registry) scheduleScanImagesOnDemand(sctx *scanContext, imageMap map[s
 			}
 
 			// Check the previous scan status, keep scanned-at unchanged
-			if rs.bSkipScanImage(sum) {
+			if rs.bSkipVulnScanForImage(sum) {
 				smd.scanLog.WithFields(log.Fields{
 					"images": meta.images, "sum.Version": sum.Version, "CVEDBVersion": smd.db.CVEDBVersion, "changed": imageChanged,
 				}).Debug("Skip scanned image")
@@ -1345,6 +1507,13 @@ func (rs *Registry) scheduleScanImages(
 	var total int
 	imageMap := make(map[string]utils.Set)
 
+	// represents the timestamp for latest kv store change to the sigstore configuration
+	// if this has changed since an image's last scan, the signatures need to be rescanned
+	sigstoreTimestamp, _, err := clusHelper.GetSigstoreTimestamp()
+	if err != nil {
+		smd.scanLog.WithFields(log.Fields{"error": err.Error()}).Debug("Failed to get sigstore timestamp")
+	}
+
 	for i := 0; i < len(itfList); i++ {
 		itf := itfList[i]
 		tags := tagList[i]
@@ -1361,6 +1530,10 @@ func (rs *Registry) scheduleScanImages(
 			total++
 			newImage := false
 
+			if info.IsSignatureImage {
+				continue
+			}
+
 			// Add to the map to be returned
 			image := share.CLUSImage{Domain: itf.Domain, Repo: itf.Repo, Tag: tag, RegMod: itf.RegMod}
 			if exist, ok := imageMap[info.ID]; ok {
@@ -1371,8 +1544,11 @@ func (rs *Registry) scheduleScanImages(
 			}
 
 			rs.stateLock()
-
-			skip := false
+			scanTypesRequired := share.ScanTypeMap{
+				Vulnerability: false,
+				Signature:     false,
+			}
+			isSignedImage := info.SignatureDigest != ""
 			sum, ok := rs.summary[info.ID]
 			if ok {
 				smd.scanLog.WithFields(log.Fields{
@@ -1399,52 +1575,106 @@ func (rs *Registry) scheduleScanImages(
 					}
 				}
 
+				// determine if vuln scan is required
 				if !newImage {
-					// if the image of the same ID has been processed in this batch, only update image list in summary
-					if imageChanged {
-						clusHelper.PutRegistryImageSummary(rs.config.Name, sum.ImageID, sum)
-					}
-					skip = true
-				} else if rs.bSkipScanImage(sum) {
-					// Check the previous scan status, keep scanned-at unchanged
-					smd.scanLog.WithFields(log.Fields{
-						"image": image, "sum.Version": sum.Version, "CVEDBVersion": smd.db.CVEDBVersion, "changed": imageChanged,
-					}).Debug("Skip scanned image")
-
-					if imageChanged {
-						clusHelper.PutRegistryImageSummary(rs.config.Name, sum.ImageID, sum)
-					}
-					skip = true
+					scanTypesRequired.Vulnerability = false
+				} else if rs.bSkipVulnScanForImage(sum) {
+					smd.scanLog.WithFields(log.Fields{"image": image, "sum.Version": sum.Version, "CVEDBVersion": smd.db.CVEDBVersion, "changed": imageChanged}).Debug("Skip vuln scan for image")
+					scanTypesRequired.Vulnerability = false
 				} else if sum.Status == api.ScanStatusScheduled {
-					smd.scanLog.WithFields(log.Fields{"image": image}).Debug("Image already scheduled")
-					if imageChanged {
-						clusHelper.PutRegistryImageSummary(rs.config.Name, sum.ImageID, sum)
-					}
-					skip = true
+					smd.scanLog.WithFields(log.Fields{"image": image}).Debug("Vuln scan for image already scheduled")
+					scanTypesRequired.Vulnerability = false
 				} else {
+					scanTypesRequired.Vulnerability = true
+				}
+
+				signatureInfoChanged := info.SignatureDigest != sum.SignatureDigest
+				sigstoreConfigurationChanged := sigstoreTimestamp != sum.SigstoreTimestamp
+
+				// determine if signature scan is required
+				if !newImage {
+					scanTypesRequired.Signature = false
+				} else if signatureInfoChanged {
+					smd.scanLog.WithFields(log.Fields{"registry": rs.config.Name, "image": image, "status": sum.Status, "imageID": info.ID}).Debug("Signature info for image changed, signature scan required.")
+					scanTypesRequired.Signature = true
+					sum.SignatureDigest = info.SignatureDigest
+					imageChanged = true
+				} else if sigstoreConfigurationChanged && isSignedImage {
+					smd.scanLog.WithFields(log.Fields{"registry": rs.config.Name, "image": image, "status": sum.Status, "imageID": info.ID}).Debug("Sigstore config changed and image is signed, signature scan required.")
+					scanTypesRequired.Signature = true
+					sum.SigstoreTimestamp = sigstoreTimestamp
+					imageChanged = true
+				} else if sum.SignatureStatus == api.ScanStatusFailed {
+					smd.scanLog.WithFields(log.Fields{"registry": rs.config.Name, "image": image, "status": sum.Status, "imageID": info.ID}).Debug("Previous signature scan failed, signature scan required.")
+					scanTypesRequired.Signature = true
+				}
+
+				if !scanTypesRequired.Signature {
+					smd.scanLog.WithFields(log.Fields{
+						"image":                     image,
+						"sum.Version":               sum.Version,
+						"previousSignatureDigest":   sum.SignatureDigest,
+						"currentSignatureDigest":    info.SignatureDigest,
+						"previousSigstoreTimestamp": sum.SigstoreTimestamp,
+						"currentSigstoreTimestamp":  sigstoreTimestamp,
+					}).Debug("Signature scan not required for image, skipping.")
+				}
+
+				if scanTypesRequired.Vulnerability {
 					sum.Status = api.ScanStatusScheduled
+					imageChanged = true
+				}
+
+				if scanTypesRequired.Signature {
+					sum.Status = api.ScanStatusScheduled
+					sum.SignatureStatus = api.ScanStatusScheduled
+					imageChanged = true
+				}
+
+				if imageChanged {
 					clusHelper.PutRegistryImageSummary(rs.config.Name, sum.ImageID, sum)
 				}
 			} else {
 				sum = &share.CLUSRegistryImageSummary{
-					ImageID:  info.ID,
-					Registry: rs.config.Registry,
-					RegName:  rs.config.Name,
-					Digest:   info.Digest,
-					// Signed:    info.Signed, [2019.Apr] comment out until we can accurately tell it
-					RunAsRoot: info.RunAsRoot,
-					Status:    api.ScanStatusScheduled,
-					Images:    []share.CLUSImage{image},
+					ImageID:           info.ID,
+					Registry:          rs.config.Registry,
+					RegName:           rs.config.Name,
+					Digest:            info.Digest,
+					RunAsRoot:         info.RunAsRoot,
+					Author:            info.Author,
+					Status:            api.ScanStatusScheduled,
+					CreatedAt:         info.Created,
+					SignatureDigest:   info.SignatureDigest,
+					SigstoreTimestamp: sigstoreTimestamp,
+					Images:            []share.CLUSImage{image},
 				}
 				rs.summary[info.ID] = sum
+				scanTypesRequired.Vulnerability = true
+
+				if isSignedImage {
+					smd.scanLog.WithFields(log.Fields{"registry": rs.config.Name, "image": image, "status": sum.Status, "imageID": info.ID}).Debug("New signed image detected, signature scan required.")
+					sum.SignatureStatus = api.ScanStatusScheduled
+					scanTypesRequired.Signature = true
+				} else {
+					sum.SignatureStatus = api.ScanStatusFinished
+				}
+
 				// update status in cluster
 				clusHelper.PutRegistryImageSummary(rs.config.Name, sum.ImageID, sum)
 			}
 
-			if !skip {
-				smd.scanLog.WithFields(log.Fields{"registry": rs.config.Name, "image": image}).Debug("Schedule image scan")
-
-				task := &regScanTask{sctx: sctx, reg: rs, imageID: info.ID}
+			if scanTypesRequired.Vulnerability || scanTypesRequired.Signature {
+				smd.scanLog.WithFields(log.Fields{
+					"registry":          rs.config.Name,
+					"image":             image,
+					"scanTypesRequired": scanTypesRequired,
+				}).Debug("Schedule image scan")
+				task := &regScanTask{
+					sctx:              sctx,
+					reg:               rs,
+					imageID:           info.ID,
+					scanTypesRequired: scanTypesRequired,
+				}
 				regScher.AddTask(task, false)
 				rs.taskQueue.Add(info.ID)
 			}
@@ -1477,6 +1707,7 @@ func (rs *Registry) getConfig(acc *access.AccessControl) *api.RESTRegistry {
 		GitlabPrivateToken: rs.config.GitlabPrivateToken,
 		IBMCloudTokenURL:   rs.config.IBMCloudTokenURL,
 		IBMCloudAccount:    rs.config.IBMCloudAccount,
+		IgnoreProxy:        rs.config.IgnoreProxy,
 	}
 	if len(rs.config.Domains) != 0 {
 		reg.Domains = rs.config.Domains
@@ -1580,11 +1811,12 @@ func (rs *Registry) polling(ctx context.Context) {
 const maxRetry = 3
 
 type regScanTask struct {
-	sctx    *scanContext
-	reg     *Registry
-	imageID string
-	retries int
-	cancel  context.CancelFunc
+	sctx              *scanContext
+	reg               *Registry
+	imageID           string
+	retries           int
+	cancel            context.CancelFunc
+	scanTypesRequired share.ScanTypeMap
 }
 
 func (t *regScanTask) Print(msg string) {
@@ -1625,15 +1857,11 @@ func (t *regScanTask) Handler(scanner string) scheduler.Action {
 		defer cancel()
 
 		smd.scanLog.WithFields(log.Fields{"scanner": scanner, "registry": t.reg.config.Name, "repo": sum.Images[0].Repo, "tag": sum.Images[0].Tag}).Debug("Scan start")
-		result = t.reg.driver.ScanImage(scanner, ctx, sum.ImageID, sum.Digest, sum.Images[0].Repo, sum.Images[0].Tag)
+		result = t.reg.driver.ScanImage(scanner, ctx, sum.ImageID, sum.Digest, sum.Images[0].Repo, sum.Images[0].Tag, t.scanTypesRequired)
 		smd.scanLog.WithFields(log.Fields{"scanner": scanner, "images": sum.Images, "result": scanUtils.ScanErrorToStr(result.Error)}).Debug("Scan done")
 
 		retAction := scheduler.TaskActionDone
-		if (result.Error == share.ScanErrorCode_ScanErrTimeout ||
-			result.Error == share.ScanErrorCode_ScanErrRegistryAPI ||
-			result.Error == share.ScanErrorCode_ScanErrFileSystem ||
-			result.Error == share.ScanErrorCode_ScanErrNetwork ||
-			result.Error == share.ScanErrorCode_ScanErrContainerAPI) && t.retries < maxRetry {
+		if t.shouldRetry(result) {
 			t.retries++
 			retAction = scheduler.TaskActionRequeue
 			smd.scanLog.WithFields(log.Fields{"scanner": scanner, "images": sum.Images, "retry": t.retries}).Debug("requeue")
@@ -1641,10 +1869,59 @@ func (t *regScanTask) Handler(scanner string) scheduler.Action {
 
 		regScher.TaskDone(t, retAction)
 
+		smd.scanLog.WithFields(log.Fields{"scanTypesRequested": result.ScanTypesRequested}).Debug("scan types requested")
 		if left := t.reg.checkAndPutImageResult(t.sctx, id, result, retAction); left < 0 {
 			smd.scanLog.WithFields(log.Fields{"registry": t.reg.config.Registry}).Debug("Registry scan canceled")
 		}
 	}()
 
 	return scheduler.TaskActionWait
+}
+
+func (t *regScanTask) shouldRetry(result *share.ScanResult) bool {
+	return (result.Error == share.ScanErrorCode_ScanErrTimeout ||
+		result.Error == share.ScanErrorCode_ScanErrRegistryAPI ||
+		result.Error == share.ScanErrorCode_ScanErrFileSystem ||
+		result.Error == share.ScanErrorCode_ScanErrNetwork ||
+		result.Error == share.ScanErrorCode_ScanErrContainerAPI) && !t.reachedMaxRetries()
+}
+
+func (t *regScanTask) reachedMaxRetries() bool {
+	return t.retries == maxRetry
+}
+
+func IsRegistryImageScanned(id string) bool {
+	var scanned bool
+
+	regReadLock()
+	for _, rs := range regMap {
+		rs.stateLock()
+		if sum, ok := rs.summary[id]; ok {
+			// smd.scanLog.WithFields(log.Fields{"img": id, "summary": sum}).Debug("found")
+			scanned = (sum.Status == api.ScanStatusFinished)
+		}
+		rs.stateUnlock()
+
+		if scanned {
+			break
+		}
+	}
+	regReadUnlock()
+
+	// smd.scanLog.WithFields(log.Fields{"img": id, "scanned": scanned}).Debug()
+	return scanned
+}
+
+func getImageDbAssetVul(c *imageInfoCache, sum *share.CLUSRegistryImageSummary, highs, meds, lows []string) *db.DbAssetVul {
+	d := &db.DbAssetVul{
+		Type:       db.AssetImage,
+		AssetID:    sum.ImageID,
+		CVE_high:   c.highVuls,
+		CVE_medium: c.medVuls,
+		CVE_low:    len(lows),
+	}
+	if len(sum.Images) > 0 {
+		d.Name = fmt.Sprintf("%s:%s", sum.Images[0].Repo, sum.Images[0].Tag)
+	}
+	return d
 }

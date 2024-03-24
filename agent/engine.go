@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -21,12 +22,14 @@ import (
 	"github.com/neuvector/neuvector/agent/dp"
 	"github.com/neuvector/neuvector/agent/pipe"
 	"github.com/neuvector/neuvector/agent/probe"
+	"github.com/neuvector/neuvector/agent/policy"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/container"
 	"github.com/neuvector/neuvector/share/fsmon"
 	"github.com/neuvector/neuvector/share/global"
 	"github.com/neuvector/neuvector/share/osutil"
 	"github.com/neuvector/neuvector/share/utils"
+	"github.com/vishvananda/netlink"
 )
 
 const containerWaitParentPeriod time.Duration = (time.Second * 1)
@@ -103,18 +106,20 @@ type localSystemInfo struct {
 	localSubnetMap map[string]share.CLUSSubnet
 	// all subnets that all containers in the cluster connect to, including
 	// local subnets and subnets populated from controller
-	internalSubnets map[string]share.CLUSSubnet
-	containerConfig map[string]*share.CLUSWorkloadConfig
-	policyMode      string
-	agentConfig     share.CLUSAgentConfig
-	agentStats      share.ContainerStats
-	hostIPs         utils.Set
-	tapProxymesh    bool
-	jumboFrameMTU   bool
-	xffEnabled      bool
-	ciliumCNI       bool
-	disableNetPolicy bool
+	internalSubnets   map[string]share.CLUSSubnet
+	containerConfig   map[string]*share.CLUSWorkloadConfig
+	policyMode        string
+	agentConfig       share.CLUSAgentConfig
+	agentStats        share.ContainerStats
+	hostIPs           utils.Set
+	tapProxymesh      bool
+	jumboFrameMTU     bool
+	xffEnabled        bool
+	ciliumCNI         bool
+	disableNetPolicy  bool
 	detectUnmanagedWl bool
+	enableIcmpPolicy  bool
+	linkStates        map[string]bool
 }
 
 var defaultPolicyMode string = share.PolicyModeLearn
@@ -124,7 +129,7 @@ var defaultTapProxymesh bool = true
 var defaultXffEnabled bool = false
 var defaultDisableNetPolicy bool = false
 var defaultDetectUnmanagedWl bool = false
-var specialSubnets map[string]share.CLUSSpecSubnet = make(map[string]share.CLUSSpecSubnet)
+var defaultEnableIcmpPolicy bool = false
 var rtStorageDriver string
 
 var gInfo localSystemInfo = localSystemInfo{
@@ -146,6 +151,7 @@ var gInfo localSystemInfo = localSystemInfo{
 	jumboFrameMTU:    false,
 	xffEnabled:       defaultXffEnabled,
 	ciliumCNI:        false,
+	linkStates:       make(map[string]bool),
 }
 
 func gInfoLock() {
@@ -166,6 +172,13 @@ func gInfoRLock() {
 func gInfoRUnlock() {
 	//log.WithFields(log.Fields{"goroutine": utils.GetGID()}).Debug("PROC: ")
 	gInfo.mutex.RUnlock()
+}
+
+func gInfoReadActiveContainer(id string) (*containerData, bool) {
+	gInfoRLock()
+	c, ok := gInfo.activeContainers[id]
+	gInfoRUnlock()
+	return c, ok
 }
 
 func getContainerByMAC(mac net.HardwareAddr) *containerData {
@@ -242,6 +255,10 @@ func isNeuvectorFunctionRole(role string, rootPid int) bool {
 		entryPtSig = "sleep" // 4.4: "/usr/local/bin/upgrader"
 	case "fetcher":
 		entryPtSig = "/usr/local/bin/fetcher"
+	case "csp":
+		entryPtSig = "/usr/bin/csp-billing-adapter"
+	case "registry-adapter":
+		entryPtSig = "/usr/local/bin/adapter"
 	default:
 		//	log.WithFields(log.Fields{"invalid role": role}).Debug("PROC:")
 		return false // exclude others
@@ -313,6 +330,16 @@ func isNeuVectorContainer(info *container.ContainerMetaExtra) (string, bool) {
 	return "", false
 }
 
+func getNeuVectorRole(info *container.ContainerMetaExtra) (string, bool) {
+	labels := info.Labels
+	if Agent.Domain != "" && Agent.Domain != global.ORCH.GetDomain(labels) { // orchestra
+		return "", false
+	}
+
+	role, ok := labels[share.NeuVectorLabelRole]
+	return role, ok
+}
+
 func isSidecarContainer(labels map[string]string) bool {
 	//check if container is a sidecar that is linkerd-proxy or istio-proxy
 	sc_containername, _ := labels[container.KubeKeyContainerName]
@@ -348,17 +375,13 @@ func runtimeEventCallback(ev container.Event, id string, pid int) {
 		task := ContainerTask{task: TASK_DEL_CONTAINER, id: id}
 		ContainerTaskChan <- &task
 	case container.EventContainerCopyIn:
-		gInfoRLock()
-		defer gInfoRUnlock()
-		if c, ok := gInfo.activeContainers[id]; ok {
+		if c, ok := gInfoReadActiveContainer(id); ok {
 			prober.ReportDockerCp(id, c.name, true)
 		} else if isAgentContainer(id) {
 			prober.ReportDockerCp(id, Agent.Name, true)
 		}
 	case container.EventContainerCopyOut:
-		gInfoRLock()
-		defer gInfoRUnlock()
-		if c, ok := gInfo.activeContainers[id]; ok {
+		if c, ok := gInfoReadActiveContainer(id); ok {
 			prober.ReportDockerCp(id, c.name, false)
 		} else if isAgentContainer(id) {
 			prober.ReportDockerCp(id, Agent.Name, false)
@@ -469,7 +492,7 @@ func notifyDPContainerApps(c *containerData) {
 func updatePods(c *containerData, quarReason *string) {
 	if c.pods.Cardinality() > 0 {
 		for pod := range c.pods.Iter() {
-			if pc, ok := gInfo.activeContainers[pod.(string)]; ok {
+			if pc, ok := gInfoReadActiveContainer(pod.(string)); ok {
 				pc.inline = c.inline
 				pc.quar = c.quar
 				ClusterEventChan <- &ClusterEvent{
@@ -479,8 +502,7 @@ func updatePods(c *containerData, quarReason *string) {
 			}
 		}
 	} else if c.parentNS != "" {
-		p, ok := gInfo.activeContainers[c.parentNS]
-		if ok { //parent exist
+		if p, ok := gInfoReadActiveContainer(c.parentNS); ok { //parent exist
 			p.inline = c.inline
 			p.quar = c.quar
 			ClusterEventChan <- &ClusterEvent{
@@ -490,7 +512,7 @@ func updatePods(c *containerData, quarReason *string) {
 			for podID := range p.pods.Iter() {
 				podid := podID.(string)
 				if podid != c.id {
-					if ch, ok1 := gInfo.activeContainers[podid]; ok1 {
+					if ch, ok1 := gInfoReadActiveContainer(podid); ok1 {
 						ch.inline = c.inline
 						ch.quar = c.quar
 						ClusterEventChan <- &ClusterEvent{
@@ -754,10 +776,10 @@ func getIPAddrScope(mac net.HardwareAddr, ip net.IP) (string, string) {
 }
 
 // Return if container is child and its parent container.
-func getSharedContainer(info *container.ContainerMetaExtra) (bool, *containerData) {
+func getSharedContainerWithLock(info *container.ContainerMetaExtra) (bool, *containerData) {
 	if isChild, parent_cid := global.RT.GetParent(info, gInfo.activePid2ID); parent_cid != "" {
-		var ok bool
 		var parent *containerData
+		var ok bool
 		if parent, ok = gInfo.activeContainers[parent_cid]; !ok {
 			if real_parent_cid := getContainerIDByName(parent_cid); real_parent_cid != "" {
 				parent_cid = real_parent_cid
@@ -773,6 +795,13 @@ func getSharedContainer(info *container.ContainerMetaExtra) (bool, *containerDat
 	} else {
 		return isChild, nil
 	}
+}
+
+// Return if container is child and its parent container.
+func getSharedContainer(info *container.ContainerMetaExtra) (bool, *containerData) {
+	gInfoRLock()
+	defer gInfoRUnlock()
+	return getSharedContainerWithLock(info)
 }
 
 func intcpPairs2Ifaces(intcpPairs []*pipe.InterceptPair) map[string][]share.CLUSIPAddr {
@@ -989,7 +1018,7 @@ func taskReexamIntfContainer(id string, info *container.ContainerMetaExtra, rest
 	}
 
 	// Check if the container is the same running instance when event is scheduled.
-	c, ok := gInfo.activeContainers[id]
+	c, ok := gInfoReadActiveContainer(id)
 	if !ok || (info != nil && c.pid != info.Pid) || !c.propertyFilled {
 		return
 	}
@@ -1091,7 +1120,7 @@ func updateAppPorts(c *containerData, parent *containerData) bool {
 func taskReexamProcContainer(id string, info *container.ContainerMetaExtra) {
 
 	// Check if the container is the same running instance when event is scheduled.
-	c, ok := gInfo.activeContainers[id]
+	c, ok := gInfoReadActiveContainer(id)
 	if !ok || (info != nil && c.pid != info.Pid) || !c.propertyFilled {
 		return
 	}
@@ -1171,6 +1200,9 @@ func fillContainerProperties(c *containerData, parent *containerData,
 			c.capIntcp = !hostMode
 			c.capBlock = true
 		}
+		if c.pid == 0 {
+			c.hasDatapath = false
+		}
 		c.inline = isContainerInline(c)
 		c.blocking = isContainerBlocking(c)
 		c.quar = isContainerQuarantine(c)
@@ -1186,16 +1218,20 @@ func fillContainerProperties(c *containerData, parent *containerData,
 		c.blocking = parent.blocking
 		c.quar = parent.quar
 		if parent.pid == 0 {
-			//in taskInterceptContainer there is logic for parent to
-			//reach this function first, child come later so set child
-			//hasDatapath=parent.hasDatapath, set parent.hasDatapath=false
-			//to prevent duplicate child/ep to be pushed to dp
-			c.hasDatapath = parent.hasDatapath
+			//NVSHAS-7830, multiple children exist, some may not be runnig
+			//when parent pid=0, need to set all child hasDatapath to true
+			//NVSHAS-8406,for istio only set app container to have datapath
+			info.Sidecar = isSidecarContainer(info.Labels)
+			if !info.Sidecar {
+				c.hasDatapath = true
+			}
 			parent.hasDatapath = false
 		}
 	}
+
 	c.cgroupMemory, _ = global.SYS.GetContainerCgroupPath(info.Pid, "memory")
 	c.cgroupCPUAcct, _ = global.SYS.GetContainerCgroupPath(info.Pid, "cpuacct")
+
 	c.upperDir, c.rootFs, _ = lookupContainerLayerPath(c.pid, c.id)
 	c.propertyFilled = true
 	log.WithFields(log.Fields{"uppDir": c.upperDir, "rootFs": c.rootFs, "id": c.id}).Debug()
@@ -1231,7 +1267,8 @@ func updateContainerNetworks(c *containerData, info *container.ContainerMetaExtr
 			epname := fmt.Sprintf("%s-endpoint", n.Name)
 			if _, ok = gInfo.networkLBs[netID]; !ok {
 				if ep, err := global.RT.GetNetworkEndpoint(netID, cname, epname); err != nil {
-					log.WithFields(log.Fields{"error": err, "container": cname, "endpoint": epname}).Error("Error reading container network endpoint")
+					// Lower the debug level. We see repeated log on this.
+					log.WithFields(log.Fields{"error": err, "container": cname, "endpoint": epname}).Debug("Error reading container network endpoint")
 				} else {
 					gInfo.networkLBs[netID] = ep
 
@@ -1631,12 +1668,14 @@ func startNeuVectorMonitors(id, role string, info *container.ContainerMetaExtra)
 	// Send event to controller
 	if !isChild {
 		if c.pid != 0 {
+			prober.BuildProcessFamilyGroups(c.id, c.pid, true, info.Privileged)
 			c.examIntface = true
 			prober.StartMonitorInterface(c.id, c.pid, containerReexamIntfMax)
 			examNeuVectorInterface(c, changeInit)
 		}
 	} else {
 		if parent != nil && !parent.examIntface {
+			prober.BuildProcessFamilyGroups(c.id, c.pid, false, info.Privileged)
 			parent.examIntface = true
 			c.examIntface = true
 			prober.StartMonitorInterface(c.id, c.pid, containerReexamIntfMax)
@@ -1665,6 +1704,10 @@ func startNeuVectorMonitors(id, role string, info *container.ContainerMetaExtra)
 			go fileWatcher.StartWatch(id, info.Pid, conf, false, true)
 		}
 	}
+
+	nvRole := container.PlatformContainerNeuVector
+	ev := ClusterEvent{event: EV_ADD_CONTAINER, id: id, info: info, role: &nvRole, service: &c.service, domain: &c.domain}
+	ClusterEventChan <- &ev
 }
 
 //////
@@ -1757,7 +1800,7 @@ func examNetworkInterface(c *containerData) bool {
 }
 
 func taskInterceptContainer(id string, info *container.ContainerMetaExtra) {
-	c, ok := gInfo.activeContainers[id]
+	c, ok := gInfoReadActiveContainer(id)
 	if !ok {
 		return
 	}
@@ -1811,7 +1854,11 @@ func taskInterceptContainer(id string, info *container.ContainerMetaExtra) {
 			examNetworkInterface(c)
 		}
 	} else {
-		if !hostMode && parent.pid == 0 {
+		info.Sidecar = isSidecarContainer(info.Labels)
+		if info.Sidecar {
+			parent.info.ProxyMesh = true
+		}
+		if !hostMode && parent.pid == 0 && !info.Sidecar {
 			if parent.examIntface == false {
 				parent.examIntface = true // only monitor one child container
 				if examNetworkInterface(c) {
@@ -1820,28 +1867,28 @@ func taskInterceptContainer(id string, info *container.ContainerMetaExtra) {
 			}
 		}
 
-		info.Sidecar = isSidecarContainer(info.Labels)
-		if info.Sidecar {
-			parent.info.ProxyMesh = true
-			if gInfo.tapProxymesh {
-				if parent.pid != 0 {
+		if gInfo.tapProxymesh {
+			if parent.pid != 0 {
+				if info.Sidecar {
 					programProxyMeshDP(parent, false, false)
-				} else if c.hasDatapath { //child that has datapath
-					programProxyMeshDP(c, false, false)
-				} else { //find child that has datapath
-					for podID := range parent.pods.Iter() {
-						if ch, ok := gInfo.activeContainers[podID.(string)]; ok && ch.hasDatapath {
-							programProxyMeshDP(ch, false, false)
-							break
-						}
+				}
+			} else if c.hasDatapath { //child that has datapath
+				programProxyMeshDP(c, false, false)
+			} else { //find child that has datapath
+				for podID := range parent.pods.Iter() {
+					if ch, ok := gInfoReadActiveContainer(podID.(string)); ok && ch.hasDatapath {
+						programProxyMeshDP(ch, false, false)
+						break
 					}
 				}
 			}
 		}
 		gInfoLock()
-		if info.Sidecar && gInfo.tapProxymesh {
+		if gInfo.tapProxymesh {
 			if parent.pid != 0 {
-				updateProxyMeshMac(parent, true)
+				if info.Sidecar {
+					updateProxyMeshMac(parent, true)
+				}
 			} else if c.hasDatapath { //child that has datapath
 				updateProxyMeshMac(c, true)
 			} else { //find child that has datapath
@@ -1858,14 +1905,14 @@ func taskInterceptContainer(id string, info *container.ContainerMetaExtra) {
 		gInfoUnlock()
 	}
 	// entry to apply group policies
-	workloadJoinGroup(c)
+	workloadJoinGroup(c, parent)
 	updateAppPorts(c, parent)
 	notifyContainerChanges(c, parent, changeInit)
 }
 
 func taskAddContainer(id string, info *container.ContainerMetaExtra) {
-	// This can be invoked from Docker socket and probe. Only used in task loop, no lock.
-	if _, ok := gInfo.activeContainers[id]; ok {
+	// This can be invoked from Docker socket and probe.
+	if _, ok := gInfoReadActiveContainer(id); ok {
 		return
 	}
 
@@ -1948,7 +1995,8 @@ func taskAddContainer(id string, info *container.ContainerMetaExtra) {
 		// service is not reported until container is running; domain should be filled.
 		// it reports the exited container as well
 		svc := global.ORCH.GetService(&info.ContainerMeta, Host.Name)
-		ev := ClusterEvent{event: EV_ADD_CONTAINER, id: id, info: info, service: &svc.Name, domain: &svc.Domain}
+		service := utils.MakeServiceName(svc.Domain, svc.Name)
+		ev := ClusterEvent{event: EV_ADD_CONTAINER, id: id, info: info, service: &service, domain: &svc.Domain}
 		ClusterEventChan <- &ev
 
 		log.Debug("Container not running")
@@ -2009,7 +2057,7 @@ func taskStopContainer(id string, pid int) {
 
 	// containerd runtime report TaskExit for both process stop and container stop.
 	// Here is to make sure the pid is container's pid
-	c, ok := gInfo.activeContainers[id]
+	c, ok := gInfoReadActiveContainer(id)
 	if !ok || (pid != 0 && pid != c.pid) {
 		return
 	}
@@ -2021,9 +2069,16 @@ func taskStopContainer(id string, pid int) {
 		info = c.info
 		info.Running = false
 	} else if info.Running {
-		// not a relaible source: from process monitor
-		log.WithFields(log.Fields{"id": id}).Debug("skip stop as container is still running")
-		return
+		// docker will have a catchup event to show its Exit code
+		if global.RT.String() == container.RuntimeDocker {
+			return
+		}
+		if osutil.IsPidValid(info.Pid) && info.FinishedAt.IsZero() {
+			// Wait for the updated container info
+			// log.WithFields(log.Fields{"info": info}).Debug()
+			return
+		}
+		info.Running = false // update
 	}
 
 	if info.FinishedAt.IsZero() {
@@ -2106,7 +2161,7 @@ func taskDelContainer(id string) {
 		return
 	}
 
-	if c, ok := gInfo.activeContainers[id]; ok {
+	if c, ok := gInfoReadActiveContainer(id); ok {
 		if c.pid != 0 && osutil.IsPidValid(c.pid) {
 			// false-positive event from cri-o
 			log.WithFields(log.Fields{"container": id, "pid": c.pid}).Debug("live rootPid")
@@ -2134,7 +2189,7 @@ func taskDPConnect() {
 	dp.DPCtrlConfigAgent(debug)
 
 	dp.DPCtrlConfigInternalSubnet(gInfo.internalSubnets)
-	dp.DPCtrlConfigSpecialIPSubnet(specialSubnets)
+	dp.DPCtrlConfigSpecialIPSubnet(policy.SpecialSubnets)
 
 	if driver != pipe.PIPE_NOTC && driver != pipe.PIPE_CLM {
 		jumboFrame := gInfo.jumboFrameMTU
@@ -2165,6 +2220,9 @@ func taskDPConnect() {
 	//set detectUnmanagedWl
 	duw := gInfo.detectUnmanagedWl
 	dp.DPCtrlSetDetectUnmanagedWl(&duw)
+	//set enableIcmpPolicy
+	eip := gInfo.enableIcmpPolicy
+	dp.DPCtrlSetEnableIcmpPolicy(&eip)
 }
 
 var nextNetworkPolicyVer *share.CLUSGroupIPPolicyVer // incoming network ploicy version
@@ -2368,9 +2426,7 @@ func cbGetContainerPid(id string) int {
 		return Agent.Pid
 	}
 
-	gInfoRLock()
-	defer gInfoRUnlock()
-	if c, ok := gInfo.activeContainers[id]; ok {
+	if c, ok := gInfoReadActiveContainer(id); ok {
 		return c.pid
 	}
 	return 0
@@ -2381,9 +2437,7 @@ func getContainerService(id string) (string, bool, bool) {
 		return "nodes", true, false // allowed kill
 	}
 
-	gInfoRLock()
-	defer gInfoRUnlock()
-	if c, ok := gInfo.activeContainers[id]; ok {
+	if c, ok := gInfoReadActiveContainer(id); ok {
 		return c.service, c.capBlock, false
 	}
 
@@ -2410,4 +2464,61 @@ func cbGetAllContainerList() utils.Set {
 	gInfoRLock()
 	defer gInfoRUnlock()
 	return gInfo.allContainers.Clone()
+}
+
+func StartMonitorHostInterface(hid string, pid int, stopCh chan struct{}) {
+	log.WithFields(log.Fields{"hostid": hid}).Debug("")
+	global.SYS.CallNetNamespaceFunc(pid, func(params interface{}) {
+		intfHostMonitorLoop(hid, stopCh)
+	}, nil)
+}
+
+func intfHostMonitorLoop(hid string, stopCh chan struct{}) {
+	var err error
+	chLink := make(chan netlink.LinkUpdate)
+	doneLink := make(chan struct{})	
+	defer close(doneLink)
+
+	if err = netlink.LinkSubscribe(chLink, doneLink); err != nil {
+		log.WithFields(log.Fields{"error": err}).Error("Link change subscription failed")
+	}
+	
+	chAddr := make(chan netlink.AddrUpdate)
+	doneAddr := make(chan struct{})	
+	defer close(doneAddr)
+
+	if err = netlink.AddrSubscribe(chAddr, doneAddr); err != nil {
+		log.WithFields(log.Fields{"error": err}).Error("Address change subscription failed")
+	}
+ 
+	log.Debug("Start monitoring Host Interface changes...")
+
+	for {
+		select {
+		case <-stopCh:
+			log.WithFields(log.Fields{"hostid": hid}).Debug("Monitor host i/f Stopped")
+			return
+		case updateLink := <-chLink:
+			if updateLink.Link == nil || updateLink.Link.Attrs() == nil {
+				continue
+			}
+			linkName := updateLink.Link.Attrs().Name
+			isUp := (updateLink.IfInfomsg.Flags&syscall.IFF_UP != 0) && (updateLink.IfInfomsg.Flags&syscall.IFF_RUNNING != 0)
+			if prevState, exists := gInfo.linkStates[linkName]; exists {
+				if (prevState && isUp) || (!prevState && !isUp) {
+					continue
+				}
+			}
+			taskReexamHostIntf()
+		case updateAddr := <-chAddr:
+			// only monitor ipv4 for now
+			if utils.IsIPv4(updateAddr.LinkAddress.IP) {
+				if updateAddr.NewAddr && gInfo.hostIPs.Contains(updateAddr.LinkAddress.IP.String()) {
+					continue
+				}
+				// for all other conditions(includes address delete) re-exam host interface
+				taskReexamHostIntf()
+			}
+		}
+	}
 }

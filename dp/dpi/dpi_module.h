@@ -20,6 +20,7 @@ extern io_spec_internal_subnet4_t *g_specialip_subnet4;
 extern uint8_t g_xff_enabled;
 extern uint8_t g_disable_net_policy;
 extern uint8_t g_detect_unmanaged_wl;
+extern uint8_t g_enable_icmp_policy;
 extern io_internal_subnet4_t *g_policy_addr;
 
 typedef struct dpi_snap_ {
@@ -46,6 +47,7 @@ typedef struct dpi_thread_data_ {
     rcu_map_t meter_map;
     rcu_map_t log_map;
     rcu_map_t unknown_ip_map;
+    rcu_map_t ip_fqdn_storage_map;
 	timer_wheel_t timer;
 
 	io_internal_subnet4_t *subnet4;
@@ -77,6 +79,7 @@ extern dpi_thread_data_t g_dpi_thread_data[];
 #define th_meter_map    (g_dpi_thread_data[THREAD_ID].meter_map)
 #define th_log_map      (g_dpi_thread_data[THREAD_ID].log_map)
 #define th_unknown_ip_map      (g_dpi_thread_data[THREAD_ID].unknown_ip_map)
+#define th_ip_fqdn_storage_map (g_dpi_thread_data[THREAD_ID].ip_fqdn_storage_map)
 #define th_timer        (g_dpi_thread_data[THREAD_ID].timer)
 
 #define th_internal_subnet4 (g_dpi_thread_data[THREAD_ID].subnet4)

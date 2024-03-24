@@ -10,6 +10,28 @@ service ControllerCapService {
   rpc IsGRPCCompressed(RPCVoid) returns (CLUSBoolean);
 }
 
+message AdapterScanImageRequest {
+    string Registry = 1;
+    string Repository = 2;
+    string Tag = 3;
+    string Token = 4;
+    bool ScanLayers = 5;
+    string AdapterVersion = 6;
+}
+
+message GetScannersResponse {
+    uint32 Scanners = 1;
+    uint32 MaxScanners = 2;
+    uint32 IdleScanners = 3;
+    string ScannerVersion = 4;
+    string ScannerDBTime = 5;
+}
+
+service ControllerScanAdapterService {
+  rpc GetScanners(RPCVoid) returns (GetScannersResponse);
+  rpc ScanImage(AdapterScanImageRequest) returns (ScanResult);
+}
+
 message ScannerRegisterData {
     string CVEDBVersion = 1;
     string CVEDBCreateTime = 2;
@@ -109,6 +131,8 @@ message CLUSConnection {
 	bool MeshToSvr = 29;
 	bool LinkLocal = 30;
 	bool TmpOpen = 31;
+	bool UwlIp = 32;
+	string FQDN = 33;
 }
 
 message CLUSConnectionArray {

@@ -203,6 +203,20 @@ func connectPAIToGlobal(conn *share.CLUSConnection, sa *nodeAttr, stip *serverTi
 		if alive == false && wouldGenerateUnmanagedEndpoint(conn, false) {
 			scheduleControllerResync(resyncRequestReasonEphemeral)
 		}
+		if conn.UwlIp {
+			// Unmanaged workload
+			if ep := getAddrGroupNameFromPolicy(conn.PolicyId, false); ep != "" {
+				conn.ServerWL = ep
+				sa.addrgrp = true
+			} else {
+				ipStr := net.IP(conn.ServerIP).String()
+				ep = specialEPName(api.LearnedWorkloadPrefix, ipStr)
+				conn.ServerWL = ep
+			}
+			stip.wlPort = uint16(conn.ServerPort)
+			sa.workload = true
+			return true
+		}
 		cctx.ConnLog.WithFields(log.Fields{
 			"client": net.IP(conn.ClientIP), "server": net.IP(conn.ServerIP),
 		}).Debug("Ignore egress connection to global IP space")
@@ -421,6 +435,16 @@ func preProcessConnectPAI(conn *share.CLUSConnection) (*nodeAttr, *nodeAttr, *se
 						if ep := getAddrGroupNameFromPolicy(conn.PolicyId, false); ep != "" {
 							conn.ServerWL = ep
 							sa.addrgrp = true
+						} else if conn.FQDN != "" && conn.PolicyId == 0 &&
+							conn.PolicyAction <= C.DP_POLICY_ACTION_LEARN {
+							//learn to predefined address group
+							if fqdngrp := getFqdnAddrGroupName(conn.FQDN); fqdngrp != "" {
+								conn.ServerWL = fqdngrp
+								sa.addrgrp = true
+								cctx.ConnLog.WithFields(log.Fields{
+									"ServerWL": conn.ServerWL, "policyaction":conn.PolicyAction,
+								}).Debug("To FQDN address group")
+							}
 						}
 						stip.wlPort = uint16(conn.ServerPort)
 

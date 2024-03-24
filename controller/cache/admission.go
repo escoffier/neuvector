@@ -50,6 +50,8 @@ const (
 	_matchedSrcImageEnvVars    = "image environment variables"
 	_matchedSrcResourceEnvVars = "resource environment variables"
 	_matchedSrcBothEnvVars     = "resource and image environment variables"
+
+	_matchedSrcResourceAnnotations = "resource annotations"
 )
 
 var admUriStates map[string]*nvsysadmission.AdmUriState // key is uri for admission request
@@ -63,6 +65,7 @@ var admFedValidateDenyCache share.CLUSAdmissionRules
 var admCacheMutex sync.RWMutex // only for setting/getting admission control 'enable' state. Notice: cacheMutex could already be held when admCacheMutex.Lock() is called
 var nvDeployStatus map[string]bool
 var nvDeployDeleted uint32 // non-zero means nv deployment is being deleted
+var whRevertCount uint32   // ValidatingWebhookConfiguration neuvector-validating-admission-webhook revert count (because of unknown matchExpressions keys)
 var initFedRole string
 
 var reservedRegs = make(map[string][]string)
@@ -91,6 +94,7 @@ var critDisplayName map[string]string = map[string]string{
 	share.CriteriaKeyRequestLimit:        "resource limitation",
 	share.CriteriaKeyCustomPath:          "custom path violation",
 	share.CriteriaKeySaBindRiskyRole:     "service account bounds high risk role violation",
+	share.CriteriaKeyImageVerifiers:      "image verifiers",
 }
 
 var critDisplayName2 map[string]string = map[string]string{ // for criteria that have sub-criteria
@@ -137,6 +141,29 @@ func initCache() {
 	cacheMutexLock()
 	defer cacheMutexUnlock()
 
+	var checkAllowNsRuleCfgType share.TCfgType
+	m := clusHelper.GetFedMembership()
+	if m != nil {
+		fedMembershipCache.FedRole = m.FedRole
+		if fedMembershipCache.FedRole != api.FedRoleNone {
+			checkAllowNsRuleCfgType = share.FederalCfg
+		} else {
+			checkAllowNsRuleCfgType = share.UserCreated
+			ruleTypes := [2]string{api.ValidatingExceptRuleType, api.ValidatingDenyRuleType}
+		Exit:
+			for _, ruleType := range ruleTypes {
+				if arhs, err := clusHelper.GetAdmissionRuleList(admission.NvAdmValidateType, ruleType); err == nil {
+					for _, arh := range arhs {
+						if arh.CfgType == share.GroundCfg {
+							checkAllowNsRuleCfgType = share.GroundCfg
+							continue Exit
+						}
+					}
+				}
+			}
+		}
+	}
+
 	defAllowedNS := utils.NewSet()     // namespaces in critical(default) allow rules, enabled or not
 	allAllowedNS := utils.NewSet()     // all effectively allowed namespaces that do no contain wildcard character
 	allAllowedNsWild := utils.NewSet() // all effectively allowed namespaces that contain wildcard character
@@ -144,7 +171,7 @@ func initCache() {
 	ruleCaches := [4]*share.CLUSAdmissionRules{&admValidateExceptCache, &admValidateDenyCache, &admFedValidateExceptionCache, &admFedValidateDenyCache}
 	for idx, ruleType := range ruleTypes {
 		arhs, err := clusHelper.GetAdmissionRuleList(admission.NvAdmValidateType, ruleType)
-		if err != nil {
+		if err != nil && err.Error() == cluster.ErrKeyNotFound.Error() {
 			clusHelper.PutAdmissionRuleList(admission.NvAdmValidateType, ruleType, arhs)
 		}
 		ruleCaches[idx].RuleMap = make(map[uint32]*share.CLUSAdmissionRule, len(arhs)) // key is ruleID
@@ -157,15 +184,19 @@ func initCache() {
 				}
 				for _, crt := range r.Criteria {
 					switch crt.Op {
-					case share.CriteriaOpContainsAll, share.CriteriaOpContainsAny, share.CriteriaOpNotContainsAny, share.CriteriaOpContainsOtherThan:
+					case share.CriteriaOpContainsAll, share.CriteriaOpContainsAny, share.CriteriaOpNotContainsAny, share.CriteriaOpContainsOtherThan,
+						share.CriteriaOpRegexContainsAny, share.CriteriaOpRegexNotContainsAny:
 						crt.ValueSlice = strings.Split(crt.Value, setDelim)
+						for i, value := range crt.ValueSlice {
+							crt.ValueSlice[i] = strings.TrimSpace(value)
+						}
 					}
 				}
 				ruleCaches[idx].RuleMap[arh.ID] = r
 				ruleCaches[idx].RuleHeads = append(ruleCaches[idx].RuleHeads, rh)
 
 				if r.RuleType == api.ValidatingExceptRuleType {
-					if qualifiedRule := (r.Critical || r.CfgType == share.FederalCfg); qualifiedRule {
+					if qualifiedRule := (r.Critical || r.CfgType == checkAllowNsRuleCfgType); qualifiedRule {
 						for _, crt := range r.Criteria {
 							if crt.Name != share.CriteriaKeyNamespace || crt.Op != share.CriteriaOpContainsAny {
 								qualifiedRule = false
@@ -207,11 +238,6 @@ func initCache() {
 		setAdmCtrlStateInCluster(admission.NvAdmValidateType, resource.NvAdmSvcName, admStateCache.Enable, &svcAvailable)
 	}
 	updateNvDeployStatus(nil)
-
-	m := clusHelper.GetFedMembership()
-	if m != nil {
-		fedMembershipCache.FedRole = m.FedRole
-	}
 
 	reservedRegs["dockerhub"] = []string{"https://index.docker.io/", "https://registry.hub.docker.com/", "https://registry-1.docker.io/"}
 	reservedRegs["docker.io"] = reservedRegs["dockerhub"]
@@ -297,30 +323,17 @@ func admissionRule2REST(rule *share.CLUSAdmissionRule) *api.RESTAdmissionRule {
 			r.RuleType = api.ValidatingDenyRuleType
 		}
 	}
-
-	return &r
-}
-
-func copyAdmissionRule(rule *share.CLUSAdmissionRule) *share.CLUSAdmissionRule {
-	criteria := make([]*share.CLUSAdmRuleCriterion, 0, len(rule.Criteria))
-	for _, crit := range rule.Criteria {
-		c := &share.CLUSAdmRuleCriterion{
-			Name:  crit.Name,
-			Op:    crit.Op,
-			Value: crit.Value,
-		}
-		criteria = append(criteria, c)
+	if rule.Containers&share.AdmCtrlRuleContainersN > 0 {
+		r.Containers = append(r.Containers, share.AdmCtrlRuleContainers)
 	}
-	r := share.CLUSAdmissionRule{
-		ID:       rule.ID,
-		Category: rule.Category,
-		Comment:  rule.Comment,
-		Criteria: criteria,
-		Disable:  rule.Disable,
-		Critical: rule.Critical,
-		CfgType:  rule.CfgType,
-		RuleType: rule.RuleType,
-		RuleMode: rule.RuleMode,
+	if rule.Containers&share.AdmCtrlRuleInitContainersN > 0 {
+		r.Containers = append(r.Containers, share.AdmCtrlRuleInitContainers)
+	}
+	if rule.Containers&share.AdmCtrlRuleEphemeralContainersN > 0 {
+		r.Containers = append(r.Containers, share.AdmCtrlRuleEphemeralContainers)
+	}
+	if len(r.Containers) == 0 {
+		r.Containers = []string{share.AdmCtrlRuleContainers}
 	}
 
 	return &r
@@ -401,10 +414,28 @@ func evalAdmCtrlRulesForAllowedNS(admCtrlEnabled bool) {
 	newAllowedNS := utils.NewSet()     // namespaces(without wildcard char) in critical/fed allow rules only
 	newAllowedNsWild := utils.NewSet() // namespaces(with wildcard char) in critical/fed allow rules only
 	if admCtrlEnabled {
+		var checkAllowNsRuleCfgType share.TCfgType
+		fedRole := fedMembershipCache.FedRole
+		if fedRole != api.FedRoleNone {
+			checkAllowNsRuleCfgType = share.FederalCfg
+		} else {
+			checkAllowNsRuleCfgType = share.UserCreated
+			ruleCaches := [2]*share.CLUSAdmissionRules{&admValidateExceptCache, &admValidateDenyCache}
+		Exit:
+			for _, ruleCache := range ruleCaches {
+				for _, r := range ruleCache.RuleMap {
+					if r.CfgType == share.GroundCfg {
+						checkAllowNsRuleCfgType = share.GroundCfg
+						continue Exit
+					}
+				}
+			}
+		}
+
 		for _, allowedRulesCache := range []*share.CLUSAdmissionRules{&admFedValidateExceptionCache, &admValidateExceptCache} {
 			for _, r := range allowedRulesCache.RuleMap {
 				if !r.Disable && r.RuleType == api.ValidatingExceptRuleType && len(r.Criteria) > 0 {
-					if qualifiedRule := (r.Critical || r.CfgType == share.FederalCfg); qualifiedRule {
+					if qualifiedRule := (r.Critical || r.CfgType == checkAllowNsRuleCfgType); qualifiedRule {
 						for _, crt := range r.Criteria {
 							if crt.Name != share.CriteriaKeyNamespace || crt.Op != share.CriteriaOpContainsAny {
 								qualifiedRule = false
@@ -489,6 +520,9 @@ func admissionConfigUpdate(nType cluster.ClusterNotifyType, key string, value []
 					}
 					setAdmCtrlStateCache(admType, category, &state, ctrlState.Uri, ctrlState.NvStatusUri)
 				}
+				if admStateCache.Enable && !state.Enable {
+					whRevertCount = 0
+				}
 				admStateCache.Enable = state.Enable
 				admStateCache.Mode = state.Mode
 				admStateCache.DefaultAction = state.DefaultAction
@@ -504,8 +538,12 @@ func admissionConfigUpdate(nType cluster.ClusterNotifyType, key string, value []
 			json.Unmarshal(value, &rule)
 			for _, crt := range rule.Criteria {
 				switch crt.Op {
-				case share.CriteriaOpContainsAll, share.CriteriaOpContainsAny, share.CriteriaOpNotContainsAny, share.CriteriaOpContainsOtherThan:
+				case share.CriteriaOpContainsAll, share.CriteriaOpContainsAny, share.CriteriaOpNotContainsAny, share.CriteriaOpContainsOtherThan,
+					share.CriteriaOpRegexContainsAny, share.CriteriaOpRegexNotContainsAny:
 					crt.ValueSlice = strings.Split(crt.Value, setDelim)
+					for i, value := range crt.ValueSlice {
+						crt.ValueSlice[i] = strings.TrimSpace(value)
+					}
 				}
 			}
 			if rule.RuleType == "" {
@@ -526,12 +564,19 @@ func admissionConfigUpdate(nType cluster.ClusterNotifyType, key string, value []
 			for _, rh := range heads {
 				ids.Add(rh.ID)
 			}
-			for id, _ := range admPolicyCache.RuleMap {
+			evalAllowedNS := false
+			for id, r := range admPolicyCache.RuleMap {
 				if !ids.Contains(id) {
 					delete(admPolicyCache.RuleMap, id)
 					opa.DeletePolicy(id)
 					log.WithFields(log.Fields{"nType": nType, "cfgType": cfgType, "id": id}).Debug("admissionConfigUpdate, delete OPA")
+					if r.RuleType == api.ValidatingExceptRuleType || r.RuleType == share.FedAdmCtrlExceptRulesType {
+						evalAllowedNS = true
+					}
 				}
+			}
+			if evalAllowedNS {
+				evalAdmCtrlRulesForAllowedNS(admStateCache.Enable)
 			}
 		case share.CLUSAdmissionStatistics:
 			var stats share.CLUSAdmissionStats
@@ -546,12 +591,9 @@ func admissionConfigUpdate(nType cluster.ClusterNotifyType, key string, value []
 		switch cfgType {
 		case share.CLUSAdmissionCfgRule:
 			id := share.CLUSPolicyRuleKey2ID(key)
-			if r, ok := admPolicyCache.RuleMap[id]; ok {
+			if _, ok := admPolicyCache.RuleMap[id]; ok {
 				delete(admPolicyCache.RuleMap, id)
 				opa.DeletePolicy(id)
-				if r.RuleType == api.ValidatingExceptRuleType || r.RuleType == share.FedAdmCtrlExceptRulesType {
-					evalAdmCtrlRulesForAllowedNS(admStateCache.Enable)
-				}
 			}
 		case share.CLUSAdmissionCfgRuleList:
 			heads := make([]*share.CLUSRuleHead, 0)
@@ -588,7 +630,8 @@ func isStringCriterionMet(crt *share.CLUSAdmRuleCriterion, value string) (bool, 
 	case share.CriteriaOpNotRegex:
 		matched, _ := regexp.MatchString(crt.Value, value)
 		return !matched, false
-	case share.CriteriaOpContainsAll, share.CriteriaOpContainsAny, share.CriteriaOpNotContainsAny, share.CriteriaOpContainsOtherThan:
+	case share.CriteriaOpContainsAll, share.CriteriaOpContainsAny, share.CriteriaOpNotContainsAny, share.CriteriaOpContainsOtherThan,
+		share.CriteriaOpRegexContainsAny, share.CriteriaOpRegexNotContainsAny:
 		valueSet := utils.NewSet(value)
 		return isSetCriterionMet(crt, valueSet)
 	default:
@@ -721,7 +764,8 @@ func isCveScoreCountCriterionMet(crt *share.CLUSAdmRuleCriterion, highVulInfo, m
 func isSetCriterionMet(crt *share.CLUSAdmRuleCriterion, valueSet utils.Set) (bool, bool) {
 	if valueSet.Cardinality() > 0 {
 		switch crt.Op {
-		case share.CriteriaOpContainsAll, share.CriteriaOpContainsAny, share.CriteriaOpNotContainsAny:
+		case share.CriteriaOpContainsAll, share.CriteriaOpContainsAny, share.CriteriaOpNotContainsAny,
+			share.CriteriaOpRegexContainsAny, share.CriteriaOpRegexNotContainsAny:
 			for _, crtValue := range crt.ValueSlice {
 				switch crt.Op {
 				case share.CriteriaOpContainsAll:
@@ -745,6 +789,18 @@ func isSetCriterionMet(crt *share.CLUSAdmRuleCriterion, valueSet utils.Set) (boo
 					for value := range valueSet.Iter() {
 						if share.EqualMatch(crtValue, value.(string)) {
 							return false, false
+						}
+					}
+				case share.CriteriaOpRegexContainsAny, share.CriteriaOpRegexNotContainsAny:
+					if regex, err := regexp.Compile(crtValue); err == nil {
+						for value := range valueSet.Iter() {
+							if regex.MatchString(value.(string)) {
+								if crt.Op == share.CriteriaOpRegexContainsAny {
+									return true, true
+								} else {
+									return false, false
+								}
+							}
 						}
 					}
 				}
@@ -773,9 +829,9 @@ func isSetCriterionMet(crt *share.CLUSAdmRuleCriterion, valueSet utils.Set) (boo
 		} else {
 			return false, true
 		}
-	case share.CriteriaOpContainsAny:
+	case share.CriteriaOpContainsAny, share.CriteriaOpRegexContainsAny:
 		return false, true
-	case share.CriteriaOpNotContainsAny:
+	case share.CriteriaOpNotContainsAny, share.CriteriaOpRegexNotContainsAny:
 		return true, false
 	case share.CriteriaOpContainsOtherThan:
 		return false, true
@@ -1300,6 +1356,8 @@ func isAdmissionRuleMet(admResObject *nvsysadmission.AdmResObject, c *nvsysadmis
 			if met {
 				matchedSource = dataSrc
 			}
+		case share.CriteriaKeyAnnotations:
+			met, positive = isMapCriterionMet(crt, admResObject.Annotations)
 		case share.CriteriaKeyImage:
 			met, positive = isImageCriterionMet(crt, c)
 		case share.CriteriaKeyImageRegistry:
@@ -1319,7 +1377,11 @@ func isAdmissionRuleMet(admResObject *nvsysadmission.AdmResObject, c *nvsysadmis
 		case share.CriteriaKeyImageScanned:
 			met, positive = isStringCriterionMet(crt, strconv.FormatBool(scannedImage.Scanned))
 		case share.CriteriaKeyImageSigned:
-			met, positive = isStringCriterionMet(crt, strconv.FormatBool(scannedImage.Signed))
+			imageSigned := false
+			if len(scannedImage.Verifiers) > 0 {
+				imageSigned = true
+			}
+			met, positive = isStringCriterionMet(crt, strconv.FormatBool(imageSigned))
 		case share.CriteriaKeyRunAsPrivileged:
 			met, positive = isStringCriterionMet(crt, strconv.FormatBool(c.Privileged))
 		case share.CriteriaKeyRunAsRoot:
@@ -1379,6 +1441,8 @@ func isAdmissionRuleMet(admResObject *nvsysadmission.AdmResObject, c *nvsysadmis
 		case share.CriteriaKeyHasPssViolation:
 			met = len(pssViolations(crt, c, scannedImage.RunAsRoot)) > 0
 			positive = true
+		case share.CriteriaKeyImageVerifiers:
+			met, positive = isSetCriterionMet(crt, utils.NewSetFromStringSlice(scannedImage.Verifiers))
 		default:
 			met, positive = false, true
 		}
@@ -1490,6 +1554,10 @@ func getOpDisplay(crt *share.CLUSAdmRuleCriterion) string {
 		return "contains any in"
 	case share.CriteriaOpNotContainsAny:
 		return "does not contain any in"
+	case share.CriteriaOpRegexContainsAny:
+		return "contains any in regex"
+	case share.CriteriaOpRegexNotContainsAny:
+		return "does not contain any in regex"
 	case share.CriteriaOpContainsOtherThan:
 		return "contains value other than"
 	case share.CriteriaOpExist:
@@ -1545,7 +1613,8 @@ func sameNameCriteriaToString(ruleType string, criteria []*share.CLUSAdmRuleCrit
 				str = fmt.Sprintf("(%s)", displayName)
 			} else {
 				switch crt.Op {
-				case share.CriteriaOpContainsAll, share.CriteriaOpContainsAny, share.CriteriaOpNotContainsAny, share.CriteriaOpContainsOtherThan:
+				case share.CriteriaOpContainsAll, share.CriteriaOpContainsAny, share.CriteriaOpNotContainsAny, share.CriteriaOpContainsOtherThan,
+					share.CriteriaOpRegexContainsAny, share.CriteriaOpRegexNotContainsAny:
 					if crt.Type == "customPath" {
 						str = fmt.Sprintf("(%s, %s %s {%s})", displayName, crt.Path, opDsiplay, crt.Value)
 					} else {
@@ -1631,52 +1700,134 @@ func isApiPathAvailable(ctrlStates map[string]*share.CLUSAdmCtrlState) bool {
 }
 
 // matchCfgType being 0 means to compare with default(critical) rules only
+// result is per-container-image's result. (a pod could have multiple containers)
 func matchK8sAdmissionRules(admType, ruleType string, matchCfgType int, admResObject *nvsysadmission.AdmResObject, c *nvsysadmission.AdmContainerInfo,
-	matchData *nvsysadmission.AdmMatchData, scannedImages []*nvsysadmission.ScannedImageSummary, result *nvsysadmission.AdmResult, ar *admissionv1beta1.AdmissionReview) bool { // return true means mtach
+	matchData *nvsysadmission.AdmMatchData, scannedImages []*nvsysadmission.ScannedImageSummary, result *nvsysadmission.AdmResult,
+	ar *admissionv1beta1.AdmissionReview, containerType string, forTesting bool) bool { // return true means match
+
+	var isDenyRuleType bool
+	var assessMatched bool                              // whether a non-disabled rule is matched in this assessment call
+	var assessResults []*nvsysadmission.AdmAssessResult // all matched rules'(disabled or not) results for assessment only
+
+	if ruleType == share.FedAdmCtrlDenyRulesType || ruleType == api.ValidatingDenyRuleType {
+		isDenyRuleType = true
+	}
 	admPolicyCache := selectAdminPolicyCache(admType, ruleType)
 	if admPolicyCache != nil {
 		cacheMutexRLock()
 		defer cacheMutexRUnlock()
 		for _, head := range admPolicyCache.RuleHeads {
-			if rule, ok := admPolicyCache.RuleMap[head.ID]; ok && !rule.Disable && rule.Category == admission.AdmRuleCatK8s {
+			if rule, ok := admPolicyCache.RuleMap[head.ID]; ok && (forTesting || !rule.Disable) && rule.Category == admission.AdmRuleCatK8s {
 				if ((matchCfgType == _criticalRulesOnly) && rule.Critical) || (!rule.Critical && (matchCfgType == int(rule.CfgType))) {
+					// check whether this rule should be evaluated for the container
+					var evaluate bool
+					if rule.Containers == 0 {
+						if containerType == share.AdmCtrlRuleContainers {
+							evaluate = true
+						}
+					} else {
+						switch containerType {
+						case share.AdmCtrlRuleContainers:
+							if (rule.Containers & share.AdmCtrlRuleContainersN) > 0 {
+								evaluate = true
+							}
+						case share.AdmCtrlRuleInitContainers:
+							if (rule.Containers & share.AdmCtrlRuleInitContainersN) > 0 {
+								evaluate = true
+							}
+						case share.AdmCtrlRuleEphemeralContainers:
+							if (rule.Containers & share.AdmCtrlRuleEphemeralContainersN) > 0 {
+								evaluate = true
+							}
+						}
+					}
+					if !evaluate {
+						continue
+					}
+
 					for _, scannedImage := range scannedImages {
 						if matched, matchedSource := isAdmissionRuleMet(admResObject, c, scannedImage, rule.Criteria, matchData.RootAvail, ar, rule.ID); matched {
-							//populateAdmResult(c, result, scannedImage, rule, ruleType, dataSource)
-							result.RuleID = rule.ID
-							result.RuleCfgType = rule.CfgType
-							if (ruleType == share.FedAdmCtrlDenyRulesType || ruleType == api.ValidatingDenyRuleType) && rule.RuleMode != "" {
-								result.RuleMode = rule.RuleMode
+							// for assessment, disabled rule could be matched even though it's ignored in the calc of final webhook request result
+							ruleDetails := ruleToString(rule)
+							matchedDenyMsg := fillDenyMessageFromRule(c, rule, scannedImage)
+							if forTesting {
+								assessResult := &nvsysadmission.AdmAssessResult{
+									ContainerImage: c.Image,
+									RuleID:         rule.ID,
+									Disabled:       rule.Disable,
+									RuleDetails:    ruleDetails,
+									RuleCfgType:    rule.CfgType,
+									MatchedSource:  matchedSource,
+								}
+								if isDenyRuleType {
+									assessResult.RuleType = api.ValidatingDenyRuleType
+									//assessResult.DenyRuleMatched = true
+									assessResult.RuleMode = rule.RuleMode
+									if len(matchedDenyMsg) > 0 {
+										assessResult.RuleDetails += ", " + matchedDenyMsg
+									}
+								} else {
+									assessResult.RuleType = api.ValidatingAllowRuleType
+								}
+								if !rule.Disable {
+									// for assessment, disabled rules' matching results are collected as well.
+									// however, disabled rules' matching results are ignored in the calc of final webhook request result
+									if result.AssessMatchedRuleType == "" {
+										// the 1st matched non-disabled rule's type is recorded the container-image's result
+										if isDenyRuleType {
+											result.AssessMatchedRuleType = api.ValidatingDenyRuleType
+										} else {
+											result.AssessMatchedRuleType = api.ValidatingAllowRuleType
+										}
+									}
+									assessMatched = true
+								}
+								assessResults = append(assessResults, assessResult)
 							}
-							result.AdmRule = ruleToString(rule)
-							result.Image = c.Image
-							result.MatchedSource = matchedSource
-							if !result.ImageNotScanned {
-								result.ImageID = scannedImage.ImageID
-								result.Registry = scannedImage.Registry
-								result.Repository = c.ImageRepo
-								result.Tag = c.ImageTag
-								result.BaseOS = scannedImage.BaseOS
-								result.HighVulsCnt = scannedImage.HighVuls
-								result.MedVulsCnt = scannedImage.MedVuls
+							if !forTesting || len(result.AssessMatchedRuleType) == 0 {
+								result.RuleID = rule.ID
+								result.RuleCfgType = rule.CfgType
+								if isDenyRuleType && rule.RuleMode != "" {
+									result.RuleMode = rule.RuleMode
+								}
+								result.AdmRule = ruleDetails
+								result.Image = c.Image
+								result.MatchedSource = matchedSource
+								if !result.ImageNotScanned {
+									result.ImageID = scannedImage.ImageID
+									result.Registry = scannedImage.Registry
+									result.Repository = c.ImageRepo
+									result.Tag = c.ImageTag
+									result.BaseOS = scannedImage.BaseOS
+									result.HighVulsCnt = scannedImage.HighVuls
+									result.MedVulsCnt = scannedImage.MedVuls
+								}
+								// denied condition
+								if isDenyRuleType {
+									result.Msg = matchedDenyMsg
+								}
+								if !forTesting {
+									log.WithFields(log.Fields{"id": head.ID, "image": c.Image, "type": ruleType}).Debug("matched a rule")
+									return true
+								}
 							}
-							// denied condition
-							if ruleType == api.ValidatingDenyRuleType || ruleType == share.FedAdmCtrlDenyRulesType {
-								result.Msg = fillDenyMessageFromRule(c, rule, scannedImage)
-							}
-							log.WithFields(log.Fields{"id": head.ID, "image": c.Image, "type": ruleType}).Debug("matched a rule")
-							return true
 						}
 					}
 				}
 			}
 		}
 	}
+	if forTesting {
+		if len(assessResults) > 0 {
+			result.AssessResults = append(result.AssessResults, assessResults...)
+		}
+		return assessMatched
+	}
 	return false
 }
 
 // Admission control - non-UI
-func (m CacheMethod) SyncAdmCtrlStateToK8s(svcName, nvAdmName string) (bool, error) { // (skip, err)
+func (m CacheMethod) SyncAdmCtrlStateToK8s(svcName, nvAdmName string, updateDetected bool) (bool, error) { // (skip, err)
 	// Configure K8s based on settings in consul in case they are different
 	state, _ := clusHelper.GetAdmissionStateRev(svcName)
 	if state == nil {
@@ -1719,6 +1870,9 @@ func (m CacheMethod) SyncAdmCtrlStateToK8s(svcName, nvAdmName string) (bool, err
 						},
 					},
 				}
+				if updateDetected {
+					k8sResInfo.RevertCount = &whRevertCount
+				}
 			case resource.NvCrdValidatingName:
 				k8sResInfo = admission.ValidatingWebhookConfigInfo{
 					WebhooksInfo: []*admission.WebhookInfo{
@@ -1736,7 +1890,18 @@ func (m CacheMethod) SyncAdmCtrlStateToK8s(svcName, nvAdmName string) (bool, err
 				}
 			}
 			k8sResInfo.Name = nvAdmName
-			return admission.ConfigK8sAdmissionControl(k8sResInfo, ctrlState)
+			skip, err := admission.ConfigK8sAdmissionControl(&k8sResInfo, ctrlState)
+			if !skip && err == nil && k8sResInfo.UnexpectedMatchExpr != "" {
+				msg := fmt.Sprintf("Kubernetes %s %s is modified with unexpected key(s) %s", resource.RscKindValidatingWebhookConfiguration,
+					resource.NvAdmValidatingName, k8sResInfo.UnexpectedMatchExpr)
+				alog := share.CLUSEventLog{
+					Event:      share.CLUSEvK8sAdmissionWebhookCChange,
+					Msg:        msg,
+					ReportedAt: time.Now().UTC(),
+				}
+				cctx.EvQueue.Append(&alog)
+			}
+			return skip, err
 		}
 	}
 	return true, nil
@@ -1791,7 +1956,9 @@ func (m CacheMethod) IsImageScanned(c *nvsysadmission.AdmContainerInfo) (bool, i
 }
 
 func (m CacheMethod) MatchK8sAdmissionRules(admType string, admResObject *nvsysadmission.AdmResObject, c *nvsysadmission.AdmContainerInfo,
-	matchData *nvsysadmission.AdmMatchData, stamps *api.AdmCtlTimeStamps, ar *admissionv1beta1.AdmissionReview) (*nvsysadmission.AdmResult, bool) {
+	matchData *nvsysadmission.AdmMatchData, stamps *api.AdmCtlTimeStamps, ar *admissionv1beta1.AdmissionReview,
+	containerType string, forTesting bool) (*nvsysadmission.AdmResult, bool) {
+
 	result := &nvsysadmission.AdmResult{}
 	vpf := cacher.GetVulnerabilityProfileInterface(share.DefaultVulnerabilityProfileName)
 	stamps.GonnaFetch = time.Now()
@@ -1819,25 +1986,28 @@ func (m CacheMethod) MatchK8sAdmissionRules(admType string, admResObject *nvsysa
 	// 3. if no rule is matched for all containers in a request, the default action(allow) is the final action
 
 	// we compare with default allow rules first when this container doesn't match any rule yet
-	if matchData.MatchState == nvsysadmission.MatchedNone {
-		if matchK8sAdmissionRules(admType, api.ValidatingExceptRuleType, _criticalRulesOnly,
-			admResObject, c, matchData, scannedImages, result, ar) {
+	if forTesting || matchData.MatchState == nvsysadmission.MatchedNone {
+		if matched := matchK8sAdmissionRules(admType, api.ValidatingExceptRuleType, _criticalRulesOnly,
+			admResObject, c, matchData, scannedImages, result, ar, containerType, forTesting); matched && !forTesting {
 			return result, true
 		}
 	}
 
 	// if we are in federation, compare with fed admission rules(i.e. fed_admctrl_exception/fed_admctrl_deny rules) before crd/local user-defined rules
 	if fedRole := cacher.GetFedMembershipRoleNoAuth(); fedRole == api.FedRoleJoint || fedRole == api.FedRoleMaster {
-		if matchData.MatchState == nvsysadmission.MatchedNone {
-			if matchK8sAdmissionRules(admType, share.FedAdmCtrlExceptRulesType, share.FederalCfg,
-				admResObject, c, matchData, scannedImages, result, ar) {
+		if forTesting || matchData.MatchState == nvsysadmission.MatchedNone {
+			if matched := matchK8sAdmissionRules(admType, share.FedAdmCtrlExceptRulesType, share.FederalCfg,
+				admResObject, c, matchData, scannedImages, result, ar, containerType, forTesting); matched && !forTesting {
 				result.MatchFedRule = true
 				return result, true
 			}
 		}
-		if matchData.MatchState != nvsysadmission.MatchedDeny {
-			if matchK8sAdmissionRules(admType, share.FedAdmCtrlDenyRulesType, share.FederalCfg,
-				admResObject, c, matchData, scannedImages, result, ar) {
+		// 1. if it's not assessment, keep matching fed deny rules when we don't match a deny rule yet (for reducing unnecessary matching)
+		// 2. if it's assessment, keep matching deny rules (for collecting all matched deny rules)
+		if forTesting || matchData.MatchState != nvsysadmission.MatchedDeny {
+			if matched := matchK8sAdmissionRules(admType, share.FedAdmCtrlDenyRulesType, share.FederalCfg,
+				admResObject, c, matchData, scannedImages, result, ar, containerType, forTesting); matched && !forTesting {
+				// it's not assessment. simply return the matched result
 				result.MatchDeny = true
 				result.MatchFedRule = true
 				return result, true
@@ -1852,20 +2022,44 @@ func (m CacheMethod) MatchK8sAdmissionRules(admType string, admResObject *nvsysa
 	// 4. user-defined deny rules
 	for _, matchScope := range []int{share.GroundCfg, share.UserCreated} {
 		// we compare with allow rules when this container doesn't match any rule yet
-		if matchData.MatchState == nvsysadmission.MatchedNone {
-			if matchK8sAdmissionRules(admType, api.ValidatingExceptRuleType, matchScope,
-				admResObject, c, matchData, scannedImages, result, ar) {
+		// 1. if it's not assessment, keep matching crd/user-defined allow rules when we don't match a deny rule yet (for reducing unnecessary matching)
+		// 2. if it's assessment, keep matching crd/user-defined allow rules (for collecting all matched allow rules)
+		if forTesting || matchData.MatchState == nvsysadmission.MatchedNone {
+			if matched := matchK8sAdmissionRules(admType, api.ValidatingExceptRuleType, matchScope,
+				admResObject, c, matchData, scannedImages, result, ar, containerType, forTesting); matched && !forTesting {
+				// it's not assessment. simply return the matched result
 				return result, true
 			}
 		}
-
-		// we compare with deny rules when this container doesn't match any deny rule yet
-		if matchData.MatchState != nvsysadmission.MatchedDeny {
-			if matchK8sAdmissionRules(admType, api.ValidatingDenyRuleType, matchScope,
-				admResObject, c, matchData, scannedImages, result, ar) {
+		// 1. if it's not assessment, keep matching crd/user-defined deny rules when we don't match a deny rule yet (for reducing unnecessary matching)
+		// 2. if it's assessment, keep matching crd/user-defined deny rules (for collecting all matched deny rules)
+		if forTesting || matchData.MatchState != nvsysadmission.MatchedDeny {
+			if matched := matchK8sAdmissionRules(admType, api.ValidatingDenyRuleType, matchScope,
+				admResObject, c, matchData, scannedImages, result, ar, containerType, forTesting); matched && !forTesting {
+				// it's not assessment. simply return the matched result
 				result.MatchDeny = true
 				return result, true
 			}
+		}
+	}
+
+	if forTesting {
+		found := false
+		for _, r := range result.AssessResults {
+			if !r.Disabled {
+				found = true
+				result.Image = r.ContainerImage
+				result.RuleID = r.RuleID
+				result.AdmRule = r.RuleDetails
+				result.RuleCfgType = r.RuleCfgType
+				result.MatchedSource = r.MatchedSource
+				result.AssessMatchedRuleType = r.RuleType
+				result.RuleMode = r.RuleMode
+				break
+			}
+		}
+		if !found {
+			result.AssessMatchedRuleType = ""
 		}
 	}
 
@@ -1987,7 +2181,8 @@ func AdmCriteria2CLUS(criteria []*api.RESTAdmRuleCriterion) ([]*share.CLUSAdmRul
 			ValueType: crit.ValueType,
 		}
 		var critValues []string
-		if c.Op == share.CriteriaOpContainsAll || c.Op == share.CriteriaOpContainsAny || c.Op == share.CriteriaOpNotContainsAny || c.Op == share.CriteriaOpContainsOtherThan {
+		if c.Op == share.CriteriaOpContainsAll || c.Op == share.CriteriaOpContainsAny || c.Op == share.CriteriaOpNotContainsAny || c.Op == share.CriteriaOpContainsOtherThan ||
+			c.Op == share.CriteriaOpRegexContainsAny || c.Op == share.CriteriaOpRegexNotContainsAny {
 			critValues = strings.Split(crit.Value, setDelim)
 			idx := 0
 			for _, crtValue := range critValues {

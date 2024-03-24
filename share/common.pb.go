@@ -17,6 +17,8 @@ It has these top-level messages:
 	CLUSBoolean
 	CLUSMetry
 	CLUSStats
+	AdapterScanImageRequest
+	GetScannersResponse
 	ScannerRegisterData
 	ScannerDeregisterData
 	CLUSFilePacket
@@ -83,6 +85,8 @@ It has these top-level messages:
 	CLUSWorkloadIntercept
 	CLUSMeter
 	CLUSMeterArray
+	CLUSWlIDArray
+	ScanTypeMap
 	ScanVulnerability
 	ScanLayerResult
 	ScanModule
@@ -91,12 +95,17 @@ It has these top-level messages:
 	ScanSecretResult
 	ScanSetIdPermLog
 	ScanResult
+	ScanSignatureInfo
 	ScanRunningRequest
 	ScanData
 	ScanAppPackage
 	ScanAppRequest
 	ScanAwsLambdaRequest
 	ScanImageRequest
+	SigstoreRootOfTrust
+	SigstoreVerifier
+	SigstoreKeypairOptions
+	SigstoreKeylessOptions
 */
 package share
 

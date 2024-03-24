@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
-	"reflect"
 
 	log "github.com/sirupsen/logrus"
 
@@ -34,6 +34,8 @@ var containerTaskExitChan chan interface{} = make(chan interface{}, 1)
 var errRestartChan chan interface{} = make(chan interface{}, 1)
 var restartChan chan interface{} = make(chan interface{}, 1)
 var monitorExitChan chan interface{} = make(chan interface{}, 1)
+
+var monitorHostIfaceStopCh chan struct{} = make(chan struct{})
 
 var Host share.CLUSHost = share.CLUSHost{
 	Platform: share.PlatformDocker,
@@ -74,6 +76,7 @@ func isAgentContainer(id string) bool {
 }
 
 func getHostIPs() {
+	gInfo.linkStates = getHostLinks()
 	addrs := getHostAddrs()
 	Host.Ifaces, gInfo.hostIPs, gInfo.jumboFrameMTU, gInfo.ciliumCNI = parseHostAddrs(addrs, Host.Platform, Host.Network)
 	if tun := global.ORCH.GetHostTunnelIP(addrs); tun != nil {
@@ -94,7 +97,7 @@ func taskReexamHostIntf() {
 	oldTunnelIP := Host.TunnelIP
 	getHostIPs()
 	if reflect.DeepEqual(oldIfaces, Host.Ifaces) != true ||
-	reflect.DeepEqual(oldTunnelIP, Host.TunnelIP) != true {
+		reflect.DeepEqual(oldTunnelIP, Host.TunnelIP) != true {
 		putHostIfInfo()
 	}
 }
@@ -116,6 +119,7 @@ func getLocalInfo(selfID string, pid2ID map[int]string) error {
 	}
 
 	agentEnv.startsAt = time.Now().UTC()
+	Agent.Pid = os.Getpid()
 	if agentEnv.runInContainer {
 		dev, meta, err := global.RT.GetDevice(selfID)
 		if err != nil {
@@ -136,7 +140,6 @@ func getLocalInfo(selfID string, pid2ID map[int]string) error {
 		}
 	} else {
 		Agent.ID = Host.ID
-		Agent.Pid = os.Getpid()
 		Agent.NetworkMode = "host"
 		Agent.PidMode = "host"
 		Agent.SelfHostname = Host.Name
@@ -275,6 +278,8 @@ func main() {
 	disable_auto_benchmark := flag.Bool("no_auto_benchmark", false, "disable auto benchmark")
 	disable_system_protection := flag.Bool("no_sys_protect", false, "disable system protections")
 	policy_puller := flag.Int("policy_puller", 0, "set policy pulling period")
+	autoProfile := flag.Int("apc", 1, "Enable auto profile collection")
+	custom_check_control := flag.String("cbench", share.CustomCheckControl_Disable, "Custom check control")
 	flag.Parse()
 
 	if *debug {
@@ -319,6 +324,22 @@ func main() {
 		log.WithFields(log.Fields{"period": *policy_puller}).Info("policy pull regulator")
 	}
 
+	agentEnv.autoProfieCapture = 1 // default
+	if *autoProfile != 1 {
+		if *autoProfile < 0 {
+			agentEnv.autoProfieCapture = 0 // no profile
+			log.WithFields(log.Fields{"auto-profile": *autoProfile}).Error("Invalid value, disable auto-profile")
+		} else {
+			agentEnv.autoProfieCapture = (uint64)(*autoProfile)
+		}
+		log.WithFields(log.Fields{"auto-profile": agentEnv.autoProfieCapture}).Info()
+	}
+
+	if *custom_check_control == share.CustomCheckControl_Loose || *custom_check_control == share.CustomCheckControl_Strict {
+		agentEnv.customBenchmark = true
+		log.Info("Enable custom benchmark")
+	}
+
 	if *join != "" {
 		// Join addresses might not be all ready. Accept whatever input is, resolve them
 		// when starting the cluster.
@@ -359,6 +380,7 @@ func main() {
 
 	walkerTask = workerlet.NewWalkerTask(*show_monitor_trace, global.SYS)
 
+	log.WithFields(log.Fields{"cgroups": global.SYS.GetCgroupsVersion()}).Info()
 	log.WithFields(log.Fields{"endpoint": *rtSock, "runtime": global.RT.String()}).Info("Container socket connected")
 	if platform == share.PlatformKubernetes {
 		k8sVer, ocVer := global.ORCH.GetVersion(false, false)
@@ -378,7 +400,8 @@ func main() {
 	agentEnv.runWithController = *withCtlr
 	agentEnv.runInContainer = global.SYS.IsRunningInContainer()
 	if agentEnv.runInContainer {
-		selfID, agentEnv.containerInContainer, err = global.SYS.GetSelfContainerID()
+		_, agentEnv.containerInContainer, _ = global.SYS.GetSelfContainerID()
+		selfID = global.RT.GetSelfID()
 		if selfID == "" { // it is a POD ID in the k8s cgroup v2; otherwise, a real container ID
 			log.WithFields(log.Fields{"error": err}).Error("Unsupported system. Exit!")
 			os.Exit(-2)
@@ -417,6 +440,9 @@ func main() {
 		log.Info("Wait for local interface ...")
 		time.Sleep(time.Second * 4)
 	}
+
+	//NVSHAS-6638,monitor host to see whether there is i/f or IP changes
+	go StartMonitorHostInterface(Host.ID, 1, monitorHostIfaceStopCh)
 
 	// Check anti-affinity
 	var retry int
@@ -526,7 +552,8 @@ func main() {
 
 	agentTimerWheel = utils.NewTimerWheel()
 	agentTimerWheel.Start()
-
+	//save a reference in policy engine
+	policySetTimerWheel(agentTimerWheel)
 	// Read existing containers again, cluster start can take a while.
 	existing, _ := global.RT.ListContainerIDs()
 
@@ -631,8 +658,6 @@ func main() {
 	Agent.JoinedAt = time.Now().UTC()
 	putLocalInfo()
 	logAgent(share.CLUSEvAgentJoin)
-	//NVSHAS-6638,monitor host to see whether there is i/f or IP changes
-	prober.StartMonitorHostInterface(Host.ID, 1)
 
 	clusterLoop(existing)
 	existing = nil
@@ -683,12 +708,13 @@ func main() {
 	fileWatcher.Close()
 	bench.Close()
 
+	close(monitorHostIfaceStopCh) // stop host interface monitor 
 	stopMonitorLoop()
 	closeCluster()
 
 	waitContainerTaskExit()
 
-	if driver != pipe.PIPE_NOTC  && driver != pipe.PIPE_CLM {
+	if driver != pipe.PIPE_NOTC && driver != pipe.PIPE_CLM {
 		dp.DPCtrlDelSrvcPort(nvSvcPort)
 	}
 

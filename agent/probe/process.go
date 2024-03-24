@@ -50,6 +50,7 @@ type procContainer struct {
 	outsider utils.Set // pid pool from outside
 	newBorn  int
 	userns   *userNs
+	startAt  time.Time
 	//map of port listened by multiple processes
 	portsMap         map[osutil.SocketInfo]*procApp
 	checkRemovedPort uint
@@ -102,7 +103,6 @@ var suspicProcMap map[string]*suspicProcInfo = map[string]*suspicProcInfo{
 	"dnscat":     {false, "dns tunneling"},
 	"dns2tcpc":   {false, "dns tunneling"},
 	"dns2tcpd":   {true, "dns tunneling"},
-	"socat":      {false, "socat relay process"},
 }
 
 var kubeProcs map[string]int = map[string]int{
@@ -416,6 +416,7 @@ func (p *Probe) addHost(pid int) {
 		userns:   &userNs{users: make(map[int]string), uidMin: osutil.UserUidMin},
 		portsMap: make(map[osutil.SocketInfo]*procApp),
 		fInfo:    make(map[string]*fileInfo),
+		startAt:  time.Now(),
 	}
 
 	p.containerMap[""] = c
@@ -458,6 +459,7 @@ func (p *Probe) addContainer(id string, proc *procInternal, scanMode bool) {
 		userns:   &userNs{users: make(map[int]string), uidMin: osutil.UserUidMin},
 		portsMap: make(map[osutil.SocketInfo]*procApp),
 		fInfo:    make(map[string]*fileInfo),
+		startAt:  time.Now(),
 	}
 
 	if p.containerStops.Contains(c.id) {
@@ -563,7 +565,7 @@ func (p *Probe) removeProcessInContainer(pid int, id string) {
 				} else {
 					// no valid rootPid: it could be a "flash" container, delete it
 					// for example: "docker run ubuntu echo 123"
-					log.WithFields(log.Fields{"pid": pid}).Info("PROC: orphan container")
+					mLog.WithFields(log.Fields{"pid": pid}).Debug("PROC: orphan container")
 				}
 			}
 		}
@@ -571,7 +573,7 @@ func (p *Probe) removeProcessInContainer(pid int, id string) {
 		// the container has exited, clean up
 		if containerRemoved {
 			clearContainerProcesses(c)
-			p.containerStops.Add(c.id)
+			// p.containerStops.Add(c.id)
 			delete(p.containerMap, c.id)
 			log.WithFields(log.Fields{"pid": pid, "id": c.id, "cnt": len(p.containerMap) - 2}).Debug("PROC: Container remove")
 		} else {
@@ -614,25 +616,21 @@ func (p *Probe) isAgentChildren(proc *procInternal, id string) bool {
 			// log.WithFields(log.Fields{"children": c.children.String(), "rootPid": c.rootPid, "oursider": c.outsider.String()}).Debug("PROC:")
 			ppid := proc.ppid
 			for i := 0; i < 5; i++ {	// lookup 5 ancestries
-				if pproc, ok := p.pidProcMap[ppid]; ok {
-					// log.WithFields(log.Fields{"pproc": pproc, "i": i}).Debug("PROC:")
-					if unexpectedAgentProcess(pproc.name){
-						return false
-					}
-
-					if isFamilyProcess(c.children, pproc) || pproc.pid == p.agentPid || pproc.pid == c.rootPid {
-						c.children.Add(proc.pid)
-						return true
-					}
-					ppid = pproc.ppid
-					continue
+				pproc, ok := p.pidProcMap[ppid]
+				if !ok {
+					break	// no parent process for reference
 				}
 
-				// give up lookup
-				if i == 0 {	// no parent process for reference
+				// log.WithFields(log.Fields{"pproc": pproc, "i": i}).Debug("PROC:")
+				if unexpectedAgentProcess(pproc.name){
+					break
+				}
+
+				if isFamilyProcess(c.children, pproc) || pproc.pid == p.agentPid || pproc.pid == c.rootPid {
+					c.children.Add(proc.pid)
 					return true
 				}
-				break
+				ppid = pproc.ppid
 			}
 		}
 	}
@@ -680,6 +678,38 @@ func (p *Probe) evaluateRuncTrigger(id string, proc *procInternal) {
 	}
 }
 
+func (p *Probe) evaluateRuntimeCmd(proc *procInternal) bool {
+	if global.RT.IsRuntimeProcess(filepath.Base(proc.ppath), nil) {
+		if global.RT.IsRuntimeProcess(filepath.Base(proc.path), nil) {
+			return true
+		}
+
+		// runc [global options] command [command options] [arguments...]
+		for i, cmd := range proc.cmds {
+			switch i {
+			case 0:
+				if !global.RT.IsRuntimeProcess(filepath.Base(cmd), nil) {
+					return false
+				}
+			case 1:
+				return cmd == "init"
+			}
+		}
+	}
+	return false
+}
+
+func truncateStrSlices(strs []string, length int) string {
+	str := strings.Join(strs, " ")
+	if length > 0 {
+		if len(str) > length {
+			str = str[:length]
+			str += "..."
+		}
+	}
+	return str
+}
+
 // Debug purpose:
 func (p *Probe) printProcReport(id string, proc *procInternal) {
 	var s string
@@ -706,7 +736,7 @@ func (p *Probe) printProcReport(id string, proc *procInternal) {
 		"ppath":    proc.ppath,
 		"name":     proc.name,
 		"path":     proc.path,
-		"cmd":      proc.cmds,
+		"cmd":      truncateStrSlices(proc.cmds, 32),
 		"action":   proc.action,
 		"riskType": proc.riskType,
 	}).Debug("PROC:")
@@ -1369,11 +1399,26 @@ func (p *Probe) handleProcUIDChange(pid, ruid, euid int) {
 		proc.user = p.getUserName(pid, euid)
 		proc.ruid = ruid
 		proc.euid = euid
-		log.WithFields(log.Fields{"proc": proc}).Debug("PROC:")
 		if c, ok := p.pidContainerMap[pid]; ok {
+			p.printProcReport(c.id, proc)
 			go p.rootEscalationCheck_uidChange(proc, c)
 		}
 	}
+}
+
+// updateUserNames - Updates the username map by going to /etc/passwd
+func (p *Probe) getUpdatedUsername(pid int, uid int) string {
+	// Get the container for our pid
+	if c, ok := p.pidContainerMap[pid]; ok {
+		// Update the usernames map
+		if root, min, err := osutil.GetAllUsers(c.rootPid, c.userns.users); err == nil {
+			c.userns.root = root
+			c.userns.uidMin = min
+			return c.userns.users[uid]
+		}
+	}
+
+	return ""
 }
 
 func (p *Probe) getUserName(pid, uid int) (user string) {
@@ -1567,7 +1612,7 @@ func (p *Probe) initReadProcesses() bool {
 		}
 	}
 	p.walkNewProcesses()
-	p.processContainerNewChanges()
+	// p.processContainerNewChanges()
 	p.inspectNewProcesses(true) // catch existing processes
 	return foundKube
 }
@@ -1782,6 +1827,10 @@ func (p *Probe) evaluateApplication(proc *procInternal, id string, bKeepAlive bo
 		return
 	}
 
+	if id != "" && p.evaluateRuntimeCmd(proc) {
+		return
+	}
+
 	p.printProcReport(id, proc)
 	// p.evaluateRuncTrigger(id, proc)
 	riskyReported := (proc.reported & (suspicReported | profileReported)) != 0 // could be reported as profile/risky event
@@ -1855,11 +1904,13 @@ func (p *Probe) evaluateApplication(proc *procInternal, id string, bKeepAlive bo
 		}
 	}
 	mLog.WithFields(log.Fields{"name": proc.name, "pid": proc.pid, "path": proc.path, "action": action, "risky": risky}).Debug("PROC: Result")
-	//}
 
 	// it has not been reported as a profile/risky event
 	riskyReported = (proc.reported & (suspicReported | profileReported)) != 0
 	if risky && !riskyReported {
+
+		proc.user = p.getUpdatedUsername(proc.pid, proc.euid)
+
 		riskInfo := suspicProcMap[proc.riskType]
 		if riskInfo == nil {
 			mLog.WithFields(log.Fields{"pid": proc.pid, "riskType": proc.riskType}).Debug("PROC: risky info missing")
@@ -1868,7 +1919,7 @@ func (p *Probe) evaluateApplication(proc *procInternal, id string, bKeepAlive bo
 		if riskInfo != nil {
 			proc.reported |= suspicReported // do it once
 			if bSkipReport {
-				mLog.WithFields(log.Fields{"name": proc.name, "pid": proc.pid, "ppid": proc.ppid, "cmds": proc.cmds}).Debug("PROC: Skip report suspicious application")
+				mLog.WithFields(log.Fields{"name": proc.name, "pid": proc.pid, "ppid": proc.ppid, "cmds": truncateStrSlices(proc.cmds, 32)}).Debug("PROC: Skip report suspicious application")
 				return
 			}
 
@@ -2242,9 +2293,12 @@ func (p *Probe) isAllowCniCommand(path string) bool {
 	return false
 }
 
-func (p *Probe) isAllowCalicoCommand(proc *procInternal) bool {
+func (p *Probe) isAllowCalicoCommand(proc *procInternal, bRtProcP bool) bool {
 	if p.bKubePlatform {
-		return proc.path == "/usr/bin/calico-node" && (len(proc.cmds) > 0 && proc.cmds[0] == "/bin/calico-node")
+		if bRtProcP {
+			return proc.path == "/usr/bin/calico-node" && (len(proc.cmds) > 0 && filepath.Base(proc.cmds[0]) == "calico-node")
+		}
+		return proc.ppath == "/usr/bin/calico-node" && filepath.Dir(proc.path) == "/usr/local/bin"
 	}
 	return false
 }
@@ -2274,8 +2328,22 @@ func (p *Probe) isProcessException(proc *procInternal, group, id string, bParent
 		return false
 	}
 
+	// the parent name is not ready
+	if proc.pname == "" {
+		proc.pname, _, _, _ = osutil.GetProcessUIDs(proc.ppid)
+	}
+
 	bRtProc := global.RT.IsRuntimeProcess(proc.name, nil)
 	bRtProcP := global.RT.IsRuntimeProcess(proc.pname, nil)
+	if proc.pname == "" {
+		bRtProcP = true		// not trace-able
+	}
+
+	// both names are in the runtime list
+	if bRtProc && bRtProcP {
+		log.WithFields(log.Fields{"name": proc.name, "path": proc.path}).Debug("PROC:")
+		return true
+	}
 
 	// parent: matching only from binary
 	pname := filepath.Base(proc.ppath)
@@ -2297,30 +2365,24 @@ func (p *Probe) isProcessException(proc *procInternal, group, id string, bParent
 		}
 	}
 
-	// both names are in the runtime list
-	if bRtProc && bRtProcP {
-		log.WithFields(log.Fields{"name": proc.name, "path": proc.path}).Debug("PROC:")
-		return true
-	}
-
 	// network plug-in: calico-node
-	if bRtProcP && p.isAllowCalicoCommand(proc) {
+	if p.isAllowCalicoCommand(proc, bRtProcP) {
 		log.WithFields(log.Fields{"name": proc.name, "path": proc.path, "pname": proc.pname}).Debug("PROC:")
 		return true
 	}
 
-	// CNI commands from node
-	if bRtProcP || (bParentHostProc && p.isAllowCniCommand(proc.ppath)) {
+	// maintainance jobs running from runtime engine
+	if bRtProcP {
 		switch proc.name {
-		case "portmap", "containerd", "sleep", "uptime", "nice":
-			return true
+		case "busybox":
+			// exception: ps and its parent is a runtime process
+			if len(proc.cmds) > 0 && (filepath.Base(proc.cmds[0]) == "ps") {
+				return true
+			}
 		case "ps":
 			// Exception for process where the parent is a runtime process.
 			// Some CNI daemons will call `ps` and we will get false positives without the exception.
-			if bRtProcP {
-				return true
-			}
-			return false
+			return true
 		case "mount", "lsof", "getent", "adduser", "useradd": // from AWS
 			return true
 		default:
@@ -2329,20 +2391,32 @@ func (p *Probe) isProcessException(proc *procInternal, group, id string, bParent
 			}
 		}
 
-		// NV4856
-		if p.isAllowIpRuntimeCommand(proc.cmds) {
-			mLog.WithFields(log.Fields{"group": group, "name": proc.name, "cmds": proc.cmds}).Debug("PROC:")
-			return true
-		}
-
 		if p.isAllowCniCommand(proc.path) {
 			mLog.WithFields(log.Fields{"group": group, "name": proc.name, "path": proc.path}).Debug("PROC:")
 			return true
 		}
 	}
 
+	// NV4856
+	if p.isAllowIpRuntimeCommand(proc.cmds) {
+		mLog.WithFields(log.Fields{"group": group, "name": proc.name, "cmds": truncateStrSlices(proc.cmds, 32)}).Debug("PROC:")
+		return true
+	}
+
 	// maintainance jobs running from node
 	if bParentHostProc {
+		// CNI commands from node
+		if p.isAllowCniCommand(proc.ppath) {
+			switch proc.name {
+			case "portmap", "containerd", "sleep", "uptime", "nice":
+				return true
+			}
+			if p.isAllowCniCommand(proc.path) {
+				mLog.WithFields(log.Fields{"group": group, "name": proc.name, "path": proc.path}).Debug("PROC:")
+				return true
+			}
+		}
+
 		switch proc.pname {
 		case "udisksd":
 			return proc.name == "dumpe2fs"
@@ -2357,16 +2431,15 @@ func (p *Probe) isProcessException(proc *procInternal, group, id string, bParent
 	if group == share.GroupNVProtect {
 		if p.disableNvProtect {
 			// allowed but output the traces
-			log.WithFields(log.Fields{"group": group, "name": proc.name, "cmds": proc.cmds, "path": proc.path}).Info("")
+			log.WithFields(log.Fields{"group": group, "name": proc.name, "cmds": truncateStrSlices(proc.cmds, 32), "path": proc.path}).Info("")
 			return true
 		}
-
 
 		if bRtProcP && len(proc.cmds) >= 3 {
 			if proc.cmds[0] == "tar" && proc.cmds[1] == "cf" {
 				// from "k8s.io/pkg/kubectl/cmd/cp.go" : copyFromPod()
 				// matched to its exact Command:  []string{"tar", "cf", "-", src.File}
-				mLog.WithFields(log.Fields{"group": group, "name": proc.name, "cmds": proc.cmds}).Debug("PROC:")
+				mLog.WithFields(log.Fields{"group": group, "name": proc.name, "cmds": truncateStrSlices(proc.cmds, 32)}).Debug("PROC:")
 				return true
 			}
 		}
@@ -2435,6 +2508,16 @@ func (p *Probe) procProfileEval(id string, proc *procInternal, bKeepAlive bool) 
 				case share.PolicyActionLearn, share.PolicyActionCheckApp:	// exclude these two actions
 				default:
 					pp.Action = share.PolicyActionAllow
+					if !allowSuspicious && proc.action == share.PolicyActionCheckApp {
+						switch mode {
+						case share.PolicyModeLearn:
+							pp.Action = share.PolicyActionCheckApp
+						case share.PolicyModeEvaluate:
+							pp.Action = share.PolicyActionViolate
+						case share.PolicyModeEnforce:
+							pp.Action = share.PolicyActionDeny
+						}
+					}
 				}
 			} else {
 				// NVSHAS-7501 - I think we have to assume false on keep alive.
@@ -2481,12 +2564,16 @@ func (p *Probe) procProfileEval(id string, proc *procInternal, bKeepAlive bool) 
 		p.reportLearnProc(svcGroup, pp)
 	}
 
-	mLog.WithFields(log.Fields{"name": proc.name, "pid": proc.pid, "action": pp.Action, "riskType": proc.riskType}).Debug("PROC:")
+	mLog.WithFields(log.Fields{"name": proc.name, "pid": proc.pid, "action": pp.Action, "riskType": proc.riskType, "svcGroup": svcGroup}).Debug("PROC:")
 	return pp.Action, true
 }
 
 func (p *Probe) sendProcessIncident(bDenied bool, id, uuid, group, derivedGroup string, proc *procInternal) {
 	var s *ProbeProcess
+
+	p.lockProcMux()
+	proc.user = p.getUpdatedUsername(proc.pid, proc.euid)
+	p.unlockProcMux()
 
 	switch uuid {
 	case share.CLUSReservedUuidAnchorMode:	// zero-drift incident
@@ -2752,10 +2839,6 @@ func (p *Probe) evaluateLiveApps(id string) {
 }
 
 func (p *Probe) processProfileReeval(id string, pg *share.CLUSProcessProfile, bAddContainer bool) {
-	if bAddContainer {
-		go p.PutBeginningProcEventsBackToWork(id)
-	}
-
 	go p.evaluateLiveApps(id)
 
 	// update riskApp by current policy
@@ -2920,6 +3003,11 @@ func (p *Probe) IsAllowedShieldProcess(id, mode, svcGroup string, proc *procInte
 	if !ok {
 		// the container was exited before we investigate into it
 		mLog.WithFields(log.Fields{"proc": proc, "id": id}).Debug("SHD: Unknown ID")
+		return true
+	}
+
+	// container is gone
+	if !osutil.IsPidValid(c.rootPid) {
 		return true
 	}
 
@@ -3130,6 +3218,7 @@ func (p *Probe) BuildProcessFamilyGroups(id string, rootPid int, bSandboxPod, bP
 				userns:   &userNs{users: make(map[int]string), uidMin: osutil.UserUidMin},
 				portsMap: make(map[osutil.SocketInfo]*procApp),
 				fInfo:    make(map[string]*fileInfo),
+				startAt: time.Now(),
 			}
 			p.containerMap[id] = c
 		} else {

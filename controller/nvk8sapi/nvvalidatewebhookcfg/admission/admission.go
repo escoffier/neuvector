@@ -50,6 +50,7 @@ type ScannedImageSummary struct {
 	VulNames        utils.Set
 	Scanned         bool
 	Signed          bool
+	Verifiers       []string
 	RunAsRoot       bool
 	EnvVars         map[string]string
 	Labels          map[string]string
@@ -135,41 +136,53 @@ type AdmUriState struct {
 	DefaultAction int // AdmCtrlActionAllow or AdmCtrlActionDeny
 }
 
-type AdmResult struct { // AdmResult is per-image
-	MatchDeny       bool
-	FinalDeny       bool
-	ImageNotScanned bool
-	NoLogging       bool
-	MatchFedRule    bool
-	RuleID          uint32
-	RuleCategory    string
-	RuleMode        string
-	RuleCfgType     share.TCfgType
-	User            string
-	AdmRule         string
-	Msg             string
-	Image           string // the image specified in yaml
-	ImageID         string // starting from this field, the following fields are available when the scan result for the image is available
-	Registry        string
-	Repository      string
-	Tag             string
-	BaseOS          string
-	UnscannedImages string
-	MatchedSource   string
-	HighVulsCnt     int
-	MedVulsCnt      int
+type AdmAssessResult struct {
+	ContainerImage string
+	RuleID         uint32
+	Disabled       bool
+	RuleDetails    string
+	RuleMode       string
+	RuleType       string // "allow"/"deny"
+	RuleCfgType    share.TCfgType
+	MatchedSource  string
+}
+
+type AdmResult struct { // AdmResult is per-container-image
+	MatchDeny             bool // for non-assessment only
+	ImageNotScanned       bool
+	MatchFedRule          bool // for non-assessment only
+	RuleID                uint32
+	RuleCategory          string
+	RuleMode              string
+	RuleCfgType           share.TCfgType
+	User                  string
+	AdmRule               string
+	Msg                   string
+	Image                 string // the image specified in yaml
+	ImageID               string // starting from this field, the following fields are available when the scan result for the image is available
+	Registry              string
+	Repository            string
+	Tag                   string
+	BaseOS                string
+	UnscannedImages       string
+	MatchedSource         string
+	HighVulsCnt           int
+	MedVulsCnt            int
+	AssessResults         []*AdmAssessResult // for assessment only, including all matched rules (disabled or not)
+	AssessMatchedRuleType string             // for assessment only, the 1st matched non-disabled rule's type(""/"allow"/"deny")
 }
 
 type AdmResObject struct {
-	ValidUntil int64 // seconds since the epoch
-	Kind       string
-	Name       string
-	Namespace  string
-	UserName   string
-	Groups     utils.Set
-	OwnerUIDs  []string
-	Labels     map[string]string
-	Containers []*AdmContainerInfo // related containers info in this resource object
+	ValidUntil    int64 // seconds since the epoch
+	Kind          string
+	Name          string
+	Namespace     string
+	UserName      string
+	Groups        utils.Set
+	OwnerUIDs     []string
+	Labels        map[string]string
+	Annotations   map[string]string
+	AllContainers [3][]*AdmContainerInfo // containers info in this resource object in containers, initContainers, ephemeralContainers order
 	//AdmResults map[string]*AdmResult // key is image repo. comment out because we do not re-use the matching result of owners anymore
 }
 
@@ -203,6 +216,7 @@ var setOps1 = []string{share.CriteriaOpContainsAny, share.CriteriaOpNotContainsA
 var boolOps = []string{"true", "false"}
 var boolTrueOp = []string{"true"}
 var pssPolicies = []string{share.PssPolicyRestricted, share.PssPolicyBaseline}
+var verifierOps = []string{share.CriteriaOpContainsAll, share.CriteriaOpContainsAny, share.CriteriaOpNotContainsAny}
 
 func (info AdmContainerInfo) MarshalJSON() ([]byte, error) {
 	return json.Marshal(*newJSONAdmContainerInfo(&info))
@@ -257,19 +271,27 @@ func getAdmK8sDenyRuleOptions() map[string]*api.RESTAdmissionRuleOption {
 				MatchSrc: api.MatchSrcYaml,
 			},
 			share.CriteriaKeyUser: &api.RESTAdmissionRuleOption{
-				Name:     share.CriteriaKeyUser,
-				Ops:      setOps1,
+				Name: share.CriteriaKeyUser,
+				Ops: []string{share.CriteriaOpContainsAny, share.CriteriaOpNotContainsAny,
+					share.CriteriaOpRegexContainsAny, share.CriteriaOpRegexNotContainsAny},
 				MatchSrc: api.MatchSrcYaml,
 			},
 			share.CriteriaKeyK8sGroups: &api.RESTAdmissionRuleOption{
-				Name:     share.CriteriaKeyK8sGroups,
-				Ops:      allSetOps,
+				Name: share.CriteriaKeyK8sGroups,
+				Ops: []string{share.CriteriaOpContainsAll, share.CriteriaOpContainsAny,
+					share.CriteriaOpNotContainsAny, share.CriteriaOpContainsOtherThan,
+					share.CriteriaOpRegexContainsAny, share.CriteriaOpRegexNotContainsAny},
 				MatchSrc: api.MatchSrcYaml,
 			},
 			share.CriteriaKeyLabels: &api.RESTAdmissionRuleOption{
 				Name:     share.CriteriaKeyLabels,
 				Ops:      allSetOps,
 				MatchSrc: api.MatchSrcBoth,
+			},
+			share.CriteriaKeyAnnotations: &api.RESTAdmissionRuleOption{
+				Name:     share.CriteriaKeyAnnotations,
+				Ops:      allSetOps,
+				MatchSrc: api.MatchSrcYaml,
 			},
 			share.CriteriaKeyMountVolumes: &api.RESTAdmissionRuleOption{
 				Name:     share.CriteriaKeyMountVolumes,
@@ -337,13 +359,13 @@ func getAdmK8sDenyRuleOptions() map[string]*api.RESTAdmissionRuleOption {
 				Name:     share.CriteriaKeyBaseImage,
 				Ops:      []string{share.CriteriaOpEqual, share.CriteriaOpNotEqual},
 				MatchSrc: api.MatchSrcImage,
-			},
+			},*/
 			share.CriteriaKeyImageSigned: &api.RESTAdmissionRuleOption{
 				Name:     share.CriteriaKeyImageSigned,
 				Ops:      []string{share.CriteriaOpEqual},
 				Values:   boolOps,
 				MatchSrc: api.MatchSrcImage,
-			},*/
+			},
 			share.CriteriaKeyImageCompliance: &api.RESTAdmissionRuleOption{
 				Name:     share.CriteriaKeyImageCompliance,
 				Ops:      []string{share.CriteriaOpEqual},
@@ -436,6 +458,11 @@ func getAdmK8sDenyRuleOptions() map[string]*api.RESTAdmissionRuleOption {
 				Ops:      []string{share.CriteriaOpContainsTagAny},
 				MatchSrc: api.MatchSrcYaml,
 			},
+			share.CriteriaKeyImageVerifiers: &api.RESTAdmissionRuleOption{
+				Name:     share.CriteriaKeyImageVerifiers,
+				Ops:      verifierOps,
+				MatchSrc: api.MatchSrcImage,
+			},
 		}
 	}
 	return admK8sDenyRuleOptions
@@ -460,19 +487,27 @@ func getAdmK8sExceptRuleOptions() map[string]*api.RESTAdmissionRuleOption { // f
 				MatchSrc: api.MatchSrcYaml,
 			},
 			share.CriteriaKeyUser: &api.RESTAdmissionRuleOption{
-				Name:     share.CriteriaKeyUser,
-				Ops:      setOps1,
+				Name: share.CriteriaKeyUser,
+				Ops: []string{share.CriteriaOpContainsAny, share.CriteriaOpNotContainsAny,
+					share.CriteriaOpRegexContainsAny, share.CriteriaOpRegexNotContainsAny},
 				MatchSrc: api.MatchSrcYaml,
 			},
 			share.CriteriaKeyK8sGroups: &api.RESTAdmissionRuleOption{
-				Name:     share.CriteriaKeyK8sGroups,
-				Ops:      allSetOps,
+				Name: share.CriteriaKeyK8sGroups,
+				Ops: []string{share.CriteriaOpContainsAll, share.CriteriaOpContainsAny,
+					share.CriteriaOpNotContainsAny, share.CriteriaOpContainsOtherThan,
+					share.CriteriaOpRegexContainsAny, share.CriteriaOpRegexNotContainsAny},
 				MatchSrc: api.MatchSrcYaml,
 			},
 			share.CriteriaKeyLabels: &api.RESTAdmissionRuleOption{
 				Name:     share.CriteriaKeyLabels,
 				Ops:      allSetOps,
 				MatchSrc: api.MatchSrcBoth,
+			},
+			share.CriteriaKeyAnnotations: &api.RESTAdmissionRuleOption{
+				Name:     share.CriteriaKeyAnnotations,
+				Ops:      allSetOps,
+				MatchSrc: api.MatchSrcYaml,
 			},
 			share.CriteriaKeyMountVolumes: &api.RESTAdmissionRuleOption{
 				Name:     share.CriteriaKeyMountVolumes,
@@ -531,13 +566,13 @@ func getAdmK8sExceptRuleOptions() map[string]*api.RESTAdmissionRuleOption { // f
 				Name:     share.CriteriaKeyBaseImage,
 				Ops:      []string{share.CriteriaOpEqual, share.CriteriaOpNotEqual},
 				MatchSrc: api.MatchSrcImage,
-			},
+			},*/
 			share.CriteriaKeyImageSigned: &api.RESTAdmissionRuleOption{
 				Name:     share.CriteriaKeyImageSigned,
 				Ops:      []string{share.CriteriaOpEqual},
 				Values:   boolOps,
 				MatchSrc: api.MatchSrcImage,
-			},*/
+			},
 			share.CriteriaKeyImageCompliance: &api.RESTAdmissionRuleOption{
 				Name:     share.CriteriaKeyImageCompliance,
 				Ops:      []string{share.CriteriaOpEqual},
@@ -553,6 +588,11 @@ func getAdmK8sExceptRuleOptions() map[string]*api.RESTAdmissionRuleOption { // f
 			share.CriteriaKeyModules: &api.RESTAdmissionRuleOption{
 				Name:     share.CriteriaKeyModules,
 				Ops:      allSetOps,
+				MatchSrc: api.MatchSrcImage,
+			},
+			share.CriteriaKeyImageVerifiers: &api.RESTAdmissionRuleOption{
+				Name:     share.CriteriaKeyImageVerifiers,
+				Ops:      verifierOps,
 				MatchSrc: api.MatchSrcImage,
 			},
 		}

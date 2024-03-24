@@ -17,6 +17,7 @@ import (
 	"github.com/neuvector/neuvector/controller/rpc"
 	"github.com/neuvector/neuvector/share"
 	scanUtils "github.com/neuvector/neuvector/share/scan"
+	"github.com/neuvector/neuvector/share/scan/registry"
 	"github.com/neuvector/neuvector/share/utils"
 )
 
@@ -109,7 +110,7 @@ func (r *jfrog) getSubdomainRepoList(jdirs []jfrogDir, org, name string, limit i
 				"org": org, "subdomain": dir.Key, "type": dir.DirType, "url": dir.URL, "registry": newURL,
 			}).Debug("Get repo list ...")
 
-			r.rc = scanUtils.NewRegClient(newURL, r.base.username, r.base.password, r.base.proxy, r.tracer)
+			r.rc = scanUtils.NewRegClient(newURL, "", r.base.username, r.base.password, r.base.proxy, r.tracer)
 			if rps, err := r.base.GetRepoList(org, name, limit); err == nil {
 				if !strings.Contains(name, "*") {
 					// although repo has no wildcard, we need wait until here so we have the correct subdomain URL
@@ -218,7 +219,7 @@ func (r *jfrog) GetTagList(domain, repo, tag string) ([]string, error) {
 		sub, subRepo := getSubdomainFromRepo(repo)
 		if url, ok := r.subdomainURL[sub]; ok {
 			if r.regURL != url {
-				rc = scanUtils.NewRegClient(url, r.base.username, r.base.password, r.base.proxy, r.tracer)
+				rc = scanUtils.NewRegClient(url, "", r.base.username, r.base.password, r.base.proxy, r.tracer)
 			}
 		} else {
 			smd.scanLog.WithFields(log.Fields{"subdomain": sub}).Error("connot find the subdomain")
@@ -324,18 +325,18 @@ func (r *jfrog) GetImageMeta(ctx context.Context, domain, repo, tag string) (*sc
 		sub, subRepo := getSubdomainFromRepo(repo)
 		if url, ok := r.subdomainURL[sub]; ok {
 			if r.regURL != url {
-				rc = scanUtils.NewRegClient(url, r.base.username, r.base.password, r.base.proxy, r.tracer)
+				rc = scanUtils.NewRegClient(url, "", r.base.username, r.base.password, r.base.proxy, r.tracer)
 			}
 		} else {
 			smd.scanLog.WithFields(log.Fields{"subdomain": sub}).Error("connot find the subdomain")
 		}
 		repo = subRepo
 	}
-	rinfo, errCode := rc.GetImageInfo(ctx, repo, tag)
+	rinfo, errCode := rc.GetImageInfo(ctx, repo, tag, registry.ManifestRequest_Default)
 	return rinfo, errCode
 }
 
-func (r *jfrog) ScanImage(scanner string, ctx context.Context, id, digest, repo, tag string) *share.ScanResult {
+func (r *jfrog) ScanImage(scanner string, ctx context.Context, id, digest, repo, tag string, scanTypesRequired share.ScanTypeMap) *share.ScanResult {
 	newURL := r.regURL
 	if r.mode == share.JFrogModeSubdomain && r.isSubdomain {
 		sub, subRepo := getSubdomainFromRepo(repo)
@@ -347,14 +348,15 @@ func (r *jfrog) ScanImage(scanner string, ctx context.Context, id, digest, repo,
 		repo = subRepo
 	}
 	req := &share.ScanImageRequest{
-		Registry:    newURL,
-		Username:    r.username,
-		Password:    r.password,
-		Repository:  repo,
-		Tag:         tag,
-		Proxy:       r.proxy,
-		ScanLayers:  r.scanLayers,
-		ScanSecrets: r.scanSecrets,
+		Registry:           newURL,
+		Username:           r.username,
+		Password:           r.password,
+		Repository:         repo,
+		Tag:                tag,
+		Proxy:              r.proxy,
+		ScanLayers:         r.scanLayers,
+		ScanSecrets:        r.scanSecrets,
+		ScanTypesRequested: &scanTypesRequired,
 	}
 	result, err := rpc.ScanImage(scanner, ctx, req)
 	if result == nil {

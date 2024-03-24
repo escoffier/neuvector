@@ -55,8 +55,10 @@ type WebhookInfo struct {
 }
 
 type ValidatingWebhookConfigInfo struct {
-	Name         string
-	WebhooksInfo []*WebhookInfo
+	Name                string
+	WebhooksInfo        []*WebhookInfo
+	RevertCount         *uint32
+	UnexpectedMatchExpr string
 }
 
 const (
@@ -116,9 +118,9 @@ func InitK8sNsSelectorInfo(allowedNS, allowedNsWild, defAllowedNS utils.Set, sel
 }
 
 func UpdateAllowedK8sNs(isLead, admCtrlEnabled bool, newAllowedNS, newAllowedNsWild utils.Set) {
+	allowedNamespaces = newAllowedNS
+	allowedNamespacesWild = newAllowedNsWild
 	if isLead {
-		allowedNamespaces = newAllowedNS
-		allowedNamespacesWild = newAllowedNsWild
 		if objs, err := global.ORCH.ListResource(resource.RscTypeNamespace); len(objs) > 0 {
 			for _, obj := range objs {
 				if nsObj := obj.(*resource.Namespace); nsObj != nil {
@@ -128,9 +130,6 @@ func UpdateAllowedK8sNs(isLead, admCtrlEnabled bool, newAllowedNS, newAllowedNsW
 		} else {
 			log.WithFields(log.Fields{"enabled": admCtrlEnabled, "err": err}).Error()
 		}
-	} else {
-		allowedNamespaces = newAllowedNS
-		allowedNamespacesWild = newAllowedNsWild
 	}
 }
 
@@ -147,13 +146,6 @@ func VerifyK8sNs(admCtrlEnabled bool, nsName string, nsLabels map[string]string)
 		resource.NsSelectorKeyStatusNV: &shouldNotExist,
 	}
 	if admCtrlEnabled {
-		if resource.CtrlPlaneOpInWhExpr == resource.NsSelectorOpNotExist {
-			labelKeys[resource.NsSelectorKeyCtrlPlane] = &shouldNotExist
-			if defAllowedNamespaces.Contains(nsName) {
-				labelKeys[resource.NsSelectorKeyCtrlPlane] = nil // could exist or not
-			}
-		}
-
 		if allowedNamespaces.Contains(nsName) {
 			labelKeys[resource.NsSelectorKeySkipNV] = &shouldExist
 		} else {
@@ -213,7 +205,7 @@ func GetAdmissionCtrlTypes(platform string) []string {
 	return admCtrlTypes
 }
 
-func isK8sConfiguredAsExpected(k8sResInfo ValidatingWebhookConfigInfo) (bool, bool, string, error) { // returns (found, matchedCfg, verRead, error)
+func isK8sConfiguredAsExpected(k8sResInfo *ValidatingWebhookConfigInfo) (bool, bool, string, error) { // returns (found, matchedCfg, verRead, error)
 	var rt string
 	if k8sResInfo.Name == resource.NvAdmValidatingName || k8sResInfo.Name == resource.NvCrdValidatingName {
 		rt = resource.RscTypeValidatingWebhookConfiguration
@@ -324,6 +316,7 @@ func isK8sConfiguredAsExpected(k8sResInfo ValidatingWebhookConfigInfo) (bool, bo
 		}
 	}
 	nsSelectorSupported := IsNsSelectorSupported()
+	unexpectedMatchKeys := utils.NewSet()
 
 	// config.Webhooks is from k8s, k8sResInfo.WebhooksInfo is what nv expects
 	for _, wh := range config.Webhooks {
@@ -360,7 +353,7 @@ func isK8sConfiguredAsExpected(k8sResInfo ValidatingWebhookConfigInfo) (bool, bo
 							if clientInUrlMode {
 								expectedUrl := fmt.Sprintf("https://%s.%s.svc:%d%s", svcName, resource.NvAdmSvcNamespace, whInfo.ClientConfig.Port, whInfo.ClientConfig.Path)
 								if clientCfg.Url != nil && strings.EqualFold(*clientCfg.Url, expectedUrl) {
-									if resource.IsK8sNvWebhookConfigured(whInfo.Name, whInfo.FailurePolicy, wh, nsSelectorSupported) {
+									if resource.IsK8sNvWebhookConfigured(whInfo.Name, whInfo.FailurePolicy, wh, nsSelectorSupported, k8sResInfo.RevertCount, unexpectedMatchKeys) {
 										whMatched = true
 									}
 								}
@@ -368,7 +361,7 @@ func isK8sConfiguredAsExpected(k8sResInfo ValidatingWebhookConfigInfo) (bool, bo
 								if clientCfg.Service.Namespace != nil && *clientCfg.Service.Namespace == resource.NvAdmSvcNamespace &&
 									clientCfg.Service.Name != nil && *clientCfg.Service.Name == svcName {
 									if clientCfg.Service.Path != nil && strings.EqualFold(*clientCfg.Service.Path, whInfo.ClientConfig.Path) {
-										if resource.IsK8sNvWebhookConfigured(whInfo.Name, whInfo.FailurePolicy, wh, nsSelectorSupported) {
+										if resource.IsK8sNvWebhookConfigured(whInfo.Name, whInfo.FailurePolicy, wh, nsSelectorSupported, k8sResInfo.RevertCount, unexpectedMatchKeys) {
 											whMatched = true
 										}
 									}
@@ -383,6 +376,11 @@ func isK8sConfiguredAsExpected(k8sResInfo ValidatingWebhookConfigInfo) (bool, bo
 			whFound = whMatched
 			break
 		}
+		if unexpectedMatchKeys.Cardinality() > 0 {
+			// found a webhook with the configurations nv needs + some unexpected entries in namespaceSelector/matchExpressions
+			k8sResInfo.UnexpectedMatchExpr = strings.Join(unexpectedMatchKeys.ToStringSlice(), ", ")
+			return true, false, verRead, nil
+		}
 		if !whFound {
 			return true, false, verRead, nil
 		}
@@ -391,7 +389,7 @@ func isK8sConfiguredAsExpected(k8sResInfo ValidatingWebhookConfigInfo) (bool, bo
 	return true, true, verRead, nil
 }
 
-func configK8sAdmCtrlValidateResource(op, resVersion string, k8sResInfo ValidatingWebhookConfigInfo) error {
+func configK8sAdmCtrlValidateResource(op, resVersion string, k8sResInfo *ValidatingWebhookConfigInfo) error {
 	var err error
 	k8sVersionMajor, k8sVersionMinor := resource.GetK8sVersion()
 	if op == K8sResOpDelete {
@@ -616,7 +614,7 @@ func configK8sAdmCtrlValidateResource(op, resVersion string, k8sResInfo Validati
 	return err
 }
 
-func ConfigK8sAdmissionControl(k8sResInfo ValidatingWebhookConfigInfo, ctrlState *share.CLUSAdmCtrlState) (bool, error) { // returns (skip, err)
+func ConfigK8sAdmissionControl(k8sResInfo *ValidatingWebhookConfigInfo, ctrlState *share.CLUSAdmCtrlState) (bool, error) { // returns (skip, err)
 	if ctrlState == nil || ctrlState.Uri == "" {
 		log.WithFields(log.Fields{"name": k8sResInfo.Name}).Error("Empty ctrlState") // should never reach here
 		return true, nil
@@ -655,10 +653,17 @@ func ConfigK8sAdmissionControl(k8sResInfo ValidatingWebhookConfigInfo, ctrlState
 			}
 		}
 		if op != "" {
-			err = configK8sAdmCtrlValidateResource(op, verRead, k8sResInfo)
-			if err == nil {
-				log.WithFields(log.Fields{"name": k8sResInfo.Name, "op": op, "enable": ctrlState.Enable}).Info("Configured admission control in k8s")
-				return false, nil
+			if op == K8sResOpUpdate && k8sResInfo.RevertCount != nil && (k8sResInfo.UnexpectedMatchExpr != "" && *k8sResInfo.RevertCount > 0) {
+				return true, nil
+			} else {
+				err = configK8sAdmCtrlValidateResource(op, verRead, k8sResInfo)
+				if err == nil {
+					if op == K8sResOpUpdate && k8sResInfo.RevertCount != nil {
+						*k8sResInfo.RevertCount = *k8sResInfo.RevertCount + 1
+					}
+					log.WithFields(log.Fields{"name": k8sResInfo.Name, "op": op, "enable": ctrlState.Enable}).Info("Configured admission control in k8s")
+					return false, nil
+				}
 			}
 		}
 		retry++
@@ -671,7 +676,7 @@ func ConfigK8sAdmissionControl(k8sResInfo ValidatingWebhookConfigInfo, ctrlState
 
 func UnregK8sAdmissionControl(admType, nvAdmName string) error {
 	k8sResInfo := ValidatingWebhookConfigInfo{Name: nvAdmName}
-	return configK8sAdmCtrlValidateResource(K8sResOpDelete, "", k8sResInfo)
+	return configK8sAdmCtrlValidateResource(K8sResOpDelete, "", &k8sResInfo)
 }
 
 func GetValidateWebhookSvcInfo(svcname string) (error, *ValidateWebhookSvcInfo) {
@@ -766,44 +771,58 @@ func TestAdmWebhookConnection(svcname string) (int, error) {
 }
 
 func workSingleK8sNsLabels(nsName string, labelKeys map[string]*bool) error {
-	obj, err := global.ORCH.GetResource(resource.RscTypeNamespace, "", nsName)
-	if err != nil {
-		log.WithFields(log.Fields{"labelKeys": labelKeys, "namespace": nsName, "err": err}).Error("resource no found")
-		return err
-	} else {
-		nsObj := obj.(*corev1.Namespace)
-		if nsObj != nil && nsObj.Metadata != nil {
-			if nsObj.Metadata.Labels == nil {
-				nsObj.Metadata.Labels = make(map[string]string)
-			}
-			needUpdate := false
-			for labelKey, shouldExist := range labelKeys {
-				if shouldExist != nil {
-					_, exists := nsObj.Metadata.Labels[labelKey]
-					if *shouldExist && !exists {
-						nsObj.Metadata.Labels[labelKey] = nsSelectorValue
-						needUpdate = true
-					} else if !*shouldExist && exists {
-						delete(nsObj.Metadata.Labels, labelKey)
-						needUpdate = true
+	var errRet error
+	for i := 0; i < 3; i++ {
+		obj, err := global.ORCH.GetResource(resource.RscTypeNamespace, "", nsName)
+		if err != nil {
+			log.WithFields(log.Fields{"labelKeys": labelKeys, "namespace": nsName, "err": err}).Error("resource no found")
+			return err
+		} else {
+			nsObj := obj.(*corev1.Namespace)
+			if nsObj != nil && nsObj.Metadata != nil {
+				if nsObj.Metadata.Labels == nil {
+					nsObj.Metadata.Labels = make(map[string]string)
+				}
+				needUpdate := false
+				for labelKey, shouldExist := range labelKeys {
+					if shouldExist != nil {
+						_, exists := nsObj.Metadata.Labels[labelKey]
+						if *shouldExist && !exists {
+							nsObj.Metadata.Labels[labelKey] = nsSelectorValue
+							needUpdate = true
+						} else if !*shouldExist && exists {
+							delete(nsObj.Metadata.Labels, labelKey)
+							needUpdate = true
+						}
 					}
 				}
-			}
-			if needUpdate {
-				err = global.ORCH.UpdateResource(resource.RscTypeNamespace, nsObj)
-				if err != nil {
-					log.WithFields(log.Fields{"nsName": nsName, "err": err}).Error("update resource failed")
-					return err
+				if needUpdate {
+					err = global.ORCH.UpdateResource(resource.RscTypeNamespace, nsObj)
+					if err != nil {
+						// 409 means conflict. i.e. namespace is updated by others before our update. retry
+						if strings.Index(err.Error(), " 409 ") > 0 {
+							errRet = err
+						} else {
+							log.WithFields(log.Fields{"nsName": nsName, "err": err}).Error("update resource failed")
+							return err
+						}
+					} else {
+						errRet = nil
+						break
+					}
+				} else {
+					errRet = nil
+					break
 				}
+			} else {
+				err = fmt.Errorf("ns/metadata is nil")
+				log.WithFields(log.Fields{"nsName": nsName}).Error(err)
+				return err
 			}
-		} else {
-			err = fmt.Errorf("ns/metadata is nil")
-			log.WithFields(log.Fields{"nsName": nsName}).Error(err)
-			return err
 		}
 	}
 
-	return nil
+	return errRet
 }
 
 func IsNsSelectorSupported() bool {

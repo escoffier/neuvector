@@ -4,14 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
-	"math"
-	"regexp"
 
 	"github.com/julienschmidt/httprouter"
 	log "github.com/sirupsen/logrus"
@@ -23,6 +24,8 @@ import (
 	"github.com/neuvector/neuvector/share/cluster"
 	"github.com/neuvector/neuvector/share/utils"
 )
+
+var TESTApikeySpecifiedCretionTime bool
 
 // return (isWeak, pwdHistoryToKeep, profileBasic, message)
 func isWeakPassword(newPwd, pwdHash string, pwdHashHistory []string, useProfile *share.CLUSPwdProfile) (bool, int, api.RESTPwdProfileBasic, string) {
@@ -108,7 +111,7 @@ func handlerUserCreate(w http.ResponseWriter, r *http.Request, ps httprouter.Par
 
 	ruser := rconf.User
 	username := ruser.Fullname
-	if username[0] == '~' {
+	if len(username) == 0 || username[0] == '~' {
 		restRespAccessDenied(w, login)
 		return
 	}
@@ -210,12 +213,12 @@ func handlerUserCreate(w http.ResponseWriter, r *http.Request, ps httprouter.Par
 	restRespSuccess(w, r, nil, acc, login, &rconf, "Create user")
 }
 
-func user2REST(user *share.CLUSUser) *api.RESTUser {
+func user2REST(user *share.CLUSUser, acc *access.AccessControl) *api.RESTUser {
 	var defaultPW bool
 	if user.Fullname == common.DefaultAdminUser && user.PasswordHash == utils.HashPassword(common.DefaultAdminPass) {
 		defaultPW = true
 	}
-	return &api.RESTUser{
+	userRest := &api.RESTUser{
 		Fullname:           user.Fullname,
 		Server:             user.Server,
 		Username:           user.Username,
@@ -229,6 +232,14 @@ func user2REST(user *share.CLUSUser) *api.RESTUser {
 		LastLoginAt:        api.RESTTimeString(user.LastLoginAt),
 		LoginCount:         user.LoginCount,
 	}
+
+	if acc.HasGlobalPermissions(0, share.PERM_AUTHORIZATION) && userRest.Server == "" {
+		if acc.IsFedAdmin() || (acc.CanWriteCluster() && user.Role != api.UserRoleFedAdmin && user.Role != api.UserRoleFedReader) {
+			userRest.PwdResettable = true
+		}
+	}
+
+	return userRest
 }
 
 func handlerUserShow(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
@@ -242,7 +253,7 @@ func handlerUserShow(w http.ResponseWriter, r *http.Request, ps httprouter.Param
 
 	fullname := ps.ByName("fullname")
 	fullname, _ = url.PathUnescape(fullname)
-	if fullname[0] == '~' {
+	if len(fullname) == 0 || fullname[0] == '~' {
 		handlerNotFound(w, r)
 		return
 	}
@@ -254,7 +265,7 @@ func handlerUserShow(w http.ResponseWriter, r *http.Request, ps httprouter.Param
 		return
 	}
 
-	resp := api.RESTUserData{User: user2REST(user)}
+	resp := api.RESTUserData{User: user2REST(user, acc)}
 	if user.Server == "" {
 		if pwdProfile, err := cacher.GetPwdProfile(share.CLUSSysPwdProfileName); err == nil {
 			now := time.Now().UTC()
@@ -290,7 +301,7 @@ func handlerSelfUserShow(w http.ResponseWriter, r *http.Request, ps httprouter.P
 	} else if login.fullname == "" {
 		restRespAccessDenied(w, login)
 		return
-	} else if login.loginType == 1 {
+	} else if login.loginType == loginTypeApikey {
 		restRespAccessDenied(w, login)
 		return
 	}
@@ -302,7 +313,7 @@ func handlerSelfUserShow(w http.ResponseWriter, r *http.Request, ps httprouter.P
 		return
 	}
 
-	resp := api.RESTSelfUserData{User: user2REST(user)}
+	resp := api.RESTSelfUserData{User: user2REST(user, acc)}
 	if user.Server == "" {
 		pwdDaysUntilExpire, pwdHoursUntilExpire, _ := isPasswordExpired(true, user.Fullname, user.PwdResetTime)
 		resp.PwdDaysUntilExpire = pwdDaysUntilExpire
@@ -333,14 +344,14 @@ func handlerUserList(w http.ResponseWriter, r *http.Request, ps httprouter.Param
 	pwdProfile, _ := cacher.GetPwdProfile(share.CLUSSysPwdProfileName)
 	users := clusHelper.GetAllUsersNoAuth()
 	for _, user := range users {
-		if login.fullname != user.Fullname { // a user can always see himself/herself
+		if login.fullname != user.Fullname || login.loginType == loginTypeApikey { // a user can always see himself/herself
 			if !acc.Authorize(user, nil) {
 				continue
 			}
 		}
 
 		// skip hidden user
-		if user.Fullname[0] == '~' {
+		if len(user.Fullname) == 0 || user.Fullname[0] == '~' {
 			continue
 		}
 
@@ -349,7 +360,7 @@ func handlerUserList(w http.ResponseWriter, r *http.Request, ps httprouter.Param
 			continue
 		}
 
-		userRest := user2REST(user)
+		userRest := user2REST(user, acc)
 		if user.Server == "" && pwdProfile.Name != "" {
 			if pwdProfile.EnablePwdExpiration && pwdProfile.PwdExpireAfterDays > 0 {
 				pwdValidUnit := _pwdValidUnit
@@ -468,7 +479,7 @@ func handlerUserConfig(w http.ResponseWriter, r *http.Request, ps httprouter.Par
 		log.WithFields(log.Fields{"name": fullname, "config": rconf.Config.Fullname}).Error(e)
 		restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrInvalidRequest, e)
 		return
-	} else if fullname[0] == '~' {
+	} else if len(fullname) == 0 || fullname[0] == '~' {
 		restRespAccessDenied(w, login)
 		return
 	}
@@ -644,8 +655,7 @@ func handlerUserConfig(w http.ResponseWriter, r *http.Request, ps httprouter.Par
 		if ruser.Timeout != nil {
 			if *ruser.Timeout == 0 {
 				*ruser.Timeout = common.DefaultIdleTimeout
-			} else if *ruser.Timeout > api.UserIdleTimeoutMax ||
-				*ruser.Timeout < api.UserIdleTimeoutMin {
+			} else if *ruser.Timeout > api.UserIdleTimeoutMax || *ruser.Timeout < api.UserIdleTimeoutMin {
 				e := fmt.Sprintf("Invalid idle timeout value. (%v, %v)", api.UserIdleTimeoutMin, api.UserIdleTimeoutMax)
 				log.WithFields(log.Fields{"user": fullname, "timeout": *ruser.Timeout}).Error(e)
 				restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrInvalidRequest, e)
@@ -704,7 +714,7 @@ func handlerUserPwdConfig(w http.ResponseWriter, r *http.Request, ps httprouter.
 
 	fullname := ps.ByName("fullname")
 	fullname, _ = url.PathUnescape(fullname)
-	if fullname[0] == '~' {
+	if len(fullname) == 0 || fullname[0] == '~' {
 		restRespAccessDenied(w, login)
 		return
 	}
@@ -719,6 +729,8 @@ func handlerUserPwdConfig(w http.ResponseWriter, r *http.Request, ps httprouter.
 		errMsg = "Request error"
 	} else if fullname != rconf.Config.Fullname {
 		errMsg = "Username not match"
+	} else if rconf.Config.ForceResetPwd && rconf.Config.NewPassword == nil {
+		errMsg = "No password provided"
 	}
 	if errMsg != "" {
 		log.WithFields(log.Fields{"error": err, "fullname": fullname}).Error(errMsg)
@@ -757,7 +769,7 @@ func handlerUserPwdConfig(w http.ResponseWriter, r *http.Request, ps httprouter.
 			errMsg = ""
 			if user.Server != "" {
 				errMsg = "Cannot modify remote user's password"
-			} else if pwdProfile.EnablePwdExpiration && pwdProfile.PwdExpireAfterDays > 0 {
+			} else if !ruser.ForceResetPwd && pwdProfile.EnablePwdExpiration && pwdProfile.PwdExpireAfterDays > 0 {
 				pwdValidUnit := _pwdValidUnit
 				if user.Fullname == common.DefaultAdminUser {
 					pwdValidUnit = _pwdValidPerDayUnit
@@ -770,6 +782,14 @@ func handlerUserPwdConfig(w http.ResponseWriter, r *http.Request, ps httprouter.
 			if errMsg != "" {
 				log.WithFields(log.Fields{"user": fullname}).Error(errMsg)
 				restRespErrorMessage(w, http.StatusForbidden, api.RESTErrOpNotAllowed, errMsg)
+				return
+			}
+
+			// only fedAdmin-role user can force reset other fedAdmin/fedReader-role user's password
+			// only admin-role user can force reset other admin-role user's password
+			if ((user.Role == api.UserRoleFedAdmin || user.Role == api.UserRoleFedReader) && !acc.IsFedAdmin()) ||
+				(user.Role == api.UserRoleAdmin && !acc.CanWriteCluster()) {
+				restRespAccessDenied(w, login)
 				return
 			}
 
@@ -788,6 +808,11 @@ func handlerUserPwdConfig(w http.ResponseWriter, r *http.Request, ps httprouter.
 				}
 				user.PasswordHash = utils.HashPassword(*ruser.NewPassword)
 				user.PwdResetTime = time.Now().UTC()
+				if ruser.ForceResetPwd {
+					user.FailedLoginCount = 0
+					user.BlockLoginSince = time.Time{}
+					user.ResetPwdInNextLogin = ruser.ResetPwdInNextLogin
+				}
 				resetPassword = true
 			}
 		}
@@ -796,6 +821,9 @@ func handlerUserPwdConfig(w http.ResponseWriter, r *http.Request, ps httprouter.
 			log.WithFields(log.Fields{"error": err, "rev": rev}).Error()
 			retry++
 		} else {
+			if resetPassword {
+				kickLoginSessions(user)
+			}
 			break
 		}
 	}
@@ -833,7 +861,7 @@ func handlerUserRoleDomainsConfig(w http.ResponseWriter, r *http.Request, ps htt
 	fullname := ps.ByName("fullname")
 	fullname, _ = url.PathUnescape(fullname)
 	role := ps.ByName("role")
-	if fullname[0] == '~' {
+	if len(fullname) == 0 || fullname[0] == '~' {
 		restRespAccessDenied(w, login)
 		return
 	}
@@ -961,7 +989,7 @@ func handlerUserDelete(w http.ResponseWriter, r *http.Request, ps httprouter.Par
 
 	fullname := ps.ByName("fullname")
 	fullname, _ = url.PathUnescape(fullname)
-	if fullname[0] == '~' {
+	if len(fullname) == 0 || fullname[0] == '~' {
 		restRespAccessDenied(w, login)
 		return
 	}
@@ -1094,7 +1122,6 @@ func normalizeApikeyRoles(user *share.CLUSApikey) error {
 	return nil
 }
 
-
 func handlerApikeyList(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
 	defer r.Body.Close()
@@ -1163,27 +1190,7 @@ func handlerApikeyCreate(w http.ResponseWriter, r *http.Request, ps httprouter.P
 	// Read body
 	body, _ := ioutil.ReadAll(r.Body)
 
-	if len(body) == 0 {
-		if !acc.Authorize(&share.CLUSApikey{
-			RoleDomains:  acc.GetRoleDomains()}, nil) {
-			log.WithFields(log.Fields{"login": login.fullname}).Error(common.ErrObjectAccessDenied.Error())
-			restRespAccessDenied(w, login)
-			return
-		}
-
-		// if it's empty request body, returns a pre-created apikey
-		tmpGuid, _ := utils.GetGuid()
-
-		var resp api.RESTApikeyPreGeneratedData
-		resp.Apikey = &api.RESTApikeyPreGenerated{
-			Name: fmt.Sprintf("token-%s", utils.RandomString(5)),
-			SecretKey: utils.EncryptPassword(tmpGuid),
-		}
-		restRespSuccess(w, r, &resp, nil, nil, nil, "Create API key")
-		return
-	}
-
-	var rconf api.RESTApikeyData
+	var rconf api.RESTApikeyCreationData
 	err := json.Unmarshal(body, &rconf)
 	if err != nil || rconf.Apikey == nil {
 		e := "Request error"
@@ -1194,12 +1201,12 @@ func handlerApikeyCreate(w http.ResponseWriter, r *http.Request, ps httprouter.P
 
 	rapikey := rconf.Apikey
 	name := rapikey.Name
-	if name[0] == '~' {
+	if len(name) == 0 || name[0] == '~' {
 		restRespAccessDenied(w, login)
 		return
 	}
 
-	// only english characters, numbers and -,_ allowed 
+	// only english characters, numbers and -,_ allowed
 	if !isApiAccessKeyFormatValid(name) {
 		e := "Invalid characters in name"
 		log.WithFields(log.Fields{"login": login.fullname, "create": rapikey.Name}).Error(e)
@@ -1207,7 +1214,7 @@ func handlerApikeyCreate(w http.ResponseWriter, r *http.Request, ps httprouter.P
 		return
 	}
 
-	if len(name) >= 32 {
+	if len(name) > 32 {
 		e := "Exceed maximum name length limitation (32 characters)"
 		log.WithFields(log.Fields{"login": login.fullname, "create": rapikey.Name}).Error(e)
 		restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrInvalidName, e)
@@ -1230,16 +1237,22 @@ func handlerApikeyCreate(w http.ResponseWriter, r *http.Request, ps httprouter.P
 
 	// 1. Only fedAdmin can create users with fedAdmin/fedReader role (on master cluster)
 	// 2. For every domain that a namespace user is in, the creater must have PERM_AUTHORIZATION(modify) permission in the domain
+
+	// Generate secret key
+	tmpGuid, _ := utils.GetGuid()
+	secretKey := utils.EncryptPassword(tmpGuid)
+
 	apikey := share.CLUSApikey{
-		ExpirationType:    rapikey.ExpirationType,
-		ExpirationHours:   rapikey.ExpirationHours,
-		Name:              rapikey.Name,
-		Description:       rapikey.Description,
-		Role:              rapikey.Role,
-		RoleDomains:       rapikey.RoleDomains,
-		Locale:            common.OEMDefaultUserLocale,
-		CreatedTimestamp:  time.Now().UTC().Unix(),
-		CreatedByEntity:   login.fullname,
+		ExpirationType:   rapikey.ExpirationType,
+		ExpirationHours:  rapikey.ExpirationHours,
+		Name:             rapikey.Name,
+		Description:      rapikey.Description,
+		Role:             rapikey.Role,
+		RoleDomains:      rapikey.RoleDomains,
+		Locale:           common.OEMDefaultUserLocale,
+		CreatedTimestamp: time.Now().UTC().Unix(),
+		CreatedByEntity:  login.fullname,
+		SecretKeyHash:    utils.HashPassword(secretKey),
 	}
 	if !acc.AuthorizeOwn(&apikey, nil) {
 		log.WithFields(log.Fields{"login": login.fullname, "apikey": rapikey.Name}).Error(common.ErrObjectAccessDenied.Error())
@@ -1249,9 +1262,22 @@ func handlerApikeyCreate(w http.ResponseWriter, r *http.Request, ps httprouter.P
 
 	// calculate expiration time
 	now := time.Now()
+	if TESTApikeySpecifiedCretionTime {
+		creation_timestamp := r.URL.Query().Get("creation_timestamp")
+		epochTimestamp, err := strconv.ParseInt(creation_timestamp, 10, 64)
+		if err != nil {
+			log.WithFields(log.Fields{"creation_timestamp": creation_timestamp, "err": err}).Debug("TESTApikeySpecifiedCretionTime failed")
+		} else {
+			apikey.CreatedTimestamp = epochTimestamp
+			now = time.Unix(epochTimestamp, 0)
+		}
+	}
+
 	switch rapikey.ExpirationType {
 	case api.ApikeyExpireNever:
-		apikey.ExpirationTimestamp = math.MaxInt64 
+		apikey.ExpirationTimestamp = math.MaxInt64
+	case api.ApikeyExpireOneHour:
+		apikey.ExpirationTimestamp = now.Add(time.Duration(1) * time.Hour).UTC().Unix()
 	case api.ApikeyExpireOneDay:
 		apikey.ExpirationTimestamp = now.AddDate(0, 0, 1).UTC().Unix()
 	case api.ApikeyExpireOneMonth:
@@ -1259,10 +1285,15 @@ func handlerApikeyCreate(w http.ResponseWriter, r *http.Request, ps httprouter.P
 	case api.ApikeyExpireOneYear:
 		apikey.ExpirationTimestamp = now.AddDate(1, 0, 0).UTC().Unix()
 	case api.ApikeyExpireCustomHour:
+		if rapikey.ExpirationHours == 0 || rapikey.ExpirationHours > 8760 {
+			e := "invalid expiration hour value (1 ~ 8760)"
+			restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrInvalidRequest, e)
+			return
+		}
 		apikey.ExpirationTimestamp = now.Add(time.Duration(rapikey.ExpirationHours) * time.Hour).UTC().Unix()
 	default:
 		e := "invalid expiration type"
-		log.WithFields(log.Fields{"Name": rapikey.Name, "ExpirationType": rapikey.ExpirationType}).Error(e)	
+		log.WithFields(log.Fields{"Name": rapikey.Name, "ExpirationType": rapikey.ExpirationType}).Error(e)
 		restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrInvalidRequest, e)
 		return
 	}
@@ -1276,21 +1307,10 @@ func handlerApikeyCreate(w http.ResponseWriter, r *http.Request, ps httprouter.P
 	// Check if apikey already exists
 	if apikeyExisting, _, _ := clusHelper.GetApikeyRev(rapikey.Name, acc); apikeyExisting != nil {
 		e := "apikey name already exists"
-		log.WithFields(log.Fields{"Name": login.fullname, "create": rapikey.Name}).Error(e)	
+		log.WithFields(log.Fields{"Name": login.fullname, "create": rapikey.Name}).Error(e)
 		restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrDuplicateName, e)
 		return
 	}
-
-	// Check if this password is generated by us... try to decrypt it...
-	decrypt := utils.DecryptPassword(rapikey.SecretKey)
-	if len(decrypt) != 32 {
-		e := "apikey SecretKey is invalid"
-		log.WithFields(log.Fields{"Name": login.fullname, "create": rapikey.Name})
-		restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrInvalidRequest, e)
-		return
-	}
-
-	apikey.SecretKeyHash = utils.HashPassword(rapikey.SecretKey)
 
 	if e := normalizeApikeyRoles(&apikey); e != nil {
 		restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrInvalidRequest, e.Error())
@@ -1304,7 +1324,13 @@ func handlerApikeyCreate(w http.ResponseWriter, r *http.Request, ps httprouter.P
 		return
 	}
 
-	restRespSuccess(w, r, nil, acc, login, &rconf, "Create apikey")
+	var resp api.RESTApikeyGeneratedData
+	resp.Apikey = &api.RESTApikeyGenerated{
+		Name:      apikey.Name,
+		SecretKey: secretKey,
+	}
+
+	restRespSuccess(w, r, &resp, acc, login, &rconf, "Create apikey")
 }
 
 func handlerApikeyDelete(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {

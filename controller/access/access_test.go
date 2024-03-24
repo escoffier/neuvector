@@ -1186,6 +1186,7 @@ func TestCompileApiUrisMappingMapping(t *testing.T) {
 			"v1/scan/platform",
 			"v1/scan/platform/platform",
 			"v1/scan/asset",
+			"v1/vulasset",
 		},
 		CONST_API_REG_SCAN: []string{
 			"v1/scan/registry",
@@ -1194,6 +1195,10 @@ func TestCompileApiUrisMappingMapping(t *testing.T) {
 			"v1/scan/registry/*/image/*",
 			"v1/scan/registry/*/layers/*",
 			"v1/list/registry_type",
+			"v1/scan/sigstore/root_of_trust",
+			"v1/scan/sigstore/root_of_trust/*",
+			"v1/scan/sigstore/root_of_trust/*/verifier",
+			"v1/scan/sigstore/root_of_trust/*/verifier/*",
 		},
 		CONST_API_INFRA: []string{
 			"v1/host",
@@ -1364,16 +1369,23 @@ func TestCompileApiUrisMappingMapping(t *testing.T) {
 			"v1/enforcer/*/profiling",
 			"v1/file/config",
 			"v1/csp/file/support",
+			"v1/internal/alert",
 		},
 		CONST_API_RT_SCAN: []string{
 			"v1/scan/workload/*",
 			"v1/scan/host/*",
 			"v1/scan/platform/platform",
+			"v1/vulasset",
+			"v1/assetvul",
 		},
 		CONST_API_REG_SCAN: []string{
 			"v1/scan/registry/*/scan",
 			"v1/scan/registry",
+			"v2/scan/registry",
 			"v1/scan/registry/*/test",
+			"v2/scan/registry/*/test",
+			"v1/scan/sigstore/root_of_trust",
+			"v1/scan/sigstore/root_of_trust/*/verifier",
 		},
 		CONST_API_CICD_SCAN: []string{
 			"v1/scan/result/repository",
@@ -1406,6 +1418,8 @@ func TestCompileApiUrisMappingMapping(t *testing.T) {
 		CONST_API_COMPLIANCE: []string{
 			"v1/bench/host/*/docker",
 			"v1/bench/host/*/kubernetes",
+			"v1/file/compliance/profile",
+			"v1/file/compliance/profile/config",
 		},
 		CONST_API_AUTHENTICATION: []string{
 			"v1/server",
@@ -1415,14 +1429,15 @@ func TestCompileApiUrisMappingMapping(t *testing.T) {
 			"v1/user_role",
 			"v1/user",
 			"v1/api_key",
+			"v1/user/*/password",
 		},
 		CONST_API_PWD_PROFILE: []string{
 			"v1/password_profile",
-			"v1/user/*/password",
 		},
 		CONST_API_SYSTEM_CONFIG: []string{
 			"v1/system/license/update",
 			"v1/system/config/webhook",
+			"v1/system/config/remote_repository",
 		},
 		CONST_API_IBMSA: []string{
 			"v1/partner/ibm_sa/*/setup/*",
@@ -1436,6 +1451,8 @@ func TestCompileApiUrisMappingMapping(t *testing.T) {
 		},
 		CONST_API_VULNERABILITY: []string{
 			"v1/vulnerability/profile/*/entry",
+			"v1/file/vulnerability/profile",
+			"v1/file/vulnerability/profile/config",
 		},
 	}
 
@@ -1451,6 +1468,9 @@ func TestCompileApiUrisMappingMapping(t *testing.T) {
 		},
 		CONST_API_REG_SCAN: []string{
 			"v1/scan/registry/*",
+			"v2/scan/registry/*",
+			"v1/scan/sigstore/root_of_trust/*",
+			"v1/scan/sigstore/root_of_trust/*/verifier/*",
 		},
 		CONST_API_INFRA: []string{
 			"v1/domain",
@@ -1508,6 +1528,7 @@ func TestCompileApiUrisMappingMapping(t *testing.T) {
 			"v1/system/config",
 			"v2/system/config",
 			"v1/system/config/webhook/*",
+			"v1/system/config/remote_repository/*",
 		},
 		CONST_API_FED: []string{
 			"v1/fed/cluster/*/**",
@@ -1533,6 +1554,8 @@ func TestCompileApiUrisMappingMapping(t *testing.T) {
 			"v1/scan/registry/*/scan",
 			"v1/scan/registry/*",
 			"v1/scan/registry/*/test",
+			"v1/scan/sigstore/root_of_trust/*",
+			"v1/scan/sigstore/root_of_trust/*/verifier/*",
 		},
 		CONST_API_GROUP: []string{
 			"v1/group/*",
@@ -1568,6 +1591,7 @@ func TestCompileApiUrisMappingMapping(t *testing.T) {
 		CONST_API_SYSTEM_CONFIG: []string{
 			"v1/system/license",
 			"v1/system/config/webhook/*",
+			"v1/system/config/remote_repository/*",
 		},
 		CONST_API_FED: []string{
 			"v1/fed/cluster/*",

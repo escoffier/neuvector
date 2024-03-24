@@ -3,10 +3,12 @@ package rest
 import (
 	"bytes"
 	"context"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/gob"
 	"encoding/json"
-	"errors"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"os"
@@ -21,9 +23,15 @@ import (
 	"syscall"
 	"time"
 
+	"errors"
+
+	"github.com/dgrijalva/jwt-go"
+	"sigs.k8s.io/yaml"
+
 	"github.com/hashicorp/go-version"
 	"github.com/julienschmidt/httprouter"
 	log "github.com/sirupsen/logrus"
+
 	//	admissionv1beta1 "k8s.io/api/admission/v1beta1"
 
 	"github.com/neuvector/neuvector/controller/access"
@@ -31,6 +39,7 @@ import (
 	"github.com/neuvector/neuvector/controller/cache"
 	"github.com/neuvector/neuvector/controller/common"
 	"github.com/neuvector/neuvector/controller/kv"
+	"github.com/neuvector/neuvector/controller/remote_repository"
 	"github.com/neuvector/neuvector/controller/scan"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/auth"
@@ -41,6 +50,13 @@ import (
 
 const retryClusterMax int = 3
 const clusterLockWait = time.Duration(time.Second * 20)
+
+type ApiVersion int
+
+const (
+	ApiVersion1 ApiVersion = iota
+	ApiVersion2
+)
 
 const gzipThreshold = 1200 // On most Ethernet NICs MTU is 1500 bytes. Let's give ip/tcp/http header 300 bytes
 
@@ -94,7 +110,9 @@ var restErrWorkloadNotFound error = errors.New("Container is not found")
 var restErrAgentNotFound error = errors.New("Enforcer is not found")
 var restErrAgentDisconnected error = errors.New("Enforcer is disconnected")
 
-var checkCrdSchemaFunc func(lead, create bool, cspType share.TCspType) []string
+var checkCrdSchemaFunc func(lead, init, crossCheck bool, cspType share.TCspType) []string
+
+var CertManager *kv.CertManager
 
 var restErrMessage = []string{
 	api.RESTErrNotFound:              "URL not found",
@@ -147,6 +165,8 @@ var restErrMessage = []string{
 	api.RESTErrPromoteFail:           "Failed to promote rules",
 	api.RESTErrPlatformAuthDisabled:  "Platform authentication is disabled",
 	api.RESTErrRancherUnauthorized:   "Rancher authentication failed",
+	api.RESTErrRemoteExportFail:      "Failed to export to remote repository",
+	api.RESTErrInvalidQueryToken:     "Invalid or expired query token",
 }
 
 func restRespForward(w http.ResponseWriter, r *http.Request, statusCode int, headers map[string]string, data []byte, remoteExport, remoteRegScanTest bool) {
@@ -1240,17 +1260,135 @@ type Context struct {
 	RESTPort           uint
 	PwdValidUnit       uint
 	TeleNeuvectorURL   string
-	TeleCurrentVer     string
 	TeleFreq           uint
+	NvAppFullVersion   string
+	NvSemanticVersion  string
 	CspType            share.TCspType
-	CspPauseInterval   uint // in minutes
-	CheckCrdSchemaFunc func(leader, create bool, cspType share.TCspType) []string
+	CspPauseInterval   uint   // in minutes
+	CustomCheckControl string // disable / strict / loose
+	CheckCrdSchemaFunc func(lead, init, crossCheck bool, cspType share.TCspType) []string
+	CertManager        *kv.CertManager
 }
 
 var cctx *Context
 
-// InitContext() must be called before StartRESTServer(), StartFedRestServer or AdmissionRestServer()
-func InitContext(ctx *Context) {
+func getExpiryDate(certPEM []byte) (time.Time, error) {
+	block, _ := pem.Decode(certPEM)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return cert.NotAfter, nil
+}
+
+func initJWTSignKey() error {
+	ExpiryCheckPeriod := time.Minute * 30
+	RenewThreshold := time.Hour * 24 * 30
+	JWTCertValidityPeriodDay := 90 // 90 days.
+
+	if envvar := os.Getenv("CERT_EXPIRY_CHECK_PERIOD"); envvar != "" {
+		if v, err := time.ParseDuration(envvar); err == nil {
+			ExpiryCheckPeriod = v
+		} else {
+			log.WithError(err).Warn("failed to load ExpiryCheckPeriod")
+		}
+	}
+	if envvar := os.Getenv("CERT_RENEW_THRESHOLD"); envvar != "" {
+		if v, err := time.ParseDuration(envvar); err == nil {
+			RenewThreshold = v
+		} else {
+			log.WithError(err).Warn("failed to load RenewThreshold")
+		}
+	}
+	if envvar := os.Getenv("JWTCERT_VALIDITY_PERIOD_DAY"); envvar != "" {
+		if v, err := strconv.Atoi(envvar); err == nil {
+			JWTCertValidityPeriodDay = v
+		} else {
+			log.WithError(err).Warn("failed to load JWTCertValidityPeriodDay")
+		}
+	}
+
+	log.WithFields(log.Fields{
+		"period":              ExpiryCheckPeriod,
+		"threshold":           RenewThreshold,
+		"validity_length_day": JWTCertValidityPeriodDay,
+	}).Info("cert manager is configured.")
+
+	CertManager = kv.NewCertManager(kv.CertManagerConfig{
+		RenewThreshold:    RenewThreshold,
+		ExpiryCheckPeriod: ExpiryCheckPeriod,
+	})
+	CertManager.Register(share.CLUSJWTKey, &kv.CertManagerCallback{
+		NewCert: func(*share.CLUSX509Cert) (*share.CLUSX509Cert, error) {
+			cert, key, err := kv.GenTlsKeyCert(share.CLUSJWTKey, "", "", kv.ValidityPeriod{Day: JWTCertValidityPeriodDay}, x509.ExtKeyUsageAny)
+			if err != nil {
+				return nil, fmt.Errorf("failed to generate tls key/cert: %w", err)
+			}
+			return &share.CLUSX509Cert{
+				CN:   share.CLUSJWTKey,
+				Key:  string(key),
+				Cert: string(cert),
+			}, nil
+		},
+		NotifyNewCert: func(oldcert *share.CLUSX509Cert, newcert *share.CLUSX509Cert) {
+			jwtKeyMutex.Lock()
+			defer jwtKeyMutex.Unlock()
+
+			var rsaPublicKey *rsa.PublicKey
+			var rsaOldPublicKey *rsa.PublicKey
+			var rsaPrivateKey *rsa.PrivateKey
+			var err error
+			if rsaPublicKey, err = jwt.ParseRSAPublicKeyFromPEM([]byte(newcert.Cert)); err != nil {
+				log.WithError(err).Error("failed to parse jwt cert.")
+				return
+			}
+
+			if newcert.OldCert != nil {
+				if rsaOldPublicKey, err = jwt.ParseRSAPublicKeyFromPEM([]byte(newcert.OldCert.Cert)); err != nil {
+					log.WithError(err).Warn("failed to parse old jwt cert.")
+					// Ignore the error
+				}
+			}
+
+			if rsaPrivateKey, err = jwt.ParseRSAPrivateKeyFromPEM([]byte(newcert.Key)); err != nil {
+				log.WithError(err).Error("failed to parse jwt key.")
+				return
+			}
+
+			// Here we replace pointers directly, so it's safe to continue using the original pointers in GetJWTSigningKey().
+			jwtCertState.jwtPublicKey = rsaPublicKey
+			jwtCertState.jwtPrivateKey = rsaPrivateKey
+			jwtCertState.jwtOldPublicKey = rsaOldPublicKey
+
+			if t, err := getExpiryDate([]byte(newcert.Cert)); err != nil {
+				log.WithError(err).Error("failed to get jwt cert's expiry time.")
+			} else {
+				jwtCertState.jwtPublicKeyNotAfter = &t
+			}
+
+			if newcert.OldCert != nil {
+				if t, err := getExpiryDate([]byte(newcert.Cert)); err != nil {
+					log.WithError(err).Error("failed to get jwt cert's expiry time.")
+				} else {
+					jwtCertState.jwtOldPublicKeyNotAfter = &t
+				}
+			}
+
+			log.WithFields(log.Fields{
+				"cn":            "neuvector-jwt-signing",
+				"newExpiryDate": jwtCertState.jwtPublicKeyNotAfter,
+				"oldExpiryDate": jwtCertState.jwtOldPublicKeyNotAfter,
+			}).Info("new certificate is loaded")
+		},
+	})
+	// Create and setup certificate.
+	CertManager.CheckAndRenewCerts()
+	go CertManager.Run(context.TODO())
+	return nil
+}
+
+// PreInitContext() must be called before orch connector starts in main()
+func PreInitContext(ctx *Context) {
 	cctx = ctx
 	localDev = ctx.LocalDev
 	cacher = ctx.Cacher
@@ -1259,9 +1397,13 @@ func InitContext(ctx *Context) {
 	auditQueue = ctx.AuditQueue
 	messenger = ctx.Messenger
 
-	remoteAuther = auth.NewRemoteAuther()
+	remoteAuther = auth.NewRemoteAuther(nil)
 	clusHelper = kv.GetClusterHelper()
 	cfgHelper = kv.GetConfigHelper()
+}
+
+// InitContext() must be called before StartRESTServer(), StartFedRestServer or AdmissionRestServer()
+func InitContext(ctx *Context) {
 
 	_restPort = ctx.RESTPort
 	_fedPort = ctx.FedPort
@@ -1274,32 +1416,14 @@ func InitContext(ctx *Context) {
 	}
 
 	_teleNeuvectorURL = ctx.TeleNeuvectorURL
-	if value, _ := cluster.Get(share.CLUSCtrlVerKey); value != nil {
-		// ver.CtrlVersion   : in the format v{major}.{minor}.{patch}[-s{#}] or interim/master.xxxx
-		// nvAppFullVersion  : in the format  {major}.{minor}.{patch}[-s{#}]
-		// nvSemanticVersion : in the format v{major}.{minor}.{patch}
-		var ver share.CLUSCtrlVersion
-		json.Unmarshal(value, &ver)
-		if strings.HasPrefix(ver.CtrlVersion, "interim/") {
-			// it's daily dev build image
-			if ctx.TeleCurrentVer == "" {
-				nvAppFullVersion = "5.1.0"
-			} else {
-				nvAppFullVersion = ctx.TeleCurrentVer
-			}
-		} else {
-			// it's official release image
-			nvAppFullVersion = ver.CtrlVersion[1:]
-		}
-		if ss := strings.Split(nvAppFullVersion, "-"); len(ss) >= 1 {
-			nvSemanticVersion = "v" + ss[0]
-		}
-	}
 	_teleFreq = ctx.TeleFreq
 	if _teleFreq == 0 {
 		_teleFreq = 60
 	}
 
+	if err := initJWTSignKey(); err != nil {
+		log.WithError(err).Error("failed to initialize JWT sign key.")
+	}
 	initHttpClients()
 }
 
@@ -1311,10 +1435,6 @@ func StartRESTServer() {
 
 	if localDev.Host.Platform == share.PlatformKubernetes {
 		k8sPlatform = true
-	}
-
-	if err := jwtReadKeys(); err != nil {
-		log.WithFields(log.Fields{"error": err}).Error("Fail to read certificates for JWT")
 	}
 
 	r := httprouter.New()
@@ -1342,9 +1462,10 @@ func StartRESTServer() {
 	//r.POST("/v1/password_profile", handlerPwdProfileCreate)
 	r.PATCH("/v1/password_profile/:name", handlerPwdProfileConfig)
 	//r.DELETE("/v1/password_profile/:name", handlerPwdProfileDelete)
-	r.GET("/v1/token_auth_server", handlerTokenAuthServerList)             // Skip API document
-	r.GET("/v1/token_auth_server/:server", handlerTokenAuthServerRequest)  // Skip API document
-	r.POST("/v1/token_auth_server/:server", handlerTokenAuthServerRequest) // Skip API document
+	r.GET("/v1/token_auth_server", handlerTokenAuthServerList) // Skip API document
+	r.GET("/v1/token_auth_server/:server", handlerTokenAuthServerRequest)
+	r.POST("/v1/token_auth_server/:server", handlerTokenAuthServerRequest)
+	r.GET("/v1/token_auth_server/:server/slo", handlerGenerateSLORequest)
 	r.GET("/v1/server", handlerServerList)
 	r.GET("/v1/server/:name", handlerServerShow)
 	r.GET("/v1/server/:name/user", handlerServerUserList)
@@ -1357,21 +1478,26 @@ func StartRESTServer() {
 	r.GET("/v1/file/config", handlerConfigExport)
 	r.POST("/v1/file/config", handlerConfigImport)
 	r.GET("/v1/file/group", handlerGroupCfgExport)
-	r.POST("/v1/file/group", handlerGroupCfgExport)           // as client, GO's http.NewRequest(http.MethodGet) doesn't use body. This API is for multi-cluster purpose.
-	r.GET("/v1/file/group/config", handlerGetGroupCfgImport)  // get current running import task
-	r.POST("/v1/file/group/config", handlerGroupCfgImport)    // for providing similar function as crd import but do not rely on crd webhook. supported 'scope' query parameter values: "local"(default).
-	r.POST("/v1/file/admission", handlerAdmCtrlExport)        // supported 'scope' query parameter values: "local"(default).
-	r.POST("/v1/file/admission/config", handlerAdmCtrlImport) // for providing similar function as crd import but do not rely on crd webhook. besides, it's for replacement
-	r.POST("/v1/file/dlp", handlerDlpExport)                  // supported 'scope' query parameter values: "local"(default).
-	r.POST("/v1/file/dlp/config", handlerDlpImport)           // for providing similar function as crd import but do not rely on crd webhook. besides, it's for replacement
-	r.POST("/v1/file/waf", handlerWafExport)                  // supported 'scope' query parameter values: "local"(default).
-	r.POST("/v1/file/waf/config", handlerWafImport)           // for providing similar function as crd import but do not rely on crd webhook. besides, it's for replacement
-	r.GET("/v1/internal/system", handlerInternalSystem)       // skip API document
-	r.GET("/v1/system/usage", handlerSystemUsage)             // skip API document
+	r.POST("/v1/file/group", handlerGroupCfgExport)                           // as client, GO's http.NewRequest(http.MethodGet) doesn't use body. This API is for multi-cluster purpose.
+	r.GET("/v1/file/group/config", handlerGetGroupCfgImport)                  // get current running import task
+	r.POST("/v1/file/group/config", handlerGroupCfgImport)                    // for providing similar function as crd import but do not rely on crd webhook. supported 'scope' query parameter values: "local"(default).
+	r.POST("/v1/file/admission", handlerAdmCtrlExport)                        // supported 'scope' query parameter values: "local"(default).
+	r.POST("/v1/file/admission/config", handlerAdmCtrlImport)                 // for providing similar function as crd import but do not rely on crd webhook. besides, it's for replacement
+	r.POST("/v1/file/dlp", handlerDlpExport)                                  // supported 'scope' query parameter values: "local"(default).
+	r.POST("/v1/file/dlp/config", handlerDlpImport)                           // for providing similar function as crd import but do not rely on crd webhook. besides, it's for replacement
+	r.POST("/v1/file/waf", handlerWafExport)                                  // supported 'scope' query parameter values: "local"(default).
+	r.POST("/v1/file/waf/config", handlerWafImport)                           // for providing similar function as crd import but do not rely on crd webhook. besides, it's for replacement
+	r.POST("/v1/file/compliance/profile", handlerCompProfileExport)           //
+	r.POST("/v1/file/compliance/profile/config", handlerCompProfileImport)    // for providing similar function as crd import but do not rely on crd webhook. besides, it's for replacement
+	r.POST("/v1/file/vulnerability/profile", handlerVulnProfileExport)        //
+	r.POST("/v1/file/vulnerability/profile/config", handlerVulnProfileImport) // for providing similar function as crd import but do not rely on crd webhook. besides, it's for replacement
+	r.POST("/v1/internal/alert", handlerAcceptAlert)                          // skip API document
+	r.GET("/v1/internal/system", handlerInternalSystem)                       // skip API document
+	r.GET("/v1/system/usage", handlerSystemUsage)                             // skip API document
 	r.GET("/v1/system/summary", handlerSystemSummary)
 	r.GET("/v1/system/config", handlerSystemGetConfig)   // supported 'scope' query parameter values: ""(all, default)/"fed"/"local". no payload
 	r.GET("/v2/system/config", handlerSystemGetConfigV2) // supported 'scope' query parameter values: ""(all, default)/"fed"/"local". no payload. starting from 5.0, rest client should call this api.
-	r.GET("/v1/system/rbac", handlerSystemGetRBAC)
+	r.GET("/v1/system/rbac", handlerSystemGetRBAC)       // skip API document
 	r.PATCH("/v1/system/config", handlerSystemConfig)
 	r.PATCH("/v2/system/config", handlerSystemConfigV2)
 	r.POST("/v1/system/config/webhook", handlerSystemWebhookCreate)
@@ -1433,11 +1559,12 @@ func StartRESTServer() {
 	r.POST("/v1/group", handlerGroupCreate)                                //
 	r.PATCH("/v1/group/:name", handlerGroupConfig)                         //
 	r.DELETE("/v1/group/:name", handlerGroupDelete)                        // no payload
-	r.GET("/v1/process_profile", handlerProcessProfileList)                // supported 'scope' query parameter values: ""(all, default)/"fed"/"local". no payload
-	r.GET("/v1/process_profile/:name", handlerProcessProfileShow)          //
-	r.PATCH("/v1/process_profile/:name", handlerProcessProfileConfig)      //
-	r.GET("/v1/process_rules/:uuid", handlerProcRuleShow)                  //
-	r.GET("/v1/file_monitor", handlerFileMonitorList)                      // supported 'scope' query parameter values: ""(all, default)/"fed"/"local". no payload
+	r.GET("/v1/group/:name/stats", handlerGroupStats)
+	r.GET("/v1/process_profile", handlerProcessProfileList)           // supported 'scope' query parameter values: ""(all, default)/"fed"/"local". no payload
+	r.GET("/v1/process_profile/:name", handlerProcessProfileShow)     //
+	r.PATCH("/v1/process_profile/:name", handlerProcessProfileConfig) //
+	r.GET("/v1/process_rules/:uuid", handlerProcRuleShow)             //
+	r.GET("/v1/file_monitor", handlerFileMonitorList)                 // supported 'scope' query parameter values: ""(all, default)/"fed"/"local". no payload
 	r.GET("/v1/file_monitor/:name", handlerFileMonitorShow)
 	r.PATCH("/v1/file_monitor/:name", handlerFileMonitorConfig)
 	r.GET("/v1/file_monitor_file", handlerFileMonitorFile) // debug
@@ -1546,8 +1673,11 @@ func StartRESTServer() {
 	r.POST("/v1/scan/result/repository", handlerScanRepositorySubmit) // Used by CI-integration, for scanner submit scan result. Skip API
 	r.POST("/v1/scan/repository", handlerScanRepositoryReq)           // Used by CI-integration, for scanning container image
 	r.POST("/v1/scan/registry", handlerRegistryCreate)
+	r.POST("/v2/scan/registry", handlerRegistryCreate)
 	r.PATCH("/v1/scan/registry/:name", handlerRegistryConfig)
+	r.PATCH("/v2/scan/registry/:name", handlerRegistryConfig)
 	r.POST("/v1/scan/registry/:name/test", handlerRegistryTest)         // debug
+	r.POST("/v2/scan/registry/:name/test", handlerRegistryTest)         // debug
 	r.DELETE("/v1/scan/registry/:name/test", handlerRegistryTestCancel) // debug
 	r.GET("/v1/scan/registry", handlerRegistryList)                     // supported 'scope' query parameter values: ""(all, default)/"fed"/"local". no payload
 	r.GET("/v1/scan/registry/:name", handlerRegistryShow)
@@ -1558,6 +1688,21 @@ func StartRESTServer() {
 	r.GET("/v1/scan/registry/:name/image/:id", handlerRegistryImageReport)
 	r.GET("/v1/scan/registry/:name/layers/:id", handlerRegistryLayersReport)
 	r.GET("/v1/scan/asset", handlerAssetVulnerability) // skip API document
+	r.POST("/v1/vulasset", handlerVulAssetCreate)      // skip API document
+	r.GET("/v1/vulasset", handlerVulAssetGet)          // skip API document
+	r.POST("/v1/assetvul", handlerAssetVul)            // skip API document
+
+	// Sigstore Configuration
+	r.GET("/v1/scan/sigstore/root_of_trust", handlerSigstoreRootOfTrustGetAll)
+	r.POST("/v1/scan/sigstore/root_of_trust", handlerSigstoreRootOfTrustPost)
+	r.GET("/v1/scan/sigstore/root_of_trust/:root_name", handlerSigstoreRootOfTrustGetByName)
+	r.PATCH("/v1/scan/sigstore/root_of_trust/:root_name", handlerSigstoreRootOfTrustPatchByName)
+	r.DELETE("/v1/scan/sigstore/root_of_trust/:root_name", handlerSigstoreRootOfTrustDeleteByName)
+	r.GET("/v1/scan/sigstore/root_of_trust/:root_name/verifier", handlerSigstoreVerifierGetAll)
+	r.POST("/v1/scan/sigstore/root_of_trust/:root_name/verifier", handlerSigstoreVerifierPost)
+	r.GET("/v1/scan/sigstore/root_of_trust/:root_name/verifier/:verifier_name", handlerSigstoreVerifierGetByName)
+	r.PATCH("/v1/scan/sigstore/root_of_trust/:root_name/verifier/:verifier_name", handlerSigstoreVerifierPatchByName)
+	r.DELETE("/v1/scan/sigstore/root_of_trust/:root_name/verifier/:verifier_name", handlerSigstoreVerifierDeleteByName)
 
 	// compliance
 	r.GET("/v1/compliance/asset", handlerAssetCompliance) // Skip API document
@@ -1635,6 +1780,11 @@ func StartRESTServer() {
 	r.POST("/v1/api_key", handlerApikeyCreate)
 	r.DELETE("/v1/api_key/:name", handlerApikeyDelete)
 	r.GET("/v1/selfapikey", handlerSelfApikeyShow) // Skip API document
+
+	// remote export repository
+	r.POST("/v1/system/config/remote_repository", handlerRemoteRepositoryPost)
+	r.PATCH("/v1/system/config/remote_repository/:nickname", handlerRemoteRepositoryPatch)
+	r.DELETE("/v1/system/config/remote_repository/:nickname", handlerRemoteRepositoryDelete)
 
 	// csp billing adapter integration
 	r.POST("/v1/csp/file/support", handlerCspSupportExport) // Skip API document. For downloading the tar ball that can be submitted to support portal
@@ -1885,7 +2035,57 @@ func StartStopFedPingPoll(cmd, interval uint32, param1 interface{}) error {
 				err = fmt.Errorf("wrong type")
 			}
 		}
+	case share.ProcessCrdQueue:
+		if crdReqMgr != nil {
+			crdReqMgr.crdReqProcTimer.Reset(0)
+		}
 	}
 
 	return err
+}
+
+func doExport(filename, exportType string, remoteExportOptions *api.RESTRemoteExportOptions, resp interface{}, w http.ResponseWriter, r *http.Request, acc *access.AccessControl, login *loginSession) {
+	var data []byte
+	json_data, _ := json.MarshalIndent(resp, "", "  ")
+	data, _ = yaml.JSONToYAML(json_data)
+
+	if remoteExportOptions != nil {
+		remoteExport := remote_repository.Export{
+			DefaultFilePath: filename,
+			Options:         remoteExportOptions,
+			Content:         data,
+			Cacher:          cacher,
+			AccessControl:   acc,
+		}
+		err := remoteExport.Do()
+		if err != nil {
+			restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrRemoteExportFail, err.Error())
+			log.WithFields(log.Fields{"error": err}).Error("could not do remote export")
+			return
+		}
+		msg := fmt.Sprintf("Export %s to remote repository", exportType)
+		restRespSuccess(w, r, nil, acc, login, nil, msg)
+	} else {
+		// tell the browser the returned content should be downloaded
+		w.Header().Set("Content-Disposition", "Attachment; filename="+filename)
+		w.Header().Set("Content-Encoding", "gzip")
+		data = utils.GzipBytes(data)
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+	}
+}
+
+// api version is always the first path element
+// Ex: /v1/scan/registry
+//      ^^
+func getRequestApiVersion(r *http.Request) ApiVersion {
+	if r.URL == nil || len(r.URL.Path) == 0 {
+		return ApiVersion1
+	}
+	trimmedPath := strings.Trim(r.URL.Path, "/")
+	splitPath := strings.Split(trimmedPath, "/")
+	if splitPath[0] == "v2" {
+		return ApiVersion2
+	}
+	return ApiVersion1
 }

@@ -19,17 +19,21 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/neuvector/neuvector/controller/access"
+	"github.com/neuvector/neuvector/controller/api"
 	"github.com/neuvector/neuvector/controller/cache"
 	"github.com/neuvector/neuvector/controller/kv"
 	"github.com/neuvector/neuvector/controller/rest"
 	"github.com/neuvector/neuvector/controller/rpc"
+	"github.com/neuvector/neuvector/controller/scan"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/cluster"
+	scanUtils "github.com/neuvector/neuvector/share/scan"
 	"github.com/neuvector/neuvector/share/system"
 	"github.com/neuvector/neuvector/share/utils"
 )
 
 const scanImageDataTimeout = time.Second * 45
+const repoScanTimeout = time.Minute * 20
 
 type ScanService struct {
 }
@@ -61,7 +65,7 @@ func (ss *ScanService) preprocessDB(data *share.ScannerRegisterData) map[string]
 
 func (ss *ScanService) prepareDBSlots(data *share.ScannerRegisterData, cvedb map[string]*share.ScanVulnerability) ([][]byte, error) {
 	// As of now, Feb. 2019, the compressed db size is 3M, while max kv value size is 512K.
-	for slots := 16; slots <= 128; slots *= 2 {
+	for slots := 128; slots <= 256; slots *= 2 {
 		log.WithFields(log.Fields{"slots": slots}).Debug()
 
 		enlarge := false
@@ -193,7 +197,7 @@ func (ss *ScanService) scannerRegister(data *share.ScannerRegisterData) error {
 	// Consul value size limit is 512K. The limit also applies to the total value size in a transaction.
 	// => so we cannot really use transaction to write database.
 
-	oldKeys, _ := cluster.GetStoreKeys(share.CLUSScannerDBStore)
+	oldStores, _ := cluster.GetStoreKeys(share.CLUSScannerDBStore)
 	newStore := fmt.Sprintf("%s%s/", share.CLUSScannerDBStore, data.CVEDBVersion)
 
 	txn := cluster.Transact()
@@ -244,11 +248,13 @@ func (ss *ScanService) scannerRegister(data *share.ScannerRegisterData) error {
 		return err
 	}
 
-	// Remove old keys. Ignore failure, missed keys will be removed the next update.
-	if writeDB {
-		for _, key := range oldKeys {
-			cluster.Delete(key)
+	// Remove old stores. Ignore failure, missed keys will be removed the next update.
+	if writeDB && len(oldStores) > 0 {
+		txn.Reset()
+		for _, store := range oldStores {
+			txn.DeleteTree(store)
 		}
+		txn.Apply()
 	}
 
 	// Create scanner stats if not exist
@@ -272,6 +278,72 @@ func (ss *ScanService) SubmitScanResult(ctx context.Context, result *share.ScanR
 
 	err := scanner.StoreRepoScanResult(result)
 	return &share.RPCVoid{}, err
+}
+
+// --
+
+type ScanAdapterService struct {
+}
+
+func (sas *ScanAdapterService) GetScanners(context.Context, *share.RPCVoid) (*share.GetScannersResponse, error) {
+	var c share.GetScannersResponse
+
+	acc := access.NewReaderAccessControl()
+	cfg := cacher.GetSystemConfig(acc)
+
+	busy, idle := rpc.CountScanners()
+	scanners, dbTime, dbVer := cacher.GetScannerCount(acc)
+	c.Scanners = uint32(scanners)
+	c.IdleScanners = idle
+	c.ScannerDBTime = dbTime
+	c.ScannerVersion = dbVer
+
+	// MaxScanner means max number of available scanners, including those to be scaled up. The number can be larger than c.Scanners.
+	if cfg.ScannerAutoscale.Strategy != api.AutoScaleNone {
+		if cfg.ScannerAutoscale.MaxPods > busy {
+			c.MaxScanners = cfg.ScannerAutoscale.MaxPods - busy
+		}
+	} else {
+		if c.Scanners > busy {
+			c.MaxScanners = c.Scanners - busy
+		}
+	}
+
+	return &c, nil
+}
+
+func (sas *ScanAdapterService) ScanImage(ctx context.Context, req *share.AdapterScanImageRequest) (*share.ScanResult, error) {
+	log.WithFields(log.Fields{"request": req}).Debug("Scan image request")
+
+	ctx, cancel := context.WithTimeout(context.Background(), repoScanTimeout)
+	defer cancel()
+
+	scanReq := &share.ScanImageRequest{
+		Registry:    req.Registry,
+		Repository:  req.Repository,
+		Tag:         req.Tag,
+		Token:       req.Token,
+		ScanLayers:  req.ScanLayers,
+		ScanSecrets: false,
+	}
+
+	result, err := rpc.ScanImage("", ctx, scanReq)
+	if result == nil || result.Error != share.ScanErrorCode_ScanErrNone {
+		return result, err
+	}
+
+	// store the scan result so it can be used by admission control
+	scan.FixRegRepoForAdmCtrl(result)
+	scanner.StoreRepoScanResult(result)
+
+	// Fill the detail and filter the result
+	for _, v := range result.Vuls {
+		scanUtils.FillVul(v)
+	}
+	vpf := cacher.GetVulnerabilityProfileInterface(share.DefaultVulnerabilityProfileName)
+	result.Vuls = vpf.FilterVuls(result.Vuls, []api.RESTIDName{api.RESTIDName{DisplayName: fmt.Sprintf("%s:%s", result.Repository, result.Tag)}})
+
+	return result, err
 }
 
 // --
@@ -458,7 +530,7 @@ func (cs *ControllerService) TriggerSyncLearnedPolicy(ctx context.Context, v *sh
 }
 
 func (cs *ControllerService) ProfilingCmd(ctx context.Context, req *share.CLUSProfilingRequest) (*share.RPCVoid, error) {
-	go utils.PerfProfile(req, "ctl.")
+	go utils.PerfProfile(req, share.ProfileFolder, "ctl.")
 	return &share.RPCVoid{}, nil
 }
 
@@ -569,6 +641,7 @@ func startGRPCServer(port uint16) (*cluster.GRPCServer, uint16) {
 	go agentReportWorker(ch)
 
 	share.RegisterControllerScanServiceServer(grpc.GetServer(), new(ScanService))
+	share.RegisterControllerScanAdapterServiceServer(grpc.GetServer(), new(ScanAdapterService))
 	share.RegisterControllerCapServiceServer(grpc.GetServer(), new(CapService))
 	share.RegisterControllerUpgradeServiceServer(grpc.GetServer(), new(UpgradeService))
 	share.RegisterControllerAgentServiceServer(grpc.GetServer(), &ControllerAgentService{reportCh: ch})

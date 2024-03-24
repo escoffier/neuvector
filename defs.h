@@ -138,24 +138,27 @@
 #define THRT_ID_DNS_TUNNELING        2024
 #define THRT_ID_TCP_SMALL_MSS        2025
 #define THRT_ID_K8S_EXTIP_MITM       2026
-#define THRT_ID_MAX                  2027
+#define THRT_ID_SSL_TLS_1DOT1        2027
+#define THRT_ID_MAX                  2028
 
 
 // --- messages
 // Message format shares between processes in agent, which is upgraded together,
 // value can be changed.
 
-#define DP_KIND_APP_UPDATE     1
-#define DP_KIND_SESSION_LIST   2
-#define DP_KIND_SESSION_COUNT  3
-#define DP_KIND_DEVICE_COUNTER 4
-#define DP_KIND_METER_LIST     5
-#define DP_KIND_THREAT_LOG     6
-#define DP_KIND_CONNECTION     7
-#define DP_KIND_MAC_STATS      8
-#define DP_KIND_DEVICE_STATS   9
-#define DP_KIND_KEEP_ALIVE     10
-#define DP_KIND_FQDN_UPDATE    11
+#define DP_KIND_APP_UPDATE              1
+#define DP_KIND_SESSION_LIST            2
+#define DP_KIND_SESSION_COUNT           3
+#define DP_KIND_DEVICE_COUNTER          4
+#define DP_KIND_METER_LIST              5
+#define DP_KIND_THREAT_LOG              6
+#define DP_KIND_CONNECTION              7
+#define DP_KIND_MAC_STATS               8
+#define DP_KIND_DEVICE_STATS            9
+#define DP_KIND_KEEP_ALIVE              10
+#define DP_KIND_FQDN_UPDATE             11
+#define DP_KIND_IP_FQDN_STORAGE_UPDATE  12
+#define DP_KIND_IP_FQDN_STORAGE_RELEASE 13
 
 typedef struct {
     uint8_t  Kind;
@@ -194,6 +197,7 @@ typedef struct {
 #define DPSESS_FLAG_MESH_TO_SVR   0x0040 // mesh traffic to svr
 #define DPSESS_FLAG_LINK_LOCAL    0x0080 // link local(169.254.0.0)
 #define DPSESS_FLAG_TMP_OPEN      0x0100 // temp open connection
+#define DPSESS_FLAG_UWLIP         0x0200 // uwl connection
 
 #define DP_POLICY_APPLY_EGRESS  0x1
 #define DP_POLICY_APPLY_INGRESS 0x2
@@ -236,8 +240,7 @@ typedef struct {
     uint8_t  ICMPCode;
     uint8_t  ICMPType;
     uint8_t  IPProto;
-    uint16_t Flags;
-    uint8_t  Padding[3];
+    uint8_t  Padding;
     uint32_t ClientPkts;
     uint32_t ServerPkts;
     uint32_t ClientBytes;
@@ -256,6 +259,7 @@ typedef struct {
     uint32_t PolicyId;
     uint8_t  PolicyAction;
     uint8_t  Severity;
+    uint16_t Flags;
     uint8_t  XffIP[16];
     uint16_t XffApp;
     uint16_t XffPort;
@@ -405,6 +409,7 @@ typedef struct {
 #define DPCONN_FLAG_MESH_TO_SVR   0x10
 #define DPCONN_FLAG_LINK_LOCAL    0x20
 #define DPCONN_FLAG_TMP_OPEN      0x40
+#define DPCONN_FLAG_UWLIP         0x80
 
 typedef struct {
     uint8_t  EPMAC[6];
@@ -445,5 +450,14 @@ typedef struct {
     uint16_t Reserved;
     uint8_t Flags;
 } DPMsgFqdnIpHdr;
+
+typedef struct {
+    uint8_t  IP[16];
+    char     Name[DP_POLICY_FQDN_NAME_MAX_LEN];
+} DPMsgIpFqdnStorageUpdateHdr;
+
+typedef struct {
+    uint8_t  IP[16];
+} DPMsgIpFqdnStorageReleaseHdr;
 
 #endif

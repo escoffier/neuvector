@@ -13,24 +13,28 @@ import (
 )
 
 type tCustomerCspData struct {
-	AccountID     string `json:"account_id"`
-	Arch          string `json:"arch"`
-	CloudProvider string `json:"cloud_provider"`
+	AccountID        string `json:"account_id"`
+	Arch             string `json:"arch"`
+	CloudProvider    string `json:"cloud_provider"`
+	XXX_unrecognized []byte `json:"-"`
 }
 
 type tCspConfig struct {
-	Timestamp          string           `json:"timestamp"`
-	BillingApiAccessOk bool             `json:"billing_api_access_ok"`
-	Expire             string           `json:"expire"`
-	Errors             []string         `json:"errors"`
-	LastBilled         string           `json:"last_billed"`
-	Usage              map[string]int   `json:"usage"`
-	CustomerCspData    tCustomerCspData `json:"customer_csp_data"`
-	BaseProduct        string           `json:"base_product"`
+	Timestamp          string            `json:"timestamp"`
+	BillingApiAccessOk bool              `json:"billing_api_access_ok"`
+	Expire             string            `json:"expire"`
+	Errors             []string          `json:"errors"`
+	LastBilled         string            `json:"last_billed"`
+	Usage              map[string]int    `json:"usage"`
+	CustomerCspData    tCustomerCspData  `json:"customer_csp_data"`
+	BaseProduct        string            `json:"base_product"`
+	Versions           map[string]string `json:"versions"`
+	XXX_unrecognized   []byte            `json:"-"`
 }
 
-func GetCspConfig(nvVersion string) api.RESTFedCspSupportResp {
+func GetCspConfig() api.RESTFedCspSupportResp {
 	var err error
+	var dataExpiredErr error
 	var tExpire time.Time
 	var resp api.RESTFedCspSupportResp
 
@@ -46,26 +50,33 @@ func GetCspConfig(nvVersion string) api.RESTFedCspSupportResp {
 					resp.CspConfigData = value
 					var cspConfig tCspConfig
 					if err = json.Unmarshal([]byte(value), &cspConfig); err == nil {
-						resp.ExpireTime = cspConfig.Expire
+						if json_data, e := json.Marshal(cspConfig.Versions); e == nil {
+							resp.AdapterVersions = string(json_data)
+						}
 						resp.CspErrors = cspConfig.Errors
 						resp.CspConfigFrom = "local cluster"
-						if tExpire, err = time.Parse(time.RFC3339, resp.ExpireTime); err == nil {
+						if tExpire, err = time.Parse("2006-01-02T15:04:05.000000-07:00", cspConfig.Expire); err == nil {
+							if tExpire.Before(now) {
+								resp.ExpireTime = tExpire.Unix()
+							}
 							if cspConfig.BillingApiAccessOk && tExpire.After(now) {
 								resp.Compliant = true
+							} else {
+								dataExpiredErr = fmt.Errorf("Billing data expired on %s", cspConfig.Expire)
 							}
 						}
-						cspConfig.BaseProduct = fmt.Sprintf("cpe:/o:suse:neuvector:%s", nvVersion)
-						if jsonData, err := json.Marshal(&cspConfig); err == nil {
-							resp.CspConfigData = string(jsonData)
-						}
+					} else {
+						log.WithFields(log.Fields{"err": err}).Error()
 					}
 				}
 			}
 		}
 	}
-	if err != nil {
-		resp.NvError = err.Error()
-		log.WithFields(log.Fields{"compliant": resp.Compliant, "nvError": resp.NvError, "cspErrors": resp.CspErrors}).Error()
+	if err != nil || len(resp.CspErrors) > 0 {
+		if err != nil {
+			resp.NvError = err.Error()
+		}
+		log.WithFields(log.Fields{"compliant": resp.Compliant, "nvError": resp.NvError, "expire": dataExpiredErr, "cspErrors": resp.CspErrors}).Error()
 	}
 
 	return resp

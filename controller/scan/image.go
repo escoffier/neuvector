@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/httptrace"
 	scanUtils "github.com/neuvector/neuvector/share/scan"
+	registryUtils "github.com/neuvector/neuvector/share/scan/registry"
 	"github.com/neuvector/neuvector/share/utils"
 )
 
@@ -25,6 +27,7 @@ type imageMeta struct {
 	signed    bool
 	runAsRoot bool
 	images    utils.Set // share.CLUSImage
+	created   time.Time
 }
 
 // --
@@ -168,7 +171,7 @@ type registryDriver interface {
 	GetTagList(doamin, repo, tag string) ([]string, error)
 	GetAllImages() (map[share.CLUSImage][]string, error)
 	GetImageMeta(ctx context.Context, domain, repo, tag string) (*scanUtils.ImageInfo, share.ScanErrorCode)
-	ScanImage(scanner string, ctx context.Context, id, digest, repo, tag string) *share.ScanResult
+	ScanImage(scanner string, ctx context.Context, id, digest, repo, tag string, scanTypesRequired share.ScanTypeMap) *share.ScanResult
 	SetConfig(cfg *share.CLUSRegistryConfig)
 	SetTracer(tracer httptrace.HTTPTrace)
 	GetTracer() httptrace.HTTPTrace
@@ -183,6 +186,7 @@ type base struct {
 	scanLayers  bool
 	scanSecrets bool
 	tracer      httptrace.HTTPTrace
+	ignoreProxy bool
 }
 
 func (r *base) url(pathTemplate string, args ...interface{}) string {
@@ -192,7 +196,7 @@ func (r *base) url(pathTemplate string, args ...interface{}) string {
 }
 
 func (r *base) newRegClient(url, username, password string) error {
-	rc := scanUtils.NewRegClient(url, username, password, r.proxy, r.tracer)
+	rc := scanUtils.NewRegClient(url, "", username, password, r.proxy, r.tracer)
 	r.rc = rc
 	r.username = username
 	r.password = password
@@ -203,7 +207,10 @@ func (r *base) SetConfig(cfg *share.CLUSRegistryConfig) {
 	r.regURL = cfg.Registry
 	r.scanLayers = cfg.ScanLayers
 	r.scanSecrets = !cfg.DisableFiles
-	r.proxy = GetProxy(cfg.Registry)
+	r.ignoreProxy = cfg.IgnoreProxy
+	if !r.ignoreProxy {
+		r.proxy = GetProxy(cfg.Registry)
+	}
 }
 
 func (r *base) GetTracer() httptrace.HTTPTrace {
@@ -261,26 +268,92 @@ func (r *base) GetAllImages() (map[share.CLUSImage][]string, error) {
 }
 
 func (r *base) GetImageMeta(ctx context.Context, domain, repo, tag string) (*scanUtils.ImageInfo, share.ScanErrorCode) {
-	rinfo, errCode := r.rc.GetImageInfo(ctx, repo, tag)
+	rinfo, errCode := r.rc.GetImageInfo(ctx, repo, tag, registryUtils.ManifestRequest_Default)
 	return rinfo, errCode
 }
 
-func (r *base) ScanImage(scanner string, ctx context.Context, id, digest, repo, tag string) *share.ScanResult {
-	req := &share.ScanImageRequest{
-		Registry:    r.regURL,
-		Username:    r.username,
-		Password:    r.password,
-		Repository:  repo,
-		Tag:         tag,
-		Proxy:       r.proxy,
-		ScanLayers:  r.scanLayers,
-		ScanSecrets: r.scanSecrets,
+func makeSigstoreScanRequestObj() ([]*share.SigstoreRootOfTrust, error) {
+	clusRootsOfTrust, err := clusHelper.GetAllSigstoreRootsOfTrust()
+	if err != nil {
+		return nil, fmt.Errorf("could not retrieve sigstore roots of trust from kv store: %s", err.Error())
 	}
+
+	reqRootsOfTrust := []*share.SigstoreRootOfTrust{}
+	for _, clusRootOfTrust := range clusRootsOfTrust {
+		reqRootOfTrust := &share.SigstoreRootOfTrust{
+			Name:                 clusRootOfTrust.Name,
+			RekorPublicKey:       clusRootOfTrust.RekorPublicKey,
+			RootCert:             clusRootOfTrust.RootCert,
+			SCTPublicKey:         clusRootOfTrust.SCTPublicKey,
+			RootlessKeypairsOnly: clusRootOfTrust.RootlessKeypairsOnly,
+		}
+
+		clusVerifiers, err := clusHelper.GetAllSigstoreVerifiersForRoot(clusRootOfTrust.Name)
+		if err != nil {
+			return nil, fmt.Errorf("could not retrieve verifiers for root \"%s\": %s", clusRootOfTrust.Name, err.Error())
+		}
+
+		for _, clusVerifier := range clusVerifiers {
+			reqVerifier := &share.SigstoreVerifier{
+				Name: clusVerifier.Name,
+				Type: clusVerifier.VerifierType,
+			}
+			reqVerifier.KeypairOptions = &share.SigstoreKeypairOptions{
+				PublicKey: clusVerifier.PublicKey,
+			}
+			reqVerifier.KeylessOptions = &share.SigstoreKeylessOptions{
+				CertIssuer:  clusVerifier.CertIssuer,
+				CertSubject: clusVerifier.CertSubject,
+			}
+			reqRootOfTrust.Verifiers = append(reqRootOfTrust.Verifiers, reqVerifier)
+		}
+
+		reqRootsOfTrust = append(reqRootsOfTrust, reqRootOfTrust)
+	}
+
+	return reqRootsOfTrust, nil
+}
+
+func (r *base) ScanImage(scanner string, ctx context.Context, id, digest, repo, tag string, scanTypesRequired share.ScanTypeMap) *share.ScanResult {
+	var result *share.ScanResult
+	req := &share.ScanImageRequest{
+		Registry:           r.regURL,
+		Username:           r.username,
+		Password:           r.password,
+		Repository:         repo,
+		Tag:                tag,
+		Proxy:              r.proxy,
+		ScanLayers:         r.scanLayers,
+		ScanSecrets:        r.scanSecrets,
+		ScanTypesRequested: &scanTypesRequired,
+		RootsOfTrust:       []*share.SigstoreRootOfTrust{},
+	}
+
+	var sigstoreScanObjErr error
+	if scanTypesRequired.Signature {
+		req.RootsOfTrust, sigstoreScanObjErr = makeSigstoreScanRequestObj()
+		if sigstoreScanObjErr != nil {
+			smd.scanLog.WithFields(log.Fields{"rootsOfTrust": req.RootsOfTrust}).Error("Could not generate sigstore scan request object, cancelling signature scan.")
+			scanTypesRequired.Signature = false
+			if !scanTypesRequired.Vulnerability {
+				// no vuln scan necessary, just return error
+				return &share.ScanResult{
+					SignatureInfo: &share.ScanSignatureInfo{
+						VerificationError: share.ScanErrorCode_ScanErrArgument,
+					}}
+			}
+		}
+	}
+
 	result, err := rpc.ScanImage(scanner, ctx, req)
 	if result == nil || err != nil {
 		// rpc request not made
 		smd.scanLog.WithFields(log.Fields{"error": err}).Error()
 		result = &share.ScanResult{Error: share.ScanErrorCode_ScanErrNetwork}
+	}
+
+	if sigstoreScanObjErr != nil {
+		result.SignatureInfo.VerificationError = share.ScanErrorCode_ScanErrArgument
 	}
 
 	return result
@@ -391,6 +464,7 @@ func getImageMeta(ctx context.Context, drv registryDriver, itf *share.CLUSImage,
 					digest:    info.Digest,
 					signed:    info.Signed,
 					runAsRoot: info.RunAsRoot,
+					created:   info.Created,
 					images:    utils.NewSet(),
 				}
 				meta.images.Add(img)

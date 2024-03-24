@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/neuvector/neuvector/controller/api"
 	"github.com/neuvector/neuvector/share"
@@ -350,6 +351,8 @@ var allRoles = map[string]*share.CLUSUserRoleInternal{                          
 	},
 }
 
+var rolesMutex sync.RWMutex
+
 func clusUserRoleToREST(name string, r *share.CLUSUserRoleInternal) *api.RESTUserRole {
 	var permissions []*api.RESTRolePermission
 	if name == api.UserRoleFedAdmin || name == api.UserRoleFedReader || name == api.UserRoleAdmin || name == api.UserRoleReader {
@@ -385,6 +388,9 @@ func clusUserRoleToREST(name string, r *share.CLUSUserRoleInternal) *api.RESTUse
 }
 
 func getRolePermitValues(roleName, domain string) (uint64, uint64) {
+	rolesMutex.RLock()
+	defer rolesMutex.RUnlock()
+
 	if role, ok := allRoles[roleName]; ok {
 		if roleName == api.UserRoleIBMSA || roleName == api.UserRoleImportStatus {
 			if domain == AccessDomainGlobal {
@@ -404,6 +410,9 @@ func getRolePermitValues(roleName, domain string) (uint64, uint64) {
 }
 
 func getRestRolePermitValues(roleName, domain string) []*api.RESTRolePermission {
+	rolesMutex.RLock()
+	defer rolesMutex.RUnlock()
+
 	//rolePermits := map[string]*api.RESTRolePermission	// key is permission id
 	var pList []*api.RESTRolePermission
 	if role, ok := allRoles[roleName]; ok {
@@ -613,6 +622,8 @@ func CompileUriPermitsMapping() {
 				"v1/scan/platform",
 				"v1/scan/platform/platform",
 				"v1/scan/asset",
+				"v1/vulasset",
+				// "scanasset5", // TODO: local dev only
 			},
 			CONST_API_REG_SCAN: []string{
 				"v1/scan/registry",
@@ -621,6 +632,10 @@ func CompileUriPermitsMapping() {
 				"v1/scan/registry/*/image/*",
 				"v1/scan/registry/*/layers/*",
 				"v1/list/registry_type",
+				"v1/scan/sigstore/root_of_trust",
+				"v1/scan/sigstore/root_of_trust/*",
+				"v1/scan/sigstore/root_of_trust/*/verifier",
+				"v1/scan/sigstore/root_of_trust/*/verifier/*",
 			},
 			CONST_API_INFRA: []string{
 				"v1/host",
@@ -652,6 +667,7 @@ func CompileUriPermitsMapping() {
 			CONST_API_GROUP: []string{
 				"v1/group",
 				"v1/group/*",
+				"v1/group/*/stats",
 				"v1/service",
 				"v1/service/*",
 				"v1/file/group",
@@ -791,16 +807,25 @@ func CompileUriPermitsMapping() {
 				"v1/enforcer/*/profiling",
 				"v1/file/config",
 				"v1/csp/file/support",
+				"v1/internal/alert",
 			},
 			CONST_API_RT_SCAN: []string{
 				"v1/scan/workload/*",
 				"v1/scan/host/*",
 				"v1/scan/platform/platform",
+				"v1/vulasset",
+				"v1/assetvul",
+				// "scanasset5",     // TODO: local dev only
+				// "scanassetview1", // TODO: local dev only
 			},
 			CONST_API_REG_SCAN: []string{
 				"v1/scan/registry/*/scan",
 				"v1/scan/registry",
+				"v2/scan/registry",
 				"v1/scan/registry/*/test",
+				"v2/scan/registry/*/test",
+				"v1/scan/sigstore/root_of_trust",
+				"v1/scan/sigstore/root_of_trust/*/verifier",
 			},
 			CONST_API_CICD_SCAN: []string{
 				"v1/scan/result/repository",
@@ -833,6 +858,8 @@ func CompileUriPermitsMapping() {
 			CONST_API_COMPLIANCE: []string{
 				"v1/bench/host/*/docker",
 				"v1/bench/host/*/kubernetes",
+				"v1/file/compliance/profile",
+				"v1/file/compliance/profile/config",
 			},
 			CONST_API_AUTHENTICATION: []string{
 				"v1/server",
@@ -842,14 +869,15 @@ func CompileUriPermitsMapping() {
 				"v1/user_role",
 				"v1/user",
 				"v1/api_key",
+				"v1/user/*/password",
 			},
 			CONST_API_PWD_PROFILE: []string{
 				"v1/password_profile",
-				"v1/user/*/password",
 			},
 			CONST_API_SYSTEM_CONFIG: []string{
 				"v1/system/license/update",
 				"v1/system/config/webhook",
+				"v1/system/config/remote_repository",
 			},
 			CONST_API_IBMSA: []string{
 				"v1/partner/ibm_sa/*/setup/*",
@@ -863,6 +891,8 @@ func CompileUriPermitsMapping() {
 			},
 			CONST_API_VULNERABILITY: []string{
 				"v1/vulnerability/profile/*/entry",
+				"v1/file/vulnerability/profile",
+				"v1/file/vulnerability/profile/config",
 			},
 		}
 
@@ -878,6 +908,9 @@ func CompileUriPermitsMapping() {
 			},
 			CONST_API_REG_SCAN: []string{
 				"v1/scan/registry/*",
+				"v2/scan/registry/*",
+				"v1/scan/sigstore/root_of_trust/*",
+				"v1/scan/sigstore/root_of_trust/*/verifier/*",
 			},
 			CONST_API_INFRA: []string{
 				"v1/domain",
@@ -935,6 +968,7 @@ func CompileUriPermitsMapping() {
 				"v1/system/config",
 				"v2/system/config",
 				"v1/system/config/webhook/*",
+				"v1/system/config/remote_repository/*",
 			},
 			CONST_API_FED: []string{
 				"v1/fed/cluster/*/**",
@@ -960,6 +994,8 @@ func CompileUriPermitsMapping() {
 				"v1/scan/registry/*/scan",
 				"v1/scan/registry/*",
 				"v1/scan/registry/*/test",
+				"v1/scan/sigstore/root_of_trust/*",
+				"v1/scan/sigstore/root_of_trust/*/verifier/*",
 			},
 			CONST_API_GROUP: []string{
 				"v1/group/*",
@@ -995,6 +1031,7 @@ func CompileUriPermitsMapping() {
 			CONST_API_SYSTEM_CONFIG: []string{
 				"v1/system/license",
 				"v1/system/config/webhook/*",
+				"v1/system/config/remote_repository/*",
 			},
 			CONST_API_FED: []string{
 				"v1/fed/cluster/*",
@@ -1037,6 +1074,9 @@ func CompileUriPermitsMapping() {
 }
 
 func IsValidRole(role string, usage int) bool {
+	rolesMutex.RLock()
+	defer rolesMutex.RUnlock()
+
 	switch usage {
 	case CONST_VISIBLE_USER_ROLE:
 		return visibleRoles.Contains(role)
@@ -1049,6 +1089,9 @@ func IsValidRole(role string, usage int) bool {
 }
 
 func GetValidRoles(usage int) []string {
+	rolesMutex.RLock()
+	defer rolesMutex.RUnlock()
+
 	var rolesSet utils.Set
 	switch usage {
 	case CONST_VISIBLE_USER_ROLE:
@@ -1079,6 +1122,9 @@ func GetValidRoles(usage int) []string {
 }
 
 func AddRole(name string, role *share.CLUSUserRoleInternal) {
+	rolesMutex.Lock()
+	defer rolesMutex.Unlock()
+
 	visibleRoles.Add(name)
 	mappableServerDefaultRoles.Add(name)
 	mappableDomainRoles.Add(name)
@@ -1092,6 +1138,9 @@ func AddRole(name string, role *share.CLUSUserRoleInternal) {
 }
 
 func DeleteRole(name string) {
+	rolesMutex.Lock()
+	defer rolesMutex.Unlock()
+
 	if role, ok := allRoles[name]; ok {
 		if !role.Reserved {
 			visibleRoles.Remove(name)
@@ -1103,6 +1152,9 @@ func DeleteRole(name string) {
 }
 
 func UpdateUserRoleForFedRoleChange(fedRole string) {
+	rolesMutex.Lock()
+	defer rolesMutex.Unlock()
+
 	roles := []string{api.UserRoleFedAdmin, api.UserRoleFedReader}
 	for _, role := range roles {
 		if fedRole == api.FedRoleMaster {
@@ -1116,6 +1168,9 @@ func UpdateUserRoleForFedRoleChange(fedRole string) {
 }
 
 func GetRoleList() []*api.RESTUserRole {
+	rolesMutex.RLock()
+	defer rolesMutex.RUnlock()
+
 	names := GetValidRoles(CONST_VISIBLE_USER_ROLE)
 	roles := make([]*api.RESTUserRole, 0, len(names))
 	for _, name := range names {
@@ -1134,6 +1189,9 @@ func GetRoleList() []*api.RESTUserRole {
 }
 
 func GetRoleDetails(name string) *api.RESTUserRole {
+	rolesMutex.RLock()
+	defer rolesMutex.RUnlock()
+
 	if visibleRoles.Contains(name) {
 		if role, ok := allRoles[name]; ok {
 			return clusUserRoleToREST(name, role)
@@ -1143,6 +1201,9 @@ func GetRoleDetails(name string) *api.RESTUserRole {
 }
 
 func GetReservedRoleNames() utils.Set {
+	rolesMutex.RLock()
+	defer rolesMutex.RUnlock()
+
 	names := utils.NewSet()
 	for _, role := range allRoles {
 		if role.Reserved {
@@ -1547,7 +1608,7 @@ func (acc *AccessControl) AuthorizeOwn(obj share.AccessObject, f share.GetAccess
 	return authz
 }
 
-func (acc *AccessControl) GetRoleDomains() map[string][]string{
+func (acc *AccessControl) GetRoleDomains() map[string][]string {
 	var roleDomains = make(map[string][]string)
 
 	for d, role := range acc.roles {
@@ -1560,4 +1621,31 @@ func (acc *AccessControl) GetRoleDomains() map[string][]string{
 func ContainsNonSupportRole(role string) bool {
 	var roles = utils.NewSet(api.UserRoleFedAdmin, api.UserRoleFedReader, api.UserRoleIBMSA, api.UserRoleImportStatus)
 	return roles.Contains(role)
+}
+
+func (acc *AccessControl) ExportAccessControl() *api.UserAccessControl {
+	c := &api.UserAccessControl{
+		Op:                  string(acc.op),
+		Roles:               acc.roles,
+		WRoles:              acc.wRoles,
+		ApiCategoryID:       acc.apiCategoryID,
+		RequiredPermissions: acc.requiredPermissions,
+		BoostPermissions:    acc.boostPermissions,
+	}
+	return c
+}
+
+func ImportAccessControl(uac *api.UserAccessControl) *AccessControl {
+	op := AccessOPRead
+	if uac.Op == "write" {
+		op = AccessOPWrite
+	}
+	acc := &AccessControl{
+		op:                  op,
+		roles:               uac.Roles,
+		wRoles:              uac.WRoles,
+		apiCategoryID:       uac.ApiCategoryID,
+		requiredPermissions: uac.RequiredPermissions,
+	}
+	return acc
 }

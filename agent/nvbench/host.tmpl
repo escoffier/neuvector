@@ -81,7 +81,6 @@ docker_daemon_configuration() {
   check_2_15
   check_2_16
   check_2_17
-  check_2_18
   check_2_end
 }
 
@@ -467,6 +466,19 @@ yell "# ------------------------------------------------------------------------
 # Based on the CIS Docker Benchmark 1.3.1.
 # --------------------------------------------------------------------------------------------"
 }
+
+trimspaces() {
+	local in=$1; if [ -z "$in" ]; then read in; fi
+	# Strip leading spaces.
+    while [[ $in == ' '* ]]; do
+       in="${in## }"
+    done
+    # Strip trailing spaces.
+    while [[ $in == *' ' ]]; do
+        in="${in%% }"
+    done
+	echo $in
+}
 #!/bin/bash
 
 bldred='\033[1;31m' # Bold Red
@@ -484,7 +496,7 @@ if [ -n "$nocolor" ] && [ "$nocolor" = "nocolor" ]; then
 fi
 
 logit () {
-  printf "%b\n" "$1" | tee -a "$logger"
+  printf "%b\n" "$1"
 }
 
 info () {
@@ -498,11 +510,11 @@ info () {
     esac
   done
   if [ "$infoCountCheck" = "true" ]; then
-    printf "%b\n" "${bldblu}[INFO]${txtrst} $2" | tee -a "$logger"
+    printf "%b\n" "${bldblu}[INFO]${txtrst} $2"
     totalChecks=$((totalChecks + 1))
     return
   fi
-  printf "%b\n" "${bldblu}[INFO]${txtrst} $1" | tee -a "$logger"
+  printf "%b\n" "${bldblu}[INFO]${txtrst} $1"
 }
 
 pass () {
@@ -518,14 +530,14 @@ pass () {
     esac
   done
   if [ "$passScored" = "true" ] || [ "$passCountCheck" = "true" ]; then
-    printf "%b\n" "${bldgrn}[PASS]${txtrst} $2" | tee -a "$logger"
+    printf "%b\n" "${bldgrn}[PASS]${txtrst} $2"
     totalChecks=$((totalChecks + 1))
   fi
   if [ "$passScored" = "true" ]; then
     currentScore=$((currentScore + 1))
   fi
   if [ "$passScored" != "true" ] && [ "$passCountCheck" != "true" ]; then
-    printf "%b\n" "${bldgrn}[PASS]${txtrst} $1" | tee -a "$logger"
+    printf "%b\n" "${bldgrn}[PASS]${txtrst} $1"
   fi
 }
 
@@ -540,12 +552,12 @@ warn () {
     esac
   done
   if [ "$warnScored" = "true" ]; then
-    printf "%b\n" "${bldred}[WARN]${txtrst} $2" | tee -a "$logger"
+    printf "%b\n" "${bldred}[WARN]${txtrst} $2"
     totalChecks=$((totalChecks + 1))
     currentScore=$((currentScore - 1))
     return
   fi
-  printf "%b\n" "${bldred}[WARN]${txtrst} $1" | tee -a "$logger"
+  printf "%b\n" "${bldred}[WARN]${txtrst} $1"
 }
 
 note () {
@@ -559,11 +571,11 @@ note () {
     esac
   done
   if [ "$noteCountCheck" = "true" ]; then
-    printf "%b\n" "${bldylw}[NOTE]${txtrst} $2" | tee -a "$logger"
+    printf "%b\n" "${bldylw}[NOTE]${txtrst} $2"
     totalChecks=$((totalChecks + 1))
     return
   fi
-  printf "%b\n" "${bldylw}[NOTE]${txtrst} $1" | tee -a "$logger"
+  printf "%b\n" "${bldylw}[NOTE]${txtrst} $1"
 }
 
 yell () {
@@ -571,42 +583,42 @@ yell () {
 }
 
 beginjson () {
-  printf "{\n  \"dockerbenchsecurity\": \"%s\",\n  \"start\": %s,\n  \"tests\": [" "$1" "$2" | tee "$logger.json" 2>/dev/null 1>&2
+  printf "{\n  \"dockerbenchsecurity\": \"%s\",\n  \"start\": %s,\n  \"tests\": [" "$1" "$2" 2>/dev/null 1>&2
 }
 
 endjson (){
-  printf "\n  ],\n  \"checks\": %s,\n  \"score\": %s,\n  \"end\": %s\n}" "$1" "$2" "$3" | tee -a "$logger.json" 2>/dev/null 1>&2
+  printf "\n  ],\n  \"checks\": %s,\n  \"score\": %s,\n  \"end\": %s\n}" "$1" "$2" "$3" 2>/dev/null 1>&2
 }
 
 logjson (){
-  printf "\n  \"%s\": \"%s\"," "$1" "$2" | tee -a "$logger.json" 2>/dev/null 1>&2
+  printf "\n  \"%s\": \"%s\"," "$1" "$2" 2>/dev/null 1>&2
 }
 
 SSEP=
 SEP=
 startsectionjson() {
-  printf "%s\n    {\n      \"id\": \"%s\",\n      \"desc\": \"%s\",\n      \"results\": [" "$SSEP" "$1" "$2" | tee -a "$logger.json" 2>/dev/null 1>&2
+  printf "%s\n    {\n      \"id\": \"%s\",\n      \"desc\": \"%s\",\n      \"results\": [" "$SSEP" "$1" "$2" 2>/dev/null 1>&2
   SEP=
   SSEP=","
 }
 
 endsectionjson() {
-  printf "\n      ]\n    }" | tee -a "$logger.json" 2>/dev/null 1>&2
+  printf "\n      ]\n    }" 2>/dev/null 1>&2
 }
 
 starttestjson() {
-  printf "%s\n        {\n          \"id\": \"%s\",\n          \"desc\": \"%s\",\n          " "$SEP" "$1" "$2" | tee -a "$logger.json" 2>/dev/null 1>&2
+  printf "%s\n        {\n          \"id\": \"%s\",\n          \"desc\": \"%s\",\n          " "$SEP" "$1" "$2" 2>/dev/null 1>&2
   SEP=","
 }
 
 log_to_json() {
   if [ $# -eq 1 ]; then
-    printf "\"result\": \"%s\"" "$1" | tee -a "$logger.json" 2>/dev/null 1>&2
+    printf "\"result\": \"%s\"" "$1" 2>/dev/null 1>&2
     return
   fi
   if [ $# -eq 2 ] && [ $# -ne 1 ]; then
     # Result also contains details
-    printf "\"result\": \"%s\",\n          \"details\": \"%s\"" "$1" "$2" | tee -a "$logger.json" 2>/dev/null 1>&2
+    printf "\"result\": \"%s\",\n          \"details\": \"%s\"" "$1" "$2" 2>/dev/null 1>&2
     return
   fi
   # Result also includes details and a list of items. Add that directly to details and to an array property "items"
@@ -625,7 +637,7 @@ log_to_json() {
     done
   fi
   itemsJson=$(printf "[\n            "; ISEP=""; ITEMCOUNT=0; for item in $truncItems; do printf "%s\"%s\"" "$ISEP" "$item"; ISEP=","; done; printf "\n          ]")
-  printf "\"result\": \"%s\",\n          \"details\": \"%s: %s\",\n          \"items\": %s" "$1" "$2" "$truncItems" "$itemsJson" | tee -a "$logger.json" 2>/dev/null 1>&2
+  printf "\"result\": \"%s\",\n          \"details\": \"%s: %s\",\n          \"items\": %s" "$1" "$2" "$truncItems" "$itemsJson" 2>/dev/null 1>&2
 }
 
 logcheckresult() {
@@ -634,12 +646,12 @@ logcheckresult() {
 
   # Log remediation measure to JSON
   if [ -n "$remediation" ] && [ "$1" != "PASS" ] && [ "$printremediation" = "1" ]; then
-    printf ",\n          \"remediation\": \"%s\"" "$remediation" | tee -a "$logger.json" 2>/dev/null 1>&2
+    printf ",\n          \"remediation\": \"%s\"" "$remediation" 2>/dev/null 1>&2
     if [ -n "$remediationImpact" ]; then
-      printf ",\n          \"remediation-impact\": \"%s\"" "$remediationImpact" | tee -a "$logger.json" 2>/dev/null 1>&2
+      printf ",\n          \"remediation-impact\": \"%s\"" "$remediationImpact" 2>/dev/null 1>&2
     fi
   fi
-  printf "\n        }" | tee -a "$logger.json" 2>/dev/null 1>&2
+  printf "\n        }" 2>/dev/null 1>&2
 
   # Save remediation measure for print log to stdout
   if [ -n "$remediation" ] && [ "$1" != "PASS" ]; then
@@ -694,7 +706,7 @@ check_1_1_1() {
     return
   fi
   warn -s "$check"
-  logcheckresult "WARN"
+  warn "      * The Docker root directory $docker_root_dir is not mounted on a separate partition."
 }
 
 check_1_1_2() {
@@ -709,7 +721,7 @@ check_1_1_2() {
   if command -v getent >/dev/null 2>&1; then
     docker_users=$(getent group docker)
   fi
-  docker_users=$(printf "%s" "$docker_users" | awk -F: '{print $4}')
+  docker_users=$(printf "%s" "$docker_users" | cut -d ":" -f4)
 
   local doubtfulusers=""
   if [ -n "$dockertrustusers" ]; then
@@ -755,7 +767,8 @@ check_1_1_3() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * Auditing not configured for $file"
+    logcheckresult "WARN" "Auditing not configured for $file"
     return
   fi
   if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -764,7 +777,8 @@ check_1_1_3() {
     return
   fi
   warn -s "$check"
-  logcheckresult "WARN"
+  warn "     * $file is not audited in $auditrules or auditctl command not found"
+  logcheckresult "WARN" "$file is not audited in $auditrules or auditctl command not found"
 }
 
 check_1_1_4() {
@@ -783,7 +797,8 @@ check_1_1_4() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * Auditing not configured for $file"
+    logcheckresult "WARN" "Auditing not configured for $file"
     return
   fi
   if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -792,7 +807,8 @@ check_1_1_4() {
     return
   fi
   warn -s "$check"
-  logcheckresult "WARN"
+  warn "     * $file is not audited in $auditrules or auditctl command not found"
+  logcheckresult "WARN" "$file is not audited in $auditrules or auditctl command not found"
 }
 
 check_1_1_5() {
@@ -812,7 +828,8 @@ check_1_1_5() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $directory"
+      logcheckresult "WARN" "Auditing not configured for $directory"
       return
     fi
     if grep -s "$directory" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -821,12 +838,13 @@ check_1_1_5() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $directory is not audited in $auditrules"
+    logcheckresult "WARN" "$directory is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "       * Directory not found"
-  logcheckresult "INFO" "Directory not found"
+  warn -s "$check"
+  warn "       * Directory $directory not found"
+  logcheckresult "WARN" "Directory $directory not found"
 }
 
 check_1_1_6() {
@@ -846,7 +864,8 @@ check_1_1_6() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $directory"
+      logcheckresult "WARN" "Auditing not configured for $directory"
       return
     fi
     if grep -s "$directory" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -855,12 +874,13 @@ check_1_1_6() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $directory is not audited in $auditrules"
+    logcheckresult "WARN" "$directory is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "       * Directory not found"
-  logcheckresult "INFO" "Directory not found"
+  warn -s "$check"
+  warn "       * Directory $directory not found"
+  logcheckresult "WARN" "Directory $directory not found"
 }
 
 check_1_1_7() {
@@ -881,7 +901,8 @@ check_1_1_7() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $file"
+      logcheckresult "WARN" "Auditing not configured for $file"
       return
     fi
     if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -890,12 +911,13 @@ check_1_1_7() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $file is not audited in $auditrules"
+    logcheckresult "WARN" "$file is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "       * File not found"
-  logcheckresult "INFO" "File not found"
+  warn -s "$check"
+  warn "       * File $file not found"
+  logcheckresult "WARN" "File $file not found"
 }
 
 check_1_1_8() {
@@ -916,7 +938,8 @@ check_1_1_8() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $file"
+      logcheckresult "WARN" "Auditing not configured for $file" 
       return
     fi
     if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -925,12 +948,13 @@ check_1_1_8() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $file is not audited in $auditrules"
+    logcheckresult "WARN" "$file is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "       * File not found"
-  logcheckresult "INFO" "File not found"
+  warn -s "$check"
+  warn "       * File $file not found"
+  logcheckresult "WARN" "File $file not found"
 }
 check_1_1_9() {
   local id="1.1.9"
@@ -950,7 +974,8 @@ check_1_1_9() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $file"
+      logcheckresult "WARN" "Auditing not configured for $file" 
       return
     fi
     if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -959,12 +984,13 @@ check_1_1_9() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $file is not audited in $auditrules"
+    logcheckresult "WARN" "$file is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "       * File not found"
-  logcheckresult "INFO" "File not found"
+  warn -s "$check"
+  warn "       * File $file not found"
+  logcheckresult "WARN" "File $file not found"
 }
 
 check_1_1_10() {
@@ -984,7 +1010,8 @@ check_1_1_10() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $file"
+      logcheckresult "WARN" "Auditing not configured for $file"
       return
     fi
     if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -993,12 +1020,13 @@ check_1_1_10() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $file is not audited in $auditrules"
+    logcheckresult "WARN" "$file is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "       * File not found"
-  logcheckresult "INFO" "File not found"
+  warn -s "$check"
+  warn "       * File $file not found"
+  logcheckresult "WARN" "File $file not found"
 }
 
 check_1_1_11() {
@@ -1018,7 +1046,8 @@ check_1_1_11() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $file"
+      logcheckresult "WARN" "Auditing not configured for $file"
       return
     fi
     if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -1027,12 +1056,13 @@ check_1_1_11() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $file is not audited in $auditrules"
+    logcheckresult "WARN" "$file is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "       * File not found"
-  logcheckresult "INFO" "File not found"
+  warn -s "$check"
+  warn "       * File $file not found"
+  logcheckresult "WARN" "File $file not found"
 }
 
 check_1_1_12() {
@@ -1052,7 +1082,8 @@ check_1_1_12() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $file"
+      logcheckresult "WARN" "Auditing not configured for $file"
       return
     fi
     if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -1061,12 +1092,13 @@ check_1_1_12() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $file is not audited in $auditrules"
+    logcheckresult "WARN" "$file is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "       * File not found"
-  logcheckresult "INFO" "File not found"
+  warn -s "$check"
+  warn "       * File $file not found"
+  logcheckresult "WARN" "File $file not found"
 }
 
 check_1_1_13() {
@@ -1086,7 +1118,8 @@ check_1_1_13() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $file"
+      logcheckresult "WARN" "Auditing not configured for $file" 
       return
     fi
     if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -1095,12 +1128,13 @@ check_1_1_13() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $file is not audited in $auditrules"
+    logcheckresult "WARN"  "$file is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "       * File not found"
-  logcheckresult "INFO" "File not found"
+  warn -s "$check"
+  warn "       * File $file not found"
+  logcheckresult "WARN" "File $file not found"
 }
 
 check_1_1_14() {
@@ -1120,7 +1154,8 @@ check_1_1_14() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $file"
+      logcheckresult "WARN" "Auditing not configured for $file" 
       return
     fi
     if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -1129,12 +1164,13 @@ check_1_1_14() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $file is not audited in $auditrules"
+    logcheckresult "WARN" "$file is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "        * File not found"
-  logcheckresult "INFO" "File not found"
+  warn -s "$check"
+  warn "       * File $file not found"
+  logcheckresult "WARN" "File $file not found"
 }
 
 check_1_1_15() {
@@ -1154,7 +1190,8 @@ check_1_1_15() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $file"
+      logcheckresult "WARN" "Auditing not configured for $file" 
       return
     fi
     if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -1163,12 +1200,13 @@ check_1_1_15() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $file is not audited in $auditrules"
+    logcheckresult "WARN" "$file is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "        * File not found"
-  logcheckresult "INFO" "File not found"
+  warn -s "$check"
+  warn "       * File $file not found"
+  logcheckresult "WARN" "File $file not found"
 }
 
 check_1_1_16() {
@@ -1188,7 +1226,8 @@ check_1_1_16() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $file"
+      logcheckresult "WARN" "Auditing not configured for $file" 
       return
     fi
     if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -1197,12 +1236,13 @@ check_1_1_16() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $file is not audited in $auditrules"
+    logcheckresult "WARN" "$file is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "        * File not found"
-  logcheckresult "INFO" "File not found"
+  warn -s "$check"
+  warn "       * File $file not found"
+  logcheckresult "WARN" "File $file not found"
 }
 
 check_1_1_17() {
@@ -1222,7 +1262,8 @@ check_1_1_17() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $file"
+      logcheckresult "WARN" "Auditing not configured for $file" 
       return
     fi
     if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -1231,12 +1272,13 @@ check_1_1_17() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $file is not audited in $auditrules"
+    logcheckresult "WARN" "$file is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "        * File not found"
-  logcheckresult "INFO" "File not found"
+  warn -s "$check"
+  warn "       * File $file not found"
+  logcheckresult "WARN" "File $file not found"
 }
 
 check_1_1_18() {
@@ -1256,7 +1298,8 @@ check_1_1_18() {
         return
       fi
       warn -s "$check"
-      logcheckresult "WARN"
+      warn "     * Auditing not configured for $file"
+      logcheckresult "WARN" "Auditing not configured for $file" 
       return
     fi
     if grep -s "$file" "$auditrules" | grep "^[^#;]" 2>/dev/null 1>&2; then
@@ -1265,12 +1308,13 @@ check_1_1_18() {
       return
     fi
     warn -s "$check"
-    logcheckresult "WARN"
+    warn "     * $file is not audited in $auditrules"
+    logcheckresult "WARN" "$file is not audited in $auditrules"
     return
   fi
-  info -c "$check"
-  info "        * File not found"
-  logcheckresult "INFO" "File not found"
+  warn -s "$check"
+  warn "       * File $file not found"
+  logcheckresult "WARN" "File $file not found"
 }
 
 check_1_2() {
@@ -1301,7 +1345,7 @@ check_1_2_2() {
   starttestjson "$id" "$desc"
 
   docker_version=$(docker version | grep -i -A2 '^server' | grep ' Version:' \
-    | awk '{print $NF; exit}' | tr -d '[:alpha:]-,')
+    | cut -d ":" -f2 | tr -d '[:alpha:][:space:]-,')
   docker_current_version="$(date +%y.%m.0 -d @$(( $(date +%s) - 2592000)))"
   do_version_check "$docker_current_version" "$docker_version"
   if [ $? -eq 11 ]; then
@@ -1361,6 +1405,7 @@ check_2_2() {
     return
   fi
   warn -s "$check"
+  warn "       * Need to set 'icc: false' in the Docker daemon configuration file."
   logcheckresult "WARN"
 }
 
@@ -1384,6 +1429,7 @@ check_2_3() {
       return
     fi
     warn -s "$check"
+    warn "       * The Docker log-level is not set to info."
     logcheckresult "WARN"
     return
   fi
@@ -1394,6 +1440,7 @@ check_2_3() {
       return
     fi
     warn -s "$check"
+    warn "       * The Docker log-level is not set to info"
     logcheckresult "WARN"
     return
   fi
@@ -1411,11 +1458,13 @@ check_2_4() {
 
   if get_docker_effective_command_line_args '--iptables' | grep "false" >/dev/null 2>&1; then
     warn -s "$check"
+    warn "       * The Docker daemon is set with --iptables=false."
     logcheckresult "WARN"
     return
   fi
   if get_docker_configuration_file_args 'iptables' | grep "false" >/dev/null 2>&1; then
     warn -s "$check"
+    warn "       * The Docker daemon is set with --iptables=false."
     logcheckresult "WARN"
     return
   fi
@@ -1433,6 +1482,7 @@ check_2_5() {
 
   if get_docker_effective_command_line_args '--insecure-registry' | grep "insecure-registry" >/dev/null 2>&1; then
     warn -s "$check"
+    warn "       * The Docker daemon is used with --insecure-registry."
     logcheckresult "WARN"
     return
   fi
@@ -1443,6 +1493,7 @@ check_2_5() {
       return
     fi
     warn -s "$check"
+    warn "       * The Docker daemon config file uses with insecure registry."
     logcheckresult "WARN"
     return
   fi
@@ -1460,6 +1511,7 @@ check_2_6() {
 
   if docker info 2>/dev/null | grep -e "^\sStorage Driver:\s*aufs\s*$" >/dev/null 2>&1; then
     warn -s "$check"
+    warn "       * The Docker daemon is using dockerd --storage-driver aufs option."
     logcheckresult "WARN"
     return
   fi
@@ -1542,6 +1594,7 @@ check_2_9() {
     return
   fi
   warn -s "$check"
+  warn "       * User namespace support is not enabled."
   logcheckresult "WARN"
 }
 
@@ -1555,13 +1608,13 @@ check_2_10() {
 
   if get_docker_configuration_file_args 'cgroup-parent' | grep -v ''; then
     warn -s "$check"
-    info "     * Confirm cgroup usage"
+    warn "     * Confirm cgroup usage"
     logcheckresult "WARN" "Confirm cgroup usage"
     return
   fi
   if get_docker_effective_command_line_args '--cgroup-parent' | grep "cgroup-parent" >/dev/null 2>&1; then
     warn -s "$check"
-    info "     * Confirm cgroup usage"
+    warn "     * Confirm cgroup usage"
     logcheckresult "WARN" "Confirm cgroup usage"
     return
   fi
@@ -1579,11 +1632,13 @@ check_2_11() {
 
   if get_docker_configuration_file_args 'storage-opts' | grep "dm.basesize" >/dev/null 2>&1; then
     warn -s "$check"
+    warn "       * --storage-opt dm.basesize is set in docker config file."
     logcheckresult "WARN"
     return
   fi
   if get_docker_effective_command_line_args '--storage-opt' | grep "dm.basesize" >/dev/null 2>&1; then
     warn -s "$check"
+    warn "       * --storage-opt dm.basesize is set in docker daemon."
     logcheckresult "WARN"
     return
   fi
@@ -1610,6 +1665,7 @@ check_2_12() {
     return
   fi
   warn -s "$check"
+  warn "       * Authorization for Docker client commands is not enabled."
   logcheckresult "WARN"
 }
 
@@ -1623,6 +1679,7 @@ check_2_13() {
 
   if docker info --format '{{ .LoggingDriver }}' | grep 'json-file' >/dev/null 2>&1; then
     warn -s "$check"
+    warn "       * Centralized and remote logging is not configured."
     logcheckresult "WARN"
     return
   fi
@@ -1649,6 +1706,7 @@ check_2_14() {
     return
   fi
   warn -s "$check"
+  warn "       * Containers are not restricted from acquiring new privileges. Ensure Docker is run with the '--no-new-privileges' flag to enhance security."
   logcheckresult "WARN"
 }
 
@@ -1676,6 +1734,7 @@ check_2_15() {
     return
   fi
   warn -s "$check"
+  warn "       * Live restore is not enabled. Enable live restore by running Docker with the '--live-restore' option to ensure container state is preserved on daemon restart."
   logcheckresult "WARN"
 }
 
@@ -1698,6 +1757,7 @@ check_2_16() {
     return
   fi
   warn -s "$check"
+  warn "       * Userland Proxy is not disabled. For enhanced network performance and security, run Docker with the '--userland-proxy=false' flag."
   logcheckresult "WARN"
 }
 
@@ -1715,33 +1775,6 @@ check_2_17() {
     return
   fi
   info -c "$check"
-  logcheckresult "INFO"
-}
-
-check_2_18() {
-  docker_version=$(docker version | grep -i -A2 '^server' | grep ' Version:' \
-    | awk '{print $NF; exit}' | tr -d '[:alpha:]-,.' | cut -c 1-4)
-
-  local id="2.18"
-  local desc="Ensure that experimental features are not implemented in production (Scored)"
-  local remediation="You should not pass --experimental as a runtime parameter to the Docker daemon on production systems."
-  local remediationImpact="None."
-  local check="$id - $desc"
-  starttestjson "$id" "$desc"
-
-  if [ "$docker_version" -le 1903 ]; then
-    if docker version -f '{{.Server.Experimental}}' | grep false 2>/dev/null 1>&2; then
-      pass -s "$check"
-      logcheckresult "PASS"
-      return
-    fi
-    warn -s "$check"
-    logcheckresult "WARN"
-    return
-  fi
-  local desc="$desc (Deprecated)"
-  local check="$id - $desc"
-  info -c "$desc"
   logcheckresult "INFO"
 }
 
@@ -2503,6 +2536,7 @@ check_4_5() {
     return
   fi
   warn -s "$check"
+  warn "       * Content trust for Docker is not Enabled"
   logcheckresult "WARN"
 }
 
@@ -2673,7 +2707,7 @@ check_6_1() {
   local check="$id - $desc"
   starttestjson "$id" "$desc"
 
-  images=$(docker images -q | sort -u | wc -l | awk '{print $1}')
+  images=$(docker images -q | sort -u | wc -l | cut -d " " -f 1)
   active_images=0
 
   for c in $(docker inspect --format "{{.Image}}" "$(docker ps -qa)" 2>/dev/null); do
@@ -2699,8 +2733,8 @@ check_6_2() {
   local check="$id - $desc"
   starttestjson "$id" "$desc"
 
-  total_containers=$(docker info 2>/dev/null | grep "Containers" | awk '{print $2}')
-  running_containers=$(docker ps -q | wc -l | awk '{print $1}')
+  total_containers=$(docker info 2>/dev/null | grep "Containers" | trimspaces | cut -d " " -f 2)
+  running_containers=$(docker ps -q | wc -l | cut -d " " -f 1)
   diff="$((total_containers - running_containers))"
   info -c "$check"
   if [ "$diff" -gt 25 ]; then

@@ -3,6 +3,7 @@ package rest
 import (
 	"archive/tar"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,11 +18,17 @@ import (
 	"github.com/neuvector/neuvector/controller/resource"
 )
 
+type tCspAdapterErrors struct {
+	CspErrors      []string `json:"csp_errors,omitempty"`
+	NvError        *string  `json:"nv_error,omitempty"`
+	DataExpireTime *int64   `json:"billing_data_expire_time,omitempty"` // in seconds
+}
+
 func handlerCspSupportExport(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
 	defer r.Body.Close()
 
-	acc, _ := getAccessControl(w, r, access.AccessOPRead)
+	acc, login := getAccessControl(w, r, access.AccessOPRead)
 	if acc == nil {
 		return
 	}
@@ -67,10 +74,31 @@ func handlerCspSupportExport(w http.ResponseWriter, r *http.Request, ps httprout
 			}
 		} else {
 			// master cluster is unreachable from this joint cluster
-			resp = resource.GetCspConfig(nvSemanticVersion)
+			resp = resource.GetCspConfig()
 		}
 	} else {
-		resp = resource.GetCspConfig(nvSemanticVersion)
+		resp = resource.GetCspConfig()
+	}
+
+	query := restParseQuery(r)
+	if f, ok := query.pairs["data"]; ok && f == "adapter_versions" {
+		restRespSuccess(w, r, &api.RESTCspAdapterInfo{AdapterVersions: resp.AdapterVersions}, acc, login, nil, "Get csp adapter versions")
+		return
+	}
+
+	var cspAdapterErrors tCspAdapterErrors
+	if len(resp.CspErrors) > 0 {
+		cspAdapterErrors.CspErrors = resp.CspErrors
+	}
+	if resp.NvError != "" {
+		cspAdapterErrors.NvError = &resp.NvError
+	}
+	if resp.ExpireTime != 0 {
+		cspAdapterErrors.DataExpireTime = &resp.ExpireTime
+	}
+	if data, err := json.Marshal(&cspAdapterErrors); err == nil {
+		errHeader := base64.StdEncoding.EncodeToString(data)
+		w.Header().Set("X-Nv-Csp-Adapter-Errors", errHeader)
 	}
 	if err != nil || resp.CspConfigData == "" || resp.CspConfigData == "{}" {
 		log.WithFields(log.Fields{"error": err, "cspConfig": resp.CspConfigData}).Error("no data")
@@ -125,12 +153,12 @@ func handlerCspSupportExport(w http.ResponseWriter, r *http.Request, ps httprout
 				_, err = tarw.Write(f.data)
 			}
 			if err != nil {
+				log.WithFields(log.Fields{"name": f.filename, "error": err}).Error()
 				break
 			}
 		}
 	}
 	if err != nil {
-		log.WithFields(log.Fields{"err": err}).Error()
 		restRespErrorMessage(w, http.StatusInternalServerError, api.RESTErrFailExport, err.Error())
 	}
 }

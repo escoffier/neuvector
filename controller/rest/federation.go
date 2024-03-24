@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,7 +32,7 @@ import (
 	"github.com/neuvector/neuvector/controller/cache"
 	"github.com/neuvector/neuvector/controller/common"
 	"github.com/neuvector/neuvector/controller/kv"
-	"github.com/neuvector/neuvector/controller/nvk8sapi/nvvalidatewebhookcfg"
+	admission "github.com/neuvector/neuvector/controller/nvk8sapi/nvvalidatewebhookcfg"
 	"github.com/neuvector/neuvector/controller/resource"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/cluster"
@@ -76,6 +77,7 @@ const (
 
 const (
 	_tagJoinFed            = "join"
+	_tagJoinPending        = "pending"
 	_tagVerifyJointCluster = "verify"
 	_tagAuthJointCluster   = "auth"
 	_tagPingJointCluster   = "ping"
@@ -109,6 +111,7 @@ const (
 	_fedLicenseDisallowed     = 207  // do not change
 	_fedClusterPinging        = 208  // do not change
 	_fedClusterSyncing        = 209  // do not change
+	_fedClusterJoinPending    = 210  // do not change
 	_fedClusterNetworkError   = 300  // do not change. this state is not visible on UI
 	_fedClusterImporting      = 301  // do not change. this state is not visible on UI
 )
@@ -170,13 +173,20 @@ var _clusterStatusMap = map[int]string{
 	_fedLicenseDisallowed:     api.FedStatusLicenseDisallowed,
 	_fedClusterPinging:        api.FedStatusClusterPinging,
 	_fedClusterSyncing:        api.FedStatusClusterSyncing,
+	_fedClusterJoinPending:    api.FedStatusClusterPending,
 }
 
 var ibmSACfg share.CLUSIBMSAConfig
 
 func LeadChangeNotify(leader bool) {
-	log.WithFields(log.Fields{"isLeader": leader}).Info()
+	log.WithFields(log.Fields{"isLeader": leader, "_isLeader": _isLeader}).Info()
 	if leader {
+		if k8sPlatform {
+			if isOldLeader := atomic.LoadUint32(&_isLeader); isOldLeader == 0 && crdReqMgr != nil {
+				// this controller just gains leader role
+				crdReqMgr.reloadRecordList()
+			}
+		}
 		atomic.StoreUint32(&_isLeader, 1)
 		if k8sPlatform && leader {
 			k8sInfo := map[string]string{
@@ -187,14 +197,21 @@ func LeadChangeNotify(leader bool) {
 				cn := fmt.Sprintf("%s.%s.svc", svcName, resource.NvAdmSvcNamespace)
 				if cert, _, err := clusHelper.GetObjectCertRev(cn); !cert.IsEmpty() {
 					admission.ResetCABundle(svcName, []byte(cert.Cert))
-					cacher.SyncAdmCtrlStateToK8s(svcName, nvAdmName)
+					cacher.SyncAdmCtrlStateToK8s(svcName, nvAdmName, false)
 				} else {
 					log.WithFields(log.Fields{"cn": cn, "err": err}).Error("no cert")
 				}
 			}
 		}
 	} else {
-		atomic.StoreUint32(&_isLeader, 0)
+		if k8sPlatform {
+			isOldLeader := atomic.LoadUint32(&_isLeader)
+			atomic.StoreUint32(&_isLeader, 0)
+			if isOldLeader == 1 && crdReqMgr != nil {
+				// this controller just lost leader role
+				crdReqMgr.reloadRecordList()
+			}
+		}
 	}
 	if fedRole := cacher.GetFedMembershipRoleNoAuth(); fedRole == api.FedRoleMaster {
 		if leader {
@@ -518,6 +535,17 @@ func sendRestRequest(idTarget string, method, urlStr, token, cntType, jointTicke
 		_httpClientMutex.RLock()
 		nvHttpClient = _nvHttpClients[proxyOption]
 		_httpClientMutex.RUnlock()
+		if nvHttpClient == nil {
+			httpClient, proxyUrlStr, basicAuth := createHttpClient(proxyOption, clusterAuthTimeout)
+			nvHttpClient = &tNvHttpClient{
+				httpClient:  httpClient,
+				proxyUrlStr: proxyUrlStr,
+				basicAuth:   basicAuth,
+			}
+			_httpClientMutex.Lock()
+			_nvHttpClients[proxyOption] = nvHttpClient
+			_httpClientMutex.Unlock()
+		}
 		if data, statusCode, err = sendRestReqInternal(nvHttpClient, method, urlStr, token, cntType,
 			jointTicket, jointID, proxyOption, cookie, body, logError); err == nil {
 
@@ -1090,8 +1118,12 @@ func updateClusterState(id, masterClusterID string, status int, cspUsage *share.
 		}
 	}
 	if cached.Status != status {
-		cached.Status = status
-		changed = true
+		if cached.Status == _fedClusterJoinPending && (status == _fedClusterLeft || status == _fedClusterDisconnected) {
+			// do not change joint cluster status
+		} else {
+			cached.Status = status
+			changed = true
+		}
 	}
 	if cspUsage != nil {
 		if cspUsage.CspType != cached.CspType || cspUsage.Nodes != cached.Nodes {
@@ -1198,6 +1230,10 @@ func pingJointCluster(tag, urlStr string, jointCluster share.CLUSFedJointCluster
 		}
 		time.Sleep(time.Second * 2)
 	}
+	if tag == _tagJoinPending && cmdResp.result == _fedClusterLeft {
+		// even the 1st ping for the joint cluster tells it's not in fed.
+		updateClusterState(id, "", _fedClusterJoinPending, nil, acc)
+	}
 	if ch != nil {
 		ch <- cmdResp
 	}
@@ -1300,6 +1336,7 @@ func preConditionCheck() string {
 
 func handlerGetFedMember(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	acc, login := isFedOpAllowed(FedRoleAny, _readerRequired, w, r)
 	if acc == nil || login == nil {
@@ -1327,6 +1364,7 @@ func handlerGetFedMember(w http.ResponseWriter, r *http.Request, ps httprouter.P
 
 func handlerConfigLocalCluster(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	acc, login := isFedOpAllowed(FedRoleAny, _adminRequired, w, r)
 	if acc == nil || login == nil {
@@ -1447,6 +1485,7 @@ func handlerConfigLocalCluster(w http.ResponseWriter, r *http.Request, ps httpro
 
 func handlerPromoteToMaster(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	if isFedRulesCleanupOngoing(w) {
 		return
@@ -1596,6 +1635,7 @@ func handlerPromoteToMaster(w http.ResponseWriter, r *http.Request, ps httproute
 
 func handlerDemoteFromMaster(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	var err error
 	var lock cluster.LockInterface
@@ -1648,6 +1688,7 @@ func handlerDemoteFromMaster(w http.ResponseWriter, r *http.Request, ps httprout
 	}
 
 	cacheFedEvent(share.CLUSEvFedDemote, "Demote from primary cluster", login.fullname, login.remote, login.id, login.domainRoles)
+	evqueue.Flush()
 	revertFedRoles(acc)
 	cleanFedRules()
 
@@ -1658,6 +1699,7 @@ func handlerDemoteFromMaster(w http.ResponseWriter, r *http.Request, ps httprout
 
 func handlerGetFedJoinToken(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	acc, login := isFedOpAllowed(api.FedRoleMaster, _fedAdminRequired, w, r)
 	if acc == nil || login == nil {
@@ -1688,6 +1730,7 @@ func handlerGetFedJoinToken(w http.ResponseWriter, r *http.Request, ps httproute
 
 func handlerJoinFed(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	if isFedRulesCleanupOngoing(w) {
 		return
@@ -1789,7 +1832,7 @@ func handlerJoinFed(w http.ResponseWriter, r *http.Request, ps httprouter.Params
 			User:     login.fullname, // user on joint cluster who issued join-federation request
 			RestInfo: restInfo,
 		},
-		CspType: nvUsage.LocalClusterUsage.CspType,
+		CspType: nvUsage.LocalClusterUsage.CspType, // joint cluster's billing csp type
 		Nodes:   nvUsage.LocalClusterUsage.Nodes,
 	}
 
@@ -1879,6 +1922,7 @@ func handlerJoinFed(w http.ResponseWriter, r *http.Request, ps httprouter.Params
 
 func handlerLeaveFed(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	var err error
 	var lock cluster.LockInterface
@@ -1929,6 +1973,7 @@ func handlerLeaveFed(w http.ResponseWriter, r *http.Request, ps httprouter.Param
 
 			if err := clusHelper.PutFedMembership(m); err == nil {
 				cacheFedEvent(share.CLUSEvFedLeave, "Leave federation", login.fullname, login.remote, login.id, login.domainRoles)
+				evqueue.Flush()
 				go leaveFedCleanup(masterCluster.ID, jointCluster.ID)
 				restRespSuccess(w, r, nil, acc, login, nil, "Leave federation")
 				return
@@ -1950,6 +1995,7 @@ func handlerLeaveFed(w http.ResponseWriter, r *http.Request, ps httprouter.Param
 
 func handlerRemoveJointCluster(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	var err error
 	var lock cluster.LockInterface
@@ -1989,6 +2035,7 @@ func handlerRemoveJointCluster(w http.ResponseWriter, r *http.Request, ps httpro
 
 func handlerJoinFedInternal(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	var err error
 	var lock cluster.LockInterface
@@ -2068,7 +2115,7 @@ func handlerJoinFedInternal(w http.ResponseWriter, r *http.Request, ps httproute
 	// update kv
 	var caCertData, privKeyData, certData []byte
 	_, privKeyPath, certPath := kv.GetFedTlsKeyCertPath("", reqData.JointCluster.ID)
-	if kv.GenTlsKeyCert(reqData.JointCluster.ID, privKeyPath, certPath, x509.ExtKeyUsageClientAuth) {
+	if err := kv.GenTlsCertWithCaAndStoreInFiles(reqData.JointCluster.ID, certPath, privKeyPath, kv.AdmCACertPath, kv.AdmCAKeyPath, kv.ValidityPeriod{Year: 10}, x509.ExtKeyUsageClientAuth); err == nil {
 		masterCaCertPath, _, _ := kv.GetFedTlsKeyCertPath(masterCluster.ID, "")
 		caCertData, err = ioutil.ReadFile(masterCaCertPath)
 		if err == nil {
@@ -2111,7 +2158,7 @@ func handlerJoinFedInternal(w http.ResponseWriter, r *http.Request, ps httproute
 
 	cspType, _ := common.GetMappedCspType(&reqData.CspType, nil)
 	cspUsage := share.CLUSClusterCspUsage{
-		CspType: cspType,
+		CspType: cspType, // joint cluster's billing csp type
 		Nodes:   reqData.Nodes,
 	}
 	updateClusterState(joinedCluster.ID, "", _fedClusterJoined, &cspUsage, accReadAll)
@@ -2134,8 +2181,11 @@ func handlerJoinFedInternal(w http.ResponseWriter, r *http.Request, ps httproute
 				RestInfo: masterCluster.RestInfo,
 			},
 		}
+		_, resp.CspType = common.GetMappedCspType(nil, &cctx.CspType) // master cluster's billing csp type
 		msg := fmt.Sprintf("Cluster %s(%s) joins federation", joinedCluster.Name, joinedCluster.RestInfo.Server)
 		cacheFedEvent(share.CLUSEvFedJoin, msg, reqData.User, reqData.Remote, "", reqData.UserRoles)
+		jointCluster.ID = reqData.JointCluster.ID
+		go pingJointCluster(_tagJoinPending, "v1/fed/ping_internal", jointCluster, nil, access.NewAdminAccessControl())
 		restRespSuccess(w, r, &resp, nil, nil, nil, "Join federation by managed cluster's request")
 		return
 	} else {
@@ -2146,6 +2196,7 @@ func handlerJoinFedInternal(w http.ResponseWriter, r *http.Request, ps httproute
 
 func handlerLeaveFedInternal(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	var err error
 	var lock cluster.LockInterface
@@ -2192,6 +2243,8 @@ func handlerLeaveFedInternal(w http.ResponseWriter, r *http.Request, ps httprout
 }
 
 func handlerPingJointInternal(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	defer r.Body.Close()
+
 	if fedRole := cacher.GetFedMembershipRoleNoAuth(); fedRole == api.FedRoleJoint {
 		var req api.RESTFedPingReq
 		var resp api.RESTFedPingResp
@@ -2221,6 +2274,8 @@ func handlerPingJointInternal(w http.ResponseWriter, r *http.Request, ps httprou
 }
 
 func handlerTestJointInternal(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	defer r.Body.Close()
+
 	if fedRole := cacher.GetFedMembershipRoleNoAuth(); fedRole == api.FedRoleNone {
 		restRespSuccess(w, r, nil, nil, nil, nil, "")
 	} else {
@@ -2230,6 +2285,7 @@ func handlerTestJointInternal(w http.ResponseWriter, r *http.Request, ps httprou
 
 func handlerJointKickedInternal(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	var err error
 	var lock cluster.LockInterface
@@ -2258,6 +2314,7 @@ func handlerJointKickedInternal(w http.ResponseWriter, r *http.Request, ps httpr
 	}
 	userName := fmt.Sprintf("%s (primary cluster)", login.mainSessionUser)
 	cacheFedEvent(share.CLUSEvFedKick, "Dimissed from federation", userName, login.remote, login.id, login.domainRoles)
+	evqueue.Flush()
 	go leaveFedCleanup(masterCluster.ID, jointCluster.ID)
 
 	// after being kicked out of federation, standalone NV reports its usage to CSP
@@ -2302,6 +2359,7 @@ func removeFromFederation(joinedCluster *share.CLUSFedJointClusterInfo, acc *acc
 
 func handlerDeployFedRules(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	if !licenseAllowFed(1) {
 		restRespError(w, http.StatusNotFound, api.RESTErrLicenseFail)
@@ -2546,7 +2604,7 @@ func pollFedRules(forcePulling bool, tryTimes int) bool {
 			FedKvVersion: kv.GetFedKvVer(),
 			RestVersion:  kv.GetRestVer(),
 			Name:         cacher.GetSystemConfigClusterName(accReadAll),
-			CspType:      nvUsage.LocalClusterUsage.CspType,
+			CspType:      nvUsage.LocalClusterUsage.CspType, // joint cluster's billing csp type
 			Nodes:        nvUsage.LocalClusterUsage.Nodes,
 		}
 
@@ -2588,7 +2646,9 @@ func pollFedRules(forcePulling bool, tryTimes int) bool {
 				}
 				if respTo.Result == _fedSuccess { // success
 					updateClusterState(jointCluster.ID, "", _fedClusterJoined, nil, accReadAll)
-					updateClusterState(masterCluster.ID, masterCluster.ID, _fedClusterConnected, nil, accReadAll)
+					var cspUsage share.CLUSClusterCspUsage
+					cspUsage.CspType, _ = common.GetMappedCspType(&respTo.CspType, nil)
+					updateClusterState(masterCluster.ID, masterCluster.ID, _fedClusterConnected, &cspUsage, accReadAll)
 					status = _fedSuccess
 					fedCfg := cacher.GetFedSettings()
 					if respTo.DeployRepoScanData != fedCfg.DeployRepoScanData {
@@ -2741,7 +2801,8 @@ func getFedRegScanData(forcePulling bool, fedCfg share.CLUSFedSettings, masterSc
 // cachedScanResultMD5: contains only the images md5 for fed registry/repo that are remembered by managed clusters & have different scan data revision from what master cluster has.
 // upToDateRegs: contains names of those fed registry/repo whose scan result is up-to-date
 // in each pollFedScanData(), some scan results are returned & their image md5 entries in cachedScanResultMD5 are updated.
-//   upToDateRegs is updated as well when a fed registry/repo's scab result becomes up-to-date
+//
+//	upToDateRegs is updated as well when a fed registry/repo's scab result becomes up-to-date
 func pollFedScanData(cachedRegConfigRev *uint64, cachedScanResultMD5 map[string]map[string]string,
 	upToDateRegs utils.Set, fedCfg share.CLUSFedSettings, tryTimes int) (int64, uint32, uint32, uint32, bool) {
 
@@ -2843,6 +2904,7 @@ func pollFedScanData(cachedRegConfigRev *uint64, cachedScanResultMD5 map[string]
 // handles polling requests on master cluster
 func handlerPollFedRulesInternal(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	// log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	accReadAll := access.NewReaderAccessControl()
 	if !isNoAuthFedOpAllowed(api.FedRoleMaster, w, r, accReadAll) {
@@ -2881,6 +2943,7 @@ func handlerPollFedRulesInternal(w http.ResponseWriter, r *http.Request, ps http
 		PollInterval:       atomic.LoadUint32(&_fedPollInterval),
 		DeployRepoScanData: fedCfg.DeployRepoScanData,
 	}
+	_, resp.CspType = common.GetMappedCspType(nil, &cctx.CspType) // master cluster's billing csp type
 	if kv.IsImporting() {
 		// do not give out master's fed policies when master cluster is importing config
 		resp.Result = _fedClusterImporting
@@ -2918,7 +2981,7 @@ func handlerPollFedRulesInternal(w http.ResponseWriter, r *http.Request, ps http
 
 		cspType, _ := common.GetMappedCspType(&req.CspType, nil)
 		cspUsage := share.CLUSClusterCspUsage{
-			CspType: cspType,
+			CspType: cspType, // joint cluster's billing csp type
 			Nodes:   req.Nodes,
 		}
 		updateClusterState(jointCluster.ID, "", status, &cspUsage, accReadAll)
@@ -2930,6 +2993,7 @@ func handlerPollFedRulesInternal(w http.ResponseWriter, r *http.Request, ps http
 // handles scan data polling requests on master cluster
 func handlerPollFedScanDataInternal(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	// log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	accReadAll := access.NewReaderAccessControl()
 	if !isNoAuthFedOpAllowed(api.FedRoleMaster, w, r, accReadAll) {
@@ -3011,6 +3075,7 @@ func handlerPollFedScanDataInternal(w http.ResponseWriter, r *http.Request, ps h
 // handles fed command on joint cluster
 func handlerFedCommandInternal(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	acc, login := isFedOpAllowed(api.FedRoleJoint, _adminRequired, w, r)
 	if acc == nil || login == nil {
@@ -3062,6 +3127,8 @@ func handlerFedCommandInternal(w http.ResponseWriter, r *http.Request, ps httpro
 }
 
 func handlerGetJointClusterView(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	defer r.Body.Close()
+
 	acc, login := isFedOpAllowed(api.FedRoleMaster, _fedAdminRequired, w, r)
 	if acc == nil || login == nil {
 		return
@@ -3078,6 +3145,8 @@ func handlerGetJointClusterView(w http.ResponseWriter, r *http.Request, ps httpr
 }
 
 func handlerCspSupportInternal(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	defer r.Body.Close()
+
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
 	accReadAll := access.NewReaderAccessControl()
 	if !isNoAuthFedOpAllowed(api.FedRoleMaster, w, r, accReadAll) {
@@ -3110,7 +3179,7 @@ func handlerCspSupportInternal(w http.ResponseWriter, r *http.Request, ps httpro
 		return
 	}
 
-	resp := resource.GetCspConfig(nvSemanticVersion)
+	resp := resource.GetCspConfig()
 
 	restRespSuccess(w, r, &resp, accReadAll, nil, nil, "")
 }
@@ -3135,6 +3204,26 @@ var forbiddenFwUrl = map[string][]string{
 }
 var forbiddenFwUrlPrefix = map[string][]string{
 	"/v1/auth/": []string{http.MethodPost, http.MethodDelete},
+}
+
+type tForbiddenFwUrlInfo struct {
+	url       string
+	urlPrefix string
+	urlRegex  *regexp.Regexp
+	verbs     []string
+}
+
+var forbiddenFwUrlRegex []tForbiddenFwUrlInfo = []tForbiddenFwUrlInfo{
+	tForbiddenFwUrlInfo{
+		url:       "/v1/auth/.*",
+		urlPrefix: "/v1/auth/",
+		verbs:     []string{http.MethodPost, http.MethodDelete},
+	},
+	tForbiddenFwUrlInfo{
+		url:       "/v1/user/.*/password",
+		urlPrefix: "/v1/user/",
+		verbs:     []string{http.MethodPost},
+	},
 }
 
 func handlerFedClusterForward(w http.ResponseWriter, r *http.Request, ps httprouter.Params, method string) {
@@ -3179,23 +3268,38 @@ func handlerFedClusterForward(w http.ResponseWriter, r *http.Request, ps httprou
 				}
 			}
 			if !forbidden {
-				for urlPrefix, verbs := range forbiddenFwUrlPrefix {
-					if strings.HasPrefix(request, urlPrefix) {
-						for _, verb := range verbs {
-							if verb == method {
-								forbidden = true
+				for _, urlInfo := range forbiddenFwUrlRegex {
+					if strings.HasPrefix(request, urlInfo.urlPrefix) {
+						if urlInfo.urlRegex == nil {
+							urlInfo.urlRegex, _ = regexp.Compile(urlInfo.url)
+						}
+						if urlInfo.urlRegex != nil && urlInfo.urlRegex.MatchString(request) {
+							for _, verb := range urlInfo.verbs {
+								if verb == method {
+									forbidden = true
+									break
+								}
+							}
+							if forbidden {
 								break
 							}
-						}
-						if forbidden {
-							break
 						}
 					}
 				}
 			}
-			if method == http.MethodPost && (request == "/v1/file/config" || request == "/v1/file/group/config" ||
-				request == "/v1/file/admission/config" || request == "/v1/file/waf/config" || request == "/v1/file/dlp/config") {
-				txnID = r.Header.Get("X-Transaction-ID")
+			if method == http.MethodPost {
+				importURIs := utils.NewSetFromStringSlice([]string{
+					"/v1/file/config",
+					"/v1/file/group/config",
+					"/v1/file/admission/config",
+					"/v1/file/waf/config",
+					"/v1/file/dlp/config",
+					"/v1/file/compliance/profile/config",
+					"/v1/file/vulnerability/profile/config",
+				})
+				if importURIs.Contains(request) {
+					txnID = r.Header.Get("X-Transaction-ID")
+				}
 			}
 			if txnID == "" && (method == http.MethodPost || method == http.MethodDelete) && strings.HasPrefix(request, "/v1/scan/registry/") {
 				if ss := strings.Split(request, "/"); len(ss) == 6 && ss[5] == "test" {
@@ -3272,7 +3376,14 @@ func handlerFedClusterForward(w http.ResponseWriter, r *http.Request, ps httprou
 					}
 				}
 			} else if method == http.MethodPost {
-				if request == "/v1/file/admission" || request == "/v1/file/waf" || request == "/v1/file/dlp" {
+				exportURIs := utils.NewSetFromStringSlice([]string{
+					"/v1/file/admission",
+					"/v1/file/waf",
+					"/v1/file/dlp",
+					"/v1/file/compliance/profile",
+					"/v1/file/vulnerability/profile",
+				})
+				if exportURIs.Contains(request) {
 					remoteExport = true
 				}
 			}
@@ -3309,24 +3420,28 @@ func handlerFedClusterForward(w http.ResponseWriter, r *http.Request, ps httprou
 
 func handlerFedClusterForwardGet(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	handlerFedClusterForward(w, r, ps, http.MethodGet)
 }
 
 func handlerFedClusterForwardPost(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	handlerFedClusterForward(w, r, ps, http.MethodPost)
 }
 
 func handlerFedClusterForwardPatch(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	handlerFedClusterForward(w, r, ps, http.MethodPatch)
 }
 
 func handlerFedClusterForwardDelete(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug()
+	defer r.Body.Close()
 
 	handlerFedClusterForward(w, r, ps, http.MethodDelete)
 }

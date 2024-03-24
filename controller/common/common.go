@@ -24,10 +24,11 @@ import (
 	syslog "github.com/neuvector/neuvector/share/utils/srslog"
 )
 
-const DefaultIdleTimeout uint32 = 300
+const DefIdleTimeoutInternal uint32 = 300
 const DefaultAdminUser string = "admin"
 const DefaultAdminPass string = "admin"
-const ReservedFedUser string = "~fedOperator" // user name with prefix "~" cannot be created thru configmap/rest api
+const ReservedFedUser string = "~fedOperator"   // user name with prefix "~" cannot be created thru configmap/rest api
+const ReservedNvSystemUser string = "~nvSystem" // user name with prefix "~" cannot be created thru configmap/rest api
 const ReservedUserNameIBMSA string = "~nv.reserved.ibmsa"
 
 const ScanPlatformID = "platform"
@@ -85,6 +86,8 @@ var defaultSyslogCategory []string = []string{
 	api.CategoryEvent, api.CategoryRuntime, api.CategoryAudit,
 }
 
+var DefaultIdleTimeout uint32 = DefIdleTimeoutInternal
+
 const defaultClusterName string = "cluster.local"
 
 const RegistryRepoScanName string = "_repo_scan"
@@ -114,7 +117,7 @@ var DefaultSystemConfig = share.CLUSSystemConfig{
 	NetServiceStatus:     false,
 	NetServicePolicyMode: share.PolicyModeLearn,
 	DisableNetPolicy:     false,
-	DetectUnmanagedWl:    false,
+	EnableIcmpPolicy:     false,
 }
 
 func ActionString(action uint8) string {
@@ -223,6 +226,7 @@ var LogThreatMap = map[uint32]LogThreatInfo{
 	C.THRT_ID_SSL_CIPHER_OVF:    {"SSL.Cipher.Overflow"},
 	C.THRT_ID_SSL_VER_2OR3:      {"SSL.Version.2or3"},
 	C.THRT_ID_SSL_TLS_1DOT0:     {"SSL.TLS1.0"},
+	C.THRT_ID_SSL_TLS_1DOT1:     {"SSL.TLS1.1"},
 	C.THRT_ID_HTTP_NEG_LEN:      {"HTTP.Negative.Body.Length"},
 	C.THRT_ID_HTTP_SMUGGLING:    {"HTTP.Request.Smuggling"},
 	C.THRT_ID_HTTP_SLOWLORIS:    {"HTTP.Request.Slowloris"},
@@ -302,6 +306,7 @@ var LogEventMap = map[share.TLogEvent]LogEventInfo{
 	share.CLUSEvCrdImported:                 {api.EventNameCrdImported, api.EventCatCrd, api.LogLevelINFO},
 	share.CLUSEvCrdRemoved:                  {api.EventNameCrdRemoved, api.EventCatCrd, api.LogLevelINFO},
 	share.CLUSEvCrdErrDetected:              {api.EventNameCrdErrDetected, api.EventCatCrd, api.LogLevelERR},
+	share.CLUSEvCrdSkipped:                  {api.EventNameCrdSkipped, api.EventCatConfig, api.LogLevelNOTICE},
 	share.CLUSEvFedPromote:                  {api.EventNameFedPromote, api.EventCatFed, api.LogLevelINFO},    // for multi-clusters
 	share.CLUSEvFedDemote:                   {api.EventNameFedDemote, api.EventCatFed, api.LogLevelINFO},     // for multi-clusters
 	share.CLUSEvFedJoin:                     {api.EventNameFedJoin, api.EventCatFed, api.LogLevelINFO},       // for multi-clusters
@@ -321,6 +326,8 @@ var LogEventMap = map[share.TLogEvent]LogEventInfo{
 	share.CLUSEvK8sNvRBAC:                   {api.EventNameK8sNvRBAC, api.EventCatConfig, api.LogLevelWARNING},
 	share.CLUSEvGroupAutoPromote:            {api.EventNameGroupAutoPromote, api.EventCatGroup, api.LogLevelINFO},
 	share.CLUSEvAuthDefAdminPwdUnchanged:    {api.EventNameAuthDefAdminPwdUnchanged, api.EventCatAuth, api.LogLevelWARNING},
+	share.CLUSEvScannerAutoScaleDisabled:    {api.EventNameScannerAutoScaleDisabled, api.EventCatConfig, api.LogLevelNOTICE},
+	share.CLUSEvK8sAdmissionWebhookCChange:  {api.EventNameK8sAdmissionWebhookChange, api.EventCatAdmCtrl, api.LogLevelNOTICE},
 }
 
 type LogIncidentInfo struct {
@@ -928,25 +935,29 @@ func GetWafRuleID(wafsensor *share.CLUSWafSensor) uint32 {
 	}
 }
 
-func GetMappedCspType(strCspType *string, cspType *share.TCspType) (share.TCspType, string) {
+func GetMappedCspType(pCspType *string, ptCspType *share.TCspType) (share.TCspType, string) {
 	cspMapping := map[string]share.TCspType{
-		"":       share.CSP_NONE,
+		"none":   share.CSP_NONE,
 		"aws":    share.CSP_EKS,
-		"gcloud": share.CSP_GKE,
+		"gcloud": share.CSP_GCP,
 		"azure":  share.CSP_AKS,
 		"ibm":    share.CSP_IBM,
 	}
-	if strCspType != nil {
-		if cspType, ok := cspMapping[*strCspType]; ok {
-			return cspType, *strCspType
+	if pCspType != nil {
+		strCspType := *pCspType
+		if strCspType == "" {
+			strCspType = "none"
 		}
-	} else if cspType != nil {
+		if tCspType, ok := cspMapping[strCspType]; ok {
+			return tCspType, strCspType
+		}
+	} else if ptCspType != nil {
 		for k, v := range cspMapping {
-			if v == *cspType {
+			if v == *ptCspType {
 				return v, k
 			}
 		}
 	}
 
-	return share.CSP_NONE, ""
+	return share.CSP_NONE, "none"
 }

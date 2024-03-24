@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/neuvector/neuvector/controller/rpc"
 	"github.com/neuvector/neuvector/controller/scan"
 	"github.com/neuvector/neuvector/controller/scheduler"
+	"github.com/neuvector/neuvector/db"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/cluster"
 	"github.com/neuvector/neuvector/share/global"
@@ -41,8 +43,7 @@ type regImageSummaryReport struct {
 var scannerCacheMap map[string]*scannerCache = make(map[string]*scannerCache)
 
 // grpc call should timeout in scanReqTimeout
-const scanReqTimeout = time.Second * 60
-const scanReqSafetyTimeOut = time.Second * 70 // should be longer than scanReqTimeout
+const scanReqTimeout = time.Second * 180
 
 const scannerCleanupPeriod = time.Duration(time.Minute * 1)
 const scannerClearnupTimeout = time.Second * 20
@@ -55,27 +56,34 @@ const (
 )
 
 type scanInfo struct {
-	initStateLoaded bool
-	agentId         string
-	status          int
-	lastResult      share.ScanErrorCode
-	lastScanTime    time.Time
-	baseOS          string
-	priority        scheduler.Priority
-	retry           int
-	objType         share.ScanObjectType
-	version         string
-	cveDBCreateTime string
-	brief           *api.RESTScanBrief    // Stats of filtered entries
-	vulTraits       []*scanUtils.VulTrait // Full list of vuls. There is a filtered flag on each entry.
-	filteredTime    time.Time
-	idns            []api.RESTIDName
-	modules         []*share.ScanModule
+	agentId                        string
+	status                         int
+	lastResult                     share.ScanErrorCode
+	lastScanTime                   time.Time
+	baseOS                         string
+	priority                       scheduler.Priority
+	retry                          int
+	objType                        share.ScanObjectType
+	version                        string
+	cveDBCreateTime                string
+	brief                          *api.RESTScanBrief    // Stats of filtered entries
+	vulTraits                      []*scanUtils.VulTrait // Full list of vuls. There is a filtered flag on each entry.
+	filteredTime                   time.Time
+	idns                           []api.RESTIDName
+	modules                        []*share.ScanModule
+	signatureVerifiers             []string
+	signatureVerificationTimestamp string
 }
 
 type scanTaskInfo struct {
 	id   string
 	info *scanInfo
+}
+
+type tAutoScaleHistory struct {
+	oldReplicas    uint32 // the scanners count before autoscale
+	newReplicas    uint32 // the scanners count after autoscale
+	sameScaleTimes uint32 // how many times we continuously scale with the same from/to replicas values
 }
 
 const maxRetry = 5
@@ -93,6 +101,8 @@ const (
 var scannerReplicas uint32
 var lastTaskQState int = task_Q_Unknown
 var contTaskQStateTime time.Time // start time of the time window for scaling up/down calculation
+
+var autoScaleHistory tAutoScaleHistory
 
 // Within scanMutex, cacheMutex can be used; but not the other way around.
 var scanMutex sync.RWMutex
@@ -152,7 +162,7 @@ func (t *scanTask) rpcScanRunning(scanner string, info *scanInfo) {
 		cctx.k8sVersion, cctx.ocVersion = global.ORCH.GetVersion(false, false)
 		result, err = rpc.ScanPlatform(scanner, cctx.k8sVersion, cctx.ocVersion, scanReqTimeout)
 	}
-	if result == nil || result.Error == share.ScanErrorCode_ScanErrNetwork || err != nil {
+	if result == nil || result.Error == share.ScanErrorCode_ScanErrNetwork || result.Error == share.ScanErrorCode_ScanErrInProgress || err != nil {
 		// rpc request not made
 		cctx.ScanLog.WithFields(log.Fields{"id": t.id, "error": err}).Error()
 
@@ -220,7 +230,6 @@ func (t *scanTask) Handler(scanner string) scheduler.Action {
 			}
 		*/
 		info.status = statusScanning
-		info.initStateLoaded = false
 		ret = scheduler.TaskActionWait
 	}
 	scanMutexUnlock()
@@ -462,8 +471,12 @@ func scanDone(id string, objType share.ScanObjectType, report *share.CLUSScanRep
 		"id": id, "type": objType, "result": scanUtils.ScanErrorToStr(report.Error),
 	}).Debug("")
 
-	var highs, meds []string
+	var highs, meds, lows []string
+	var fixedHighsInfo []scanUtils.FixedVulInfo
 	var alives utils.Set // vul names that are not filtered
+	var vuls2Populate []*api.RESTVulnerability
+	var dbAssetVul *db.DbAssetVul
+	var baseOS string
 
 	scanMutexLock()
 	info, ok := scanMap[id]
@@ -476,12 +489,16 @@ func scanDone(id string, objType share.ScanObjectType, report *share.CLUSScanRep
 		info.version = report.Version
 		info.cveDBCreateTime = report.CVEDBCreateTime
 		info.modules = report.Modules
+		if report.SignatureInfo != nil {
+			info.signatureVerifiers = report.SignatureInfo.Verifiers
+			info.signatureVerificationTimestamp = report.SignatureInfo.VerificationTimestamp
+		}
 
 		// Filter and count vulnerabilities
 		vpf := cacher.GetVulnerabilityProfileInterface(share.DefaultVulnerabilityProfileName)
 		info.vulTraits = scanUtils.ExtractVulnerability(report.Vuls)
 		alives = vpf.FilterVulTraits(info.vulTraits, info.idns)
-		highs, meds = scanUtils.GatherVulTrait(info.vulTraits)
+		highs, meds, lows, fixedHighsInfo = scanUtils.GatherVulTrait(info.vulTraits)
 		brief := fillScanBrief(info, len(highs), len(meds))
 		info.brief = brief
 		info.filteredTime = time.Now()
@@ -491,30 +508,92 @@ func scanDone(id string, objType share.ScanObjectType, report *share.CLUSScanRep
 			if c := getWorkloadCache(id); c != nil {
 				c.scanBrief = brief
 				c.vulTraits = info.vulTraits
+				sdb := scanUtils.GetScannerDB()
+
+				baseOS = ""
+				if c.scanBrief != nil {
+					baseOS = c.scanBrief.BaseOS
+				}
+
+				vuls2Populate = scanUtils.FillVulTraits(sdb.CVEDB, baseOS, c.vulTraits, "", true)
+				dbAssetVul = getWorkloadDbAssetVul(c, highs, meds, lows, info.lastScanTime)
 			}
 		case share.ScanObjectType_HOST:
 			if c := getHostCache(id); c != nil {
 				c.scanBrief = brief
 				c.vulTraits = info.vulTraits
+
+				sdb := scanUtils.GetScannerDB()
+				baseOS = ""
+				if c.scanBrief != nil {
+					baseOS = c.scanBrief.BaseOS
+				}
+
+				vuls2Populate = scanUtils.FillVulTraits(sdb.CVEDB, baseOS, c.vulTraits, "", true)
+				dbAssetVul = getHostDbAssetVul(c, highs, meds, lows, info.lastScanTime)
 			}
+		case share.ScanObjectType_PLATFORM:
+			sdb := scanUtils.GetScannerDB()
+			baseOS = ""
+			if brief != nil {
+				baseOS = brief.BaseOS
+			}
+			vuls2Populate = scanUtils.FillVulTraits(sdb.CVEDB, baseOS, info.vulTraits, "", true)
+			dbAssetVul = getPlatformDbAssetVul(highs, meds, lows, baseOS, info.lastScanTime)
 		}
 	} else {
 		cctx.ScanLog.WithFields(log.Fields{"id": id, "type": objType}).Debug("Scan object is gone")
 	}
 	scanMutexUnlock()
 
+	if ok && dbAssetVul != nil {
+		// extract package info
+		dbAssetVul.Packages = make([]*db.DbVulnResourcePackageVersion2, 0)
+		var cveLists utils.Set = utils.NewSet()
+		for _, vul := range vuls2Populate {
+			vulPackage := &db.DbVulnResourcePackageVersion2{
+				CVEName:        vul.Name,
+				PackageName:    vul.PackageName,
+				PackageVersion: vul.PackageVersion,
+				FixedVersion:   vul.FixedVersion,
+				DbKey:          vul.DbKey,
+			}
+
+			fix := "nf"
+			if len(vul.FixedVersion) > 0 {
+				fix = "wf"
+			}
+
+			cveLists.Add(fmt.Sprintf("%s;%s;%s", vul.Name, vul.DbKey, fix))
+			dbAssetVul.Packages = append(dbAssetVul.Packages, vulPackage)
+		}
+
+		b, err := json.Marshal(cveLists.ToStringSlice())
+		if err == nil {
+			dbAssetVul.CVE_lists = string(b)
+		}
+
+		// populate assetvul
+		db.PopulateAssetVul(dbAssetVul)
+	}
+
 	// all controller should call auditUpdate to record the log, the leader will take action
 	if alives != nil {
-		clog := scanReport2ScanLog(id, objType, report, highs, meds, "")
-		auditUpdate(id, share.EventCVEReport, objType, clog, alives)
+		clog := scanReport2ScanLog(id, objType, report, highs, meds, nil, nil, "")
+		syncLock(syncCatgAuditIdx)
+		auditUpdate(id, share.EventCVEReport, objType, clog, alives, fixedHighsInfo)
+		syncUnlock(syncCatgAuditIdx)
 	}
 }
 
-func (m CacheMethod) GetScannerCount(acc *access.AccessControl) int {
+func (m CacheMethod) GetScannerCount(acc *access.AccessControl) (int, string, string) {
 	cacheMutexRLock()
 	defer cacheMutexRUnlock()
+	sdb := scanUtils.GetScannerDB()
+	dbTime := sdb.CVEDBCreateTime
+	dbVers := sdb.CVEDBVersion
 	if acc.HasGlobalPermissions(share.PERMS_CLUSTER_READ, 0) {
-		return len(scannerCacheMap)
+		return len(scannerCacheMap), dbTime, dbVers
 	} else {
 		var count int
 		for _, s := range scannerCacheMap {
@@ -523,7 +602,7 @@ func (m CacheMethod) GetScannerCount(acc *access.AccessControl) int {
 			}
 			count++
 		}
-		return count
+		return count, dbTime, dbVers
 	}
 }
 
@@ -622,11 +701,16 @@ func scanMapAdd(taskId string, agentId string, idns []api.RESTIDName, objType sh
 	// If controller simply restarts or rolling upgraded, don't rescan
 	// the object. Only start automatically for new workload.
 	if value, err := cluster.Get(skey); err == nil {
+		// state key exists, the workload has been added in another controller or in previous run
 		scanMutexUnlock()
 
+		// We must call scanStateHandler() here because if the kv callback comes earlier,
+		// scanMap[] entry does not exist yet.
 		scanStateHandler(cluster.ClusterNotifyAdd, skey, value)
-		// avoid scanStateHandler to be processed again if it happens after object is added
-		info.initStateLoaded = true
+
+		// However, if the kv callback comes later, can we skip it? We used to set a flag
+		// here, but when the kv callback does come, we don't know if the value has changed
+		// or not, so for now, we let it call once again.
 	} else if isScanner() {
 		// Always scan the platform even auto-scan is disabled
 		if objType == share.ScanObjectType_PLATFORM {
@@ -816,9 +900,6 @@ func scanStateHandler(nType cluster.ClusterNotifyType, key string, value []byte)
 	scanMutexRUnlock()
 	if !ok {
 		return
-	} else if info.initStateLoaded {
-		info.initStateLoaded = false
-		return
 	}
 
 	cctx.ScanLog.WithFields(log.Fields{"key": key, "status": state.Status}).Debug("")
@@ -923,7 +1004,7 @@ func registryImageStateHandler(nType cluster.ClusterNotifyType, key string, valu
 		}
 
 		vpf := cacher.GetVulnerabilityProfileInterface(share.DefaultVulnerabilityProfileName)
-		alives, highs, meds := scan.RegistryImageStateUpdate(name, id, &sum, vpf)
+		alives, highs, meds, fixedHighsInfo, layerHighs, layerMeds := scan.RegistryImageStateUpdate(name, id, &sum, systemConfigCache.SyslogCVEInLayers, vpf)
 
 		if sum.Status == api.ScanStatusFinished && sum.Result == share.ScanErrorCode_ScanErrNone {
 			var report *share.CLUSScanReport
@@ -933,12 +1014,16 @@ func registryImageStateHandler(nType cluster.ClusterNotifyType, key string, valu
 				// for any scan report on master/standalone cluster & non-fed scan report on managed cluster
 				if fedRole != api.FedRoleJoint || !strings.HasPrefix(name, api.FederalGroupPrefix) {
 					if alives != nil {
-						clog := scanReport2ScanLog(id, share.ScanObjectType_IMAGE, report, highs, meds, name)
-						auditUpdate(id, share.EventCVEReport, share.ScanObjectType_IMAGE, clog, alives)
+						clog := scanReport2ScanLog(id, share.ScanObjectType_IMAGE, report, highs, meds, layerHighs, layerMeds, name)
+						syncLock(syncCatgAuditIdx)
+						auditUpdate(id, share.EventCVEReport, share.ScanObjectType_IMAGE, clog, alives, fixedHighsInfo)
+						syncUnlock(syncCatgAuditIdx)
 					}
 
 					clog := scanReport2BenchLog(id, share.ScanObjectType_IMAGE, report, name)
+					syncLock(syncCatgAuditIdx)
 					benchUpdate(share.EventCompliance, clog)
+					syncUnlock(syncCatgAuditIdx)
 				}
 
 				if fedRegName != "" {
@@ -950,6 +1035,13 @@ func registryImageStateHandler(nType cluster.ClusterNotifyType, key string, valu
 					currImagesMD5, ok := fedScanResultMD5[fedRegName]
 					if !ok || currImagesMD5 == nil {
 						currImagesMD5 = make(map[string]string, 1)
+					}
+					if report != nil && report.SignatureInfo != nil {
+						if report.SignatureInfo.Verifiers != nil {
+							sort.Strings(report.SignatureInfo.Verifiers)
+						}
+						report.SignatureInfo.VerificationTimestamp = ""
+						report.SignatureInfo.VerificationError = 0
 					}
 					res, _ := json.Marshal(&scanResult)
 					md5Sum := md5.Sum(res)
@@ -963,7 +1055,7 @@ func registryImageStateHandler(nType cluster.ClusterNotifyType, key string, valu
 		}
 
 	case cluster.ClusterNotifyDelete:
-		scan.RegistryImageStateUpdate(name, id, nil, nil)
+		scan.RegistryImageStateUpdate(name, id, nil, false, nil)
 		if fedRegName != "" {
 			fedScanDataCacheMutexLock()
 			if currImagesMD5, ok := fedScanResultMD5[fedRegName]; ok {
@@ -1174,10 +1266,55 @@ func rescaleScanner(autoscaleCfg share.CLUSSystemConfigAutoscale, totalScanners 
 		newReplicas = autoscaleCfg.MaxPods
 	}
 	if newReplicas != totalScanners {
-		if err := resource.UpdateDeploymentReplicates("neuvector-scanner-pod", int32(newReplicas)); err == nil {
-			log.WithFields(log.Fields{"from": totalScanners, "to": newReplicas}).Info("autoscale")
+		skipScale := false
+		thisAutoScale := tAutoScaleHistory{
+			oldReplicas:    totalScanners,
+			newReplicas:    newReplicas,
+			sameScaleTimes: 1,
+		}
+		if autoScaleHistory.sameScaleTimes >= 1 {
+			if thisAutoScale.oldReplicas == autoScaleHistory.oldReplicas && thisAutoScale.newReplicas == autoScaleHistory.newReplicas {
+				// this time we scale using the same from/to replicas values like in last auto-scaling
+				// it implies someone reverted scanner replicas after we set it last time
+				log.WithFields(log.Fields{"from": autoScaleHistory.oldReplicas, "to": autoScaleHistory.newReplicas}).Info("same scaling as the last time")
+				autoScaleHistory.sameScaleTimes += 1
+			} else {
+				autoScaleHistory = thisAutoScale
+			}
+		} else {
+			autoScaleHistory = thisAutoScale
+		}
+		if autoScaleHistory.sameScaleTimes > 4 {
+			// someone reverted scanner replicas 4 times continusously.
+			acc := access.NewAdminAccessControl()
+			if cfg := cacher.GetSystemConfig(acc); cfg.ScannerAutoscale.Strategy != api.AutoScaleNone {
+				log.WithFields(log.Fields{"strategy": cfg.ScannerAutoscale.Strategy}).Info("autoscale disabled")
+				if cconf, rev := clusHelper.GetSystemConfigRev(acc); cconf != nil {
+					cconf.ScannerAutoscale.Strategy = api.AutoScaleNone
+					cconf.ScannerAutoscale.DisabledByOthers = true
+					if err := clusHelper.PutSystemConfigRev(cconf, rev); err == nil {
+						clog := share.CLUSEventLog{
+							Event:      share.CLUSEvScannerAutoScaleDisabled,
+							ReportedAt: time.Now().UTC(),
+						}
+						clog.Msg = "Scanner autoscale is disabled because someone reverted the scaling for 3 continous times."
+						cctx.EvQueue.Append(&clog)
+						skipScale = true
+						log.Info(clog.Msg)
+					} else {
+						log.WithFields(log.Fields{"strategy": cfg.ScannerAutoscale.Strategy}).Info("failed to disabl autoscale")
+					}
+				}
+			}
+			autoScaleHistory = tAutoScaleHistory{}
+		}
+		if !skipScale {
+			if err := resource.UpdateDeploymentReplicates("neuvector-scanner-pod", int32(newReplicas)); err == nil {
+				log.WithFields(log.Fields{"from": totalScanners, "history": autoScaleHistory}).Info("autoscale")
+			}
 		}
 	}
+
 	if setTimeWindow {
 		contTaskQStateTime = time.Now().UTC()
 	}
@@ -1316,7 +1453,7 @@ func (m CacheMethod) GetVulnerabilityReport(id, showTag string) ([]*api.RESTVuln
 		}
 
 		sdb := scanUtils.GetScannerDB()
-		vuls := scanUtils.FillVulDetails(sdb.CVEDB, info.baseOS, info.vulTraits, showTag)
+		vuls := scanUtils.FillVulTraits(sdb.CVEDB, info.baseOS, info.vulTraits, showTag, false)
 		modules := make([]*api.RESTScanModule, len(info.modules))
 		for i, m := range info.modules {
 			modules[i] = scanUtils.ScanModule2REST(m)
@@ -1343,4 +1480,63 @@ func (m CacheMethod) GetScanPlatformSummary(acc *access.AccessControl) (*api.RES
 	} else {
 		return nil, common.ErrObjectAccessDenied
 	}
+}
+
+func getWorkloadDbAssetVul(c *workloadCache, highs, meds, lows []string, lastScanTime time.Time) *db.DbAssetVul {
+	d := &db.DbAssetVul{
+		Type:             db.AssetWorkload,
+		AssetID:          c.workload.ID,
+		Name:             c.podName,
+		W_domain:         c.workload.Domain,
+		W_service_group:  c.serviceName,
+		W_workload_image: c.workload.Image,
+		CVE_high:         len(highs),
+		CVE_medium:       len(meds),
+		CVE_low:          len(lows),
+	}
+
+	apps := translateWorkloadApps(c.workload)
+	b, err := json.Marshal(apps)
+	if err == nil {
+		d.W_applications = string(b)
+	}
+
+	d.Policy_mode, _ = getWorkloadPerGroupPolicyMode(c)
+	d.Scanned_at = api.RESTTimeString(lastScanTime.UTC())
+	return d
+}
+
+func getHostDbAssetVul(c *hostCache, highs, meds, lows []string, lastScanTime time.Time) *db.DbAssetVul {
+	d := &db.DbAssetVul{
+		Type:         db.AssetNode,
+		AssetID:      c.host.ID,
+		Name:         c.host.Name,
+		CVE_high:     len(highs),
+		CVE_medium:   len(meds),
+		CVE_low:      len(lows),
+		N_os:         c.host.OS,
+		N_kernel:     c.host.Kernel,
+		N_cpus:       int(c.host.CPUs),
+		N_memory:     c.host.Memory,
+		N_containers: c.workloads.Cardinality(),
+	}
+
+	d.Policy_mode, _ = getHostPolicyMode(c)
+	d.Scanned_at = api.RESTTimeString(lastScanTime.UTC())
+	return d
+}
+
+func getPlatformDbAssetVul(highs, meds, lows []string, baseOS string, lastScanTime time.Time) *db.DbAssetVul {
+	d := &db.DbAssetVul{
+		Type:       db.AssetPlatform,
+		AssetID:    common.ScanPlatformID,
+		Name:       localDev.Host.Platform,
+		CVE_high:   len(highs),
+		CVE_medium: len(meds),
+		CVE_low:    len(lows),
+		P_version:  cctx.k8sVersion,
+		P_base_os:  baseOS,
+	}
+	d.Scanned_at = api.RESTTimeString(lastScanTime.UTC())
+	return d
 }

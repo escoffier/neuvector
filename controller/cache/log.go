@@ -29,9 +29,12 @@ import (
 
 const logCacheSize int = 4096
 const maxSyslogMsg int32 = 256
+const logDescriptionLength int = 256
 
 var syslogMutex sync.RWMutex
 var syslogMsgCount int32
+var syslogLastConnKey string // a string to identify the connection criteria
+var syslogOverflowAt, syslogLastFailAt time.Time
 
 func syslogMutexLock() {
 	cctx.MutexLog.WithFields(log.Fields{"goroutine": utils.GetGID()}).Debug("Acquire ...")
@@ -264,6 +267,8 @@ func (m CacheMethod) GetIncidentCount(acc *access.AccessControl) int {
 }
 
 func (m CacheMethod) GetAudits(acc *access.AccessControl) []*api.Audit {
+	syncRLock(syncCatgAuditIdx)
+	defer syncRUnlock(syncCatgAuditIdx)
 	logs := make([]*api.Audit, 0)
 	for i := 0; i < curAuditIndex; i++ {
 		incd := auditCache[curAuditIndex-i-1]
@@ -277,6 +282,9 @@ func (m CacheMethod) GetAudits(acc *access.AccessControl) []*api.Audit {
 }
 
 func (m CacheMethod) GetAuditCount(acc *access.AccessControl) int {
+	syncRLock(syncCatgAuditIdx)
+	defer syncRUnlock(syncCatgAuditIdx)
+
 	if acc.HasGlobalPermissions(share.PERM_AUDIT_EVENTS, 0) {
 		return curAuditIndex
 	} else {
@@ -380,6 +388,30 @@ func getWebhookCache(ruleID int, whName string) *webhookCache {
 	return whc
 }
 
+func getWebhookProxy(whc *webhookCache) *share.CLUSProxy {
+	if !whc.useProxy {
+		return nil
+	}
+
+	if strings.HasPrefix(whc.url, "http://") {
+		proxy := systemConfigCache.RegistryHttpProxy
+		if !proxy.Enable {
+			return nil
+		} else {
+			return &proxy
+		}
+	} else if strings.HasPrefix(whc.url, "https://") {
+		proxy := systemConfigCache.RegistryHttpsProxy
+		if !proxy.Enable {
+			return nil
+		} else {
+			return &proxy
+		}
+	}
+
+	return nil
+}
+
 func webhookActivity(act *actionDesc, arg interface{}) {
 	rlog := arg.(*api.Event)
 	rlog.ResponseRuleID = int(act.id)
@@ -387,7 +419,8 @@ func webhookActivity(act *actionDesc, arg interface{}) {
 		title := fmt.Sprintf("%s", rlog.Name)
 		for _, w := range act.webhooks {
 			if whc := getWebhookCache(rlog.ResponseRuleID, w); whc != nil {
-				whc.conn.Notify(rlog, whc.target, rlog.Level, api.CategoryEvent, rlog.ClusterName, title)
+				proxy := getWebhookProxy(whc)
+				whc.c.Notify(rlog, rlog.Level, api.CategoryEvent, rlog.ClusterName, title, proxy)
 			}
 		}
 	}
@@ -400,7 +433,8 @@ func webhookEvent(act *actionDesc, arg interface{}) {
 		title := fmt.Sprintf("%s", rlog.Name)
 		for _, w := range act.webhooks {
 			if whc := getWebhookCache(rlog.ResponseRuleID, w); whc != nil {
-				whc.conn.Notify(rlog, whc.target, rlog.Level, api.CategoryEvent, rlog.ClusterName, title)
+				proxy := getWebhookProxy(whc)
+				whc.c.Notify(rlog, rlog.Level, api.CategoryEvent, rlog.ClusterName, title, proxy)
 			}
 		}
 	}
@@ -413,7 +447,8 @@ func webhookViolation(act *actionDesc, arg interface{}) {
 		title := fmt.Sprintf("%s -> %s", rlog.ClientName, rlog.ServerName)
 		for _, w := range act.webhooks {
 			if whc := getWebhookCache(rlog.ResponseRuleID, w); whc != nil {
-				whc.conn.Notify(rlog, whc.target, rlog.Level, api.CategoryViolation, rlog.ClusterName, title)
+				proxy := getWebhookProxy(whc)
+				whc.c.Notify(rlog, rlog.Level, api.CategoryViolation, rlog.ClusterName, title, proxy)
 			}
 		}
 	}
@@ -433,7 +468,8 @@ func webhookThreat(act *actionDesc, arg interface{}) {
 		rlog.CapLen, rlog.Packet = 0, ""
 		for _, w := range act.webhooks {
 			if whc := getWebhookCache(rlog.ResponseRuleID, w); whc != nil {
-				whc.conn.Notify(rlog, whc.target, rlog.Level, api.CategoryThreat, rlog.ClusterName, title)
+				proxy := getWebhookProxy(whc)
+				whc.c.Notify(rlog, rlog.Level, api.CategoryThreat, rlog.ClusterName, title, proxy)
 			}
 		}
 		rlog.CapLen, rlog.Packet = len, pkt
@@ -447,7 +483,8 @@ func webhookIncident(act *actionDesc, arg interface{}) {
 		title := fmt.Sprintf("%s at %s", rlog.Name, rlog.WorkloadName)
 		for _, w := range act.webhooks {
 			if whc := getWebhookCache(rlog.ResponseRuleID, w); whc != nil {
-				whc.conn.Notify(rlog, whc.target, rlog.Level, api.CategoryIncident, rlog.ClusterName, title)
+				proxy := getWebhookProxy(whc)
+				whc.c.Notify(rlog, rlog.Level, api.CategoryIncident, rlog.ClusterName, title, proxy)
 			}
 		}
 	}
@@ -475,7 +512,8 @@ func webhookAudit(act *actionDesc, arg interface{}) {
 		}
 		for _, w := range act.webhooks {
 			if whc := getWebhookCache(rlog.ResponseRuleID, w); whc != nil {
-				whc.conn.Notify(rlog, whc.target, rlog.Level, api.CategoryAudit, rlog.ClusterName, title)
+				proxy := getWebhookProxy(whc)
+				whc.c.Notify(rlog, rlog.Level, api.CategoryAudit, rlog.ClusterName, title, proxy)
 			}
 		}
 	}
@@ -489,7 +527,10 @@ func sendSyslog(elog interface{}, level, cat, header string) {
 	defer atomic.AddInt32(&syslogMsgCount, -1)
 
 	if c >= maxSyslogMsg {
-		log.Error("Maximum concurrent syslog message reached. Check syslog server settings.")
+		if time.Since(syslogOverflowAt) > time.Minute*time.Duration(30) {
+			syslogOverflowAt = time.Now()
+			log.Error("Maximum concurrent syslog message reached. Check syslog server settings.")
+		}
 		return
 	}
 
@@ -498,7 +539,15 @@ func sendSyslog(elog interface{}, level, cat, header string) {
 
 	if syslogger != nil {
 		if err := syslogger.Send(elog, level, cat, header); err != nil {
-			log.WithFields(log.Fields{"error": err}).Error()
+			connKey := syslogger.Identifier()
+			if time.Since(syslogLastFailAt) > time.Minute*time.Duration(30) || syslogLastConnKey != connKey {
+				if syslogLastConnKey != connKey {
+					syslogOverflowAt = time.Time{} // set to zero
+				}
+				syslogLastConnKey = connKey
+				syslogLastFailAt = time.Now()
+				log.WithFields(log.Fields{"error": err}).Error()
+			}
 		}
 	}
 }
@@ -548,13 +597,24 @@ func logIncident(arg interface{}) {
 	}
 }
 
-func fillAuditPackages(l *api.Audit, cve string) {
-	if !systemConfigCache.SingleCVEPerSyslog {
-		return
-	}
-	val, ok := l.PackageMap[cve]
+func fillVulAudit(l *api.Audit, cve string) {
+	v, ok := l.Vuls[cve]
 	if ok {
-		l.Packages = val
+		l.Packages = []string{v.PackageName}
+		l.PackageVersion = v.PackageVersion
+		l.FixedVersion = v.FixedVersion
+		l.Link = v.Link
+		l.Score = v.Score
+		l.ScoreV3 = v.ScoreV3
+		l.Vectors = v.Vectors
+		l.VectorsV3 = v.VectorsV3
+		l.Published = v.PublishedDate
+		l.LastMod = v.FixedVersion
+		if len(v.Description) > logDescriptionLength {
+			l.Description = fmt.Sprintf("%s...", v.Description[:logDescriptionLength])
+		} else {
+			l.Description = v.Description
+		}
 	}
 }
 
@@ -575,7 +635,7 @@ func logAudit(arg interface{}) {
 					l.MediumVuls = []string{}
 					l.HighCnt = 1
 					l.MediumCnt = 0
-					fillAuditPackages(&l, v)
+					fillVulAudit(&l, v)
 					sendSyslog(&l, l.Level, api.CategoryAudit, "audit")
 				}
 				for _, v := range rlog.MediumVuls {
@@ -584,12 +644,54 @@ func logAudit(arg interface{}) {
 					l.MediumVuls = []string{v}
 					l.HighCnt = 0
 					l.MediumCnt = 1
-					fillAuditPackages(&l, v)
+					fillVulAudit(&l, v)
 					sendSyslog(&l, l.Level, api.CategoryAudit, "audit")
 				}
 			}()
 		} else {
 			go sendSyslog(rlog, rlog.Level, api.CategoryAudit, "audit")
+		}
+
+		if systemConfigCache.SyslogCVEInLayers &&
+			(rlog.Name == api.EventNameContainerScanReport ||
+				rlog.Name == api.EventNameHostScanReport ||
+				rlog.Name == api.EventNameRegistryScanReport ||
+				rlog.Name == api.EventNamePlatformScanReport) {
+			go func() {
+				for _, llog := range rlog.Layers {
+					if len(llog.HighVuls) > 0 || len(llog.MediumVuls) > 0 {
+						// copy the fields of the layer
+						rlog.ImageLayerDigest = llog.ImageLayerDigest
+						rlog.Cmds = llog.Cmds
+						rlog.HighVuls = llog.HighVuls
+						rlog.MediumVuls = llog.MediumVuls
+						rlog.HighCnt = llog.HighCnt
+						rlog.MediumCnt = llog.MediumCnt
+						if systemConfigCache.SingleCVEPerSyslog {
+							for _, v := range rlog.HighVuls {
+								l := *rlog
+								l.HighVuls = []string{v}
+								l.MediumVuls = []string{}
+								l.HighCnt = 1
+								l.MediumCnt = 0
+								fillVulAudit(&l, v)
+								sendSyslog(&l, l.Level, api.CategoryAudit, "audit")
+							}
+							for _, v := range rlog.MediumVuls {
+								l := *rlog
+								l.HighVuls = []string{}
+								l.MediumVuls = []string{v}
+								l.HighCnt = 0
+								l.MediumCnt = 1
+								fillVulAudit(&l, v)
+								sendSyslog(&l, l.Level, api.CategoryAudit, "audit")
+							}
+						} else {
+							sendSyslog(rlog, rlog.Level, api.CategoryAudit, "audit")
+						}
+					}
+				}
+			}()
 		}
 	}
 }
@@ -945,10 +1047,10 @@ func admCtrlUpdate(event string, clog *api.Audit) {
 	responseRuleLookup(&desc)
 }
 
-func auditUpdate(id, event string, objType share.ScanObjectType, clog *api.Audit, vuls utils.Set) {
+func auditUpdate(id, event string, objType share.ScanObjectType, clog *api.Audit, vuls utils.Set, fixedHighsInfo []scanUtils.FixedVulInfo) {
 	desc := eventDesc{id: id, event: event,
 		name: clog.Name, level: clog.Level, vuls: vuls,
-		cve_high: clog.HighCnt, cve_med: clog.MediumCnt,
+		cve_high: clog.HighCnt, cve_med: clog.MediumCnt, cve_high_fixed_info: fixedHighsInfo,
 		items: clog.Items, arg: clog}
 	if objType != share.ScanObjectType_CONTAINER {
 		desc.noQuar = true
@@ -1268,7 +1370,7 @@ func syncIncidentRx(msg *syncDataMsg) int {
 
 func syncAuditRx(msg *syncDataMsg) int {
 	syncLock(syncCatgAuditIdx)
-	if validateModifyIdx(syncCatgAuditIdx, msg.ModifyIdx) == false {
+	if !validateModifyIdx(syncCatgAuditIdx, msg.ModifyIdx) {
 		syncUnlock(syncCatgAuditIdx)
 		// Introduce a delay before retry
 		time.Sleep(time.Second)
@@ -1282,12 +1384,17 @@ func syncAuditRx(msg *syncDataMsg) int {
 			syncUnlock(syncCatgAuditIdx)
 			return syncRxErrorFailed
 		} else {
-			curAuditIndex = len(audits)
-			for i, audit := range audits {
+			num := 0
+			for _, audit := range audits {
+				if audit == nil {
+					continue
+				}
 				audit.Level = api.UpgradeLogLevel(audit.Level)
 				auditSuppressSetIdRpts(audit)
-				auditCache[i] = audit
+				auditCache[num] = audit
+				num++
 			}
+			curAuditIndex = num
 		}
 	} else {
 		curAuditIndex = 0
@@ -1347,7 +1454,11 @@ func eventLog2API(ev *share.CLUSEventLog) *api.Event {
 		rlog.LicenseExpire = ev.LicenseExpire.Format("2006-01-02")
 	}
 	rlog.EnforcerLimit = ev.EnforcerLimit
-	rlog.Msg = ev.Msg
+	if ev.Msg != "" {
+		rlog.Msg = ev.Msg
+	} else {
+		rlog.Msg = info.Name
+	}
 	rlog.ReportedAt = api.RESTTimeString(ev.ReportedAt)
 	rlog.ReportedTimeStamp = ev.ReportedAt.Unix()
 
@@ -1468,7 +1579,11 @@ func threatLog2API(thrt *share.CLUSThreatLog, id string, port uint16) *api.Threa
 	rlog.ICMPCode = thrt.ICMPCode
 	rlog.Application = common.AppNameMap[thrt.Application]
 	rlog.Monitor = thrt.Tap
-	rlog.Msg = thrt.Msg
+	if thrt.Msg != "" {
+		rlog.Msg = thrt.Msg
+	} else {
+		rlog.Msg = rlog.Name
+	}
 	rlog.Packet = thrt.Packet
 	rlog.CapLen = thrt.CapLen
 
@@ -1584,7 +1699,11 @@ func incidentLog2API(incd *share.CLUSIncidentLog, id string, port uint16) *api.I
 		}
 	}
 
-	rlog.Msg = incd.Msg
+	if incd.Msg != "" {
+		rlog.Msg = incd.Msg
+	} else {
+		rlog.Msg = info.Name
+	}
 	rlog.ReportedAt = api.RESTTimeString(incd.ReportedAt)
 	rlog.ReportedTimeStamp = incd.ReportedAt.Unix()
 
@@ -1765,7 +1884,7 @@ func scanReport2BenchLog(id string, objType share.ScanObjectType, report *share.
 	return &clog
 }
 
-func scanReport2ScanLog(id string, objType share.ScanObjectType, report *share.CLUSScanReport, highs, meds []string, regName string) *api.Audit {
+func scanReport2ScanLog(id string, objType share.ScanObjectType, report *share.CLUSScanReport, highs, meds []string, layerHighs, layerMeds map[string][]string, regName string) *api.Audit {
 	clog := api.Audit{
 		LogCommon: api.LogCommon{
 			ReportedAt:        api.RESTTimeString(report.ScannedAt),
@@ -1790,6 +1909,8 @@ func scanReport2ScanLog(id string, objType share.ScanObjectType, report *share.C
 		clog.WorkloadImage = wln.image
 		clog.WorkloadService = wln.service
 		if c := getWorkloadCache(id); c != nil {
+			clog.Image = c.workload.Image
+			clog.ImageID = c.workload.ImageID
 			clog.HostName = c.workload.HostName
 			clog.HostID = c.workload.HostID
 			clog.AgentID = c.workload.AgentID
@@ -1822,14 +1943,40 @@ func scanReport2ScanLog(id string, objType share.ScanObjectType, report *share.C
 	clog.HighCnt = len(highs)
 	clog.MediumCnt = len(meds)
 	if systemConfigCache.SingleCVEPerSyslog {
-		clog.PackageMap = make(map[string][]string)
-		for _, reportvuln := range report.Vuls {
-			val, ok := clog.PackageMap[reportvuln.Name]
-			if ok {
-				clog.PackageMap[reportvuln.Name] = append(val, reportvuln.PackageName)
-			} else {
-				clog.PackageMap[reportvuln.Name] = []string{reportvuln.PackageName}
+		// if only reporting one cve per event, we will add the vulnerabile info.
+		// the vul. list will not be included in the log
+		for _, v := range report.Vuls {
+			scanUtils.FillVul(v)
+		}
+		clog.Vuls = make(map[string]*share.ScanVulnerability)
+		for _, v := range report.Vuls {
+			clog.Vuls[v.Name] = v
+		}
+	}
+	if systemConfigCache.SyslogCVEInLayers {
+		clog.Layers = make([]api.Audit, len(report.Layers))
+		for i, l := range report.Layers {
+			var lc api.Audit
+			lc.ImageLayerDigest = l.Digest
+			lc.Cmds = l.Cmds
+			if h, ok := layerHighs[l.Digest]; ok {
+				lc.HighVuls = h
+				lc.HighCnt = len(h)
 			}
+			if m, ok := layerMeds[l.Digest]; ok {
+				lc.MediumVuls = m
+				lc.MediumCnt = len(m)
+			}
+			if systemConfigCache.SingleCVEPerSyslog {
+				for _, v := range lc.Vuls {
+					scanUtils.FillVul(v)
+				}
+				lc.Vuls = make(map[string]*share.ScanVulnerability)
+				for _, v := range lc.Vuls {
+					lc.Vuls[v.Name] = v
+				}
+			}
+			clog.Layers[i] = lc
 		}
 	}
 

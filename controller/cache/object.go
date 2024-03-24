@@ -22,6 +22,7 @@ import (
 	"github.com/neuvector/neuvector/controller/kv"
 	"github.com/neuvector/neuvector/controller/resource"
 	"github.com/neuvector/neuvector/controller/scan"
+	"github.com/neuvector/neuvector/db"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/cluster"
 	"github.com/neuvector/neuvector/share/container"
@@ -256,6 +257,8 @@ func workload2BriefREST(cache *workloadCache) *api.RESTWorkloadBrief {
 		HostID:             wl.HostID,
 		Image:              wl.Image,
 		ImageID:            wl.ImageID,
+		ImgCreateAt:        api.RESTTimeString(wl.ImgCreateAt),
+		ImgRegScand:        scan.IsRegistryImageScanned(wl.ImageID),
 		PlatformRole:       cache.platformRole,
 		Domain:             wl.Domain,
 		Author:             wl.Author,
@@ -265,6 +268,7 @@ func workload2BriefREST(cache *workloadCache) *api.RESTWorkloadBrief {
 		ShareNSWith:        wl.ShareNetNS,
 		CapQuar:            wl.CapIntcp && cache.state != api.StateUnmanaged,                                      // Allow quarantine when workload is not running
 		CapSniff:           wl.CapSniff && !cacher.disablePCAP && wl.Running && cache.state != api.StateUnmanaged, // Only allow sniff when workload is running
+		HasDatapath:        wl.HasDatapath,
 		CapChgMode:         true,
 		ScanSummary:        cache.scanBrief,
 		Children:           make([]*api.RESTWorkloadBrief, 0),
@@ -546,7 +550,7 @@ func addrDeviceAdd(id string, ifaces map[string][]share.CLUSIPAddr) {
 	//workload, reset unManagedWlTimer to update unmanaged workload ip to prevent
 	//neuvector device being treated as unmanaged wl
 	if addcnt > 0 {
-		scheduleUnmanagedWlProc(false)
+		scheduleUnmanagedWlProc(true)
 	}
 
 	// cleanup ephemeral entries
@@ -702,6 +706,11 @@ func hostUpdate(nType cluster.ClusterNotifyType, key string, value []byte) {
 		if cache != nil {
 			evhdls.Trigger(EV_HOST_DELETE, hostID, cache)
 		}
+
+		// cleanup records in database
+		if err := db.DeleteAssetByID(db.AssetNode, hostID); err != nil {
+			log.WithFields(log.Fields{"err": err, "id": hostID}).Error("Delete asset in db failed.")
+		}
 	}
 }
 
@@ -776,7 +785,7 @@ func agentUpdate(nType cluster.ClusterNotifyType, key string, value []byte) {
 
 		//workload on host without agent is unmanaged
 		//process unmanaged wl ip for special subnet
-		scheduleUnmanagedWlProc(false)
+		scheduleUnmanagedWlProc(true)
 
 		cacheMutexUnlock()
 
@@ -798,7 +807,7 @@ func agentUpdate(nType cluster.ClusterNotifyType, key string, value []byte) {
 		}
 		//workload on host without agent is unmanaged
 		//process unmanaged wl ip for special subnet
-		scheduleUnmanagedWlProc(false)
+		scheduleUnmanagedWlProc(true)
 
 		cacheMutexUnlock()
 
@@ -1020,6 +1029,8 @@ func addrWorkloadAdd(id string, param interface{}) {
 	defer cacheMutexUnlock()
 
 	// Update workload_ip-to-workload map
+	host_mode := (wl.NetworkMode == "host")
+	hostip_reused := false
 	for _, addrs := range wl.Ifaces {
 		for _, addr := range addrs {
 			switch addr.Scope {
@@ -1039,6 +1050,16 @@ func addrWorkloadAdd(id string, param interface{}) {
 					ipWLMap[key] = &workloadDigest{wlID: id, ipnet: addr.IPNet, alive: true, managed: true, node: wl.HostName}
 				}
 
+				//NVSHAS-8155, previous host ip reused by POD, remove it from iphost cache
+				if !host_mode { //NVSHAS-8249, only for non-hostmode wl
+					if _, ok1 := ipHostMap[key]; ok1 {
+						delete(ipHostMap, key)
+						hostip_reused = true
+						log.WithFields(log.Fields{
+							"ip": key, "workload": container.ShortContainerId(wl.ID),
+						}).Debug("Remove host ip reused by workload")
+					}
+				}
 				log.WithFields(log.Fields{
 					"ip": key, "workload": container.ShortContainerId(wl.ID),
 				}).Debug("ip-workload map")
@@ -1046,6 +1067,10 @@ func addrWorkloadAdd(id string, param interface{}) {
 				updateInternalIPNet(&addr.IPNet, addr.Scope, true)
 			}
 		}
+	}
+
+	if hostip_reused {
+		refreshInternalIPNet()
 	}
 
 	if cache, ok := hostCacheMap[wl.HostID]; ok {
@@ -1321,17 +1346,22 @@ func workloadUpdate(nType cluster.ClusterNotifyType, key string, value []byte) {
 			// STOP event is always sent. In case we miss it, we should handle the key deletion
 			if wl.Running {
 				log.WithFields(log.Fields{"NVcontainer": wl.Name}).Info("Add")
+				wlCache := &workloadCache{workload: &wl}
+				if pod, ok := wl.Labels[container.KubeKeyPodName]; ok {
+					wlCache.podName = pod
+				}
 				cacheMutexLock()
 				addrDeviceAdd(wl.ID, wl.Ifaces)
+				nvwlCacheMap[wl.ID] = wlCache
 				cacheMutexUnlock()
 
 				// Remove workload:x.x.x.x from the graph
-				wlCache := &workloadCache{workload: &wl}
 				connectWorkloadAdd(wl.ID, wlCache)
 			} else {
 				log.WithFields(log.Fields{"NVcontainer": wl.Name}).Info("Delete")
 				cacheMutexLock()
 				addrDeviceDelete(wl.ID, wl.Ifaces)
+				delete(nvwlCacheMap, wl.ID)
 				cacheMutexUnlock()
 			}
 			return
@@ -1523,6 +1553,11 @@ func workloadUpdate(nType cluster.ClusterNotifyType, key string, value []byte) {
 		if wlCache != nil {
 			evhdls.Trigger(EV_WORKLOAD_DELETE, id, wlCache)
 		}
+
+		// cleanup records in database
+		if err := db.DeleteAssetByID(db.AssetWorkload, id); err != nil {
+			log.WithFields(log.Fields{"err": err, "id": id}).Error("Delete asset in db failed.")
+		}
 	}
 }
 
@@ -1642,6 +1677,8 @@ func configUpdate(nType cluster.ClusterNotifyType, key string, value []byte, mod
 		userRoleConfigUpdate(nType, key, value)
 	case share.CFGEndpointPwdProfile:
 		pwdProfileConfigUpdate(nType, key, value)
+	case share.CFGEndpointQuerySession:
+		querySessionRequest(nType, key, value)
 	}
 
 	// Only the lead run backup, because the typical use case for backup is to save config
@@ -2207,4 +2244,30 @@ func (kvs *kvConfigStore) GetBackupKvStore(key string) ([]byte, bool) {
 		return value, ok
 	}
 	return nil, false
+}
+
+func querySessionRequest(nType cluster.ClusterNotifyType, key string, value []byte) {
+	log.WithFields(log.Fields{"type": cluster.ClusterNotifyName[nType], "key": key}).Debug("")
+
+	switch nType {
+	case cluster.ClusterNotifyAdd, cluster.ClusterNotifyModify:
+		var qsr api.QuerySessionRequest
+		json.Unmarshal(value, &qsr)
+
+		log.WithFields(log.Fields{"type": cluster.ClusterNotifyName[nType], "key": key, "qsr": qsr}).Debug("[multi-cluster] consul kv watcher added event. Will call rest.CreateQuerySession()")
+
+		err := cctx.CreateQuerySessionFunc(&qsr)
+		if err != nil {
+			log.WithFields(log.Fields{"type": cluster.ClusterNotifyName[nType], "key": key, "qsr": qsr, "err": err}).Debug("[multi-cluster] consul kv watcher added event. call rest.CreateQuerySession() error")
+		}
+	case cluster.ClusterNotifyDelete:
+		queryToken := share.CLUSKeyLastToken(key)
+
+		err := cctx.DeleteQuerySessionFunc(queryToken)
+		if err != nil {
+			log.WithFields(log.Fields{"queryToken": queryToken}).Debug("[multi-cluster] consul kv watcher deleted event, call cctx.DeleteQuerySessionFunc() error")
+		} else {
+			log.WithFields(log.Fields{"queryToken": queryToken}).Debug("[multi-cluster] consul kv watcher deleted event")
+		}
+	}
 }

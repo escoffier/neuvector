@@ -10,12 +10,12 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/sirupsen/logrus"
 	"github.com/neuvector/neuvector/agent/policy"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/cluster"
 	"github.com/neuvector/neuvector/share/fsmon"
 	"github.com/neuvector/neuvector/share/utils"
+	log "github.com/sirupsen/logrus"
 )
 
 ////  group profile
@@ -42,11 +42,11 @@ type fileMatchRule struct {
 
 //// workload profile map for policy lookups
 type workloadProfile struct {
-	groups     utils.Set
-	proc       *share.CLUSProcessProfile
-	file       *share.CLUSFileMonitorProfile
-	access     *share.CLUSFileAccessRule
-	matchRules []*fileMatchRule // local usage: match path to (estimated) group
+	groups         utils.Set
+	proc           *share.CLUSProcessProfile
+	file           *share.CLUSFileMonitorProfile
+	access         *share.CLUSFileAccessRule
+	matchRules     []*fileMatchRule // local usage: match path to (estimated) group
 	procCalculated bool
 	fileCalculated bool
 }
@@ -251,7 +251,7 @@ func updateGroupProfileCache(nType cluster.ClusterNotifyType, name string, obj i
 		}
 	case share.CLUSProcessProfile:
 		proc := obj.(share.CLUSProcessProfile)
-		if proc.Mode != grpCache.proc.Mode || len(grpCache.proc.Process)==0 || reflect.DeepEqual(proc.Process, grpCache.proc.Process) == false {
+		if proc.Mode != grpCache.proc.Mode || len(grpCache.proc.Process) == 0 || reflect.DeepEqual(proc.Process, grpCache.proc.Process) == false {
 			for _, pp := range proc.Process {
 				pp.DerivedGroup = name // late filled-up to save kv storages
 			}
@@ -263,7 +263,7 @@ func updateGroupProfileCache(nType cluster.ClusterNotifyType, name string, obj i
 		}
 	case share.CLUSFileMonitorProfile:
 		file := obj.(share.CLUSFileMonitorProfile)
-		if file.Mode != grpCache.file.Mode || len(grpCache.file.Filters)==0 || reflect.DeepEqual(file.Filters, grpCache.file.Filters) == false {
+		if file.Mode != grpCache.file.Mode || len(grpCache.file.Filters) == 0 || reflect.DeepEqual(file.Filters, grpCache.file.Filters) == false {
 			for i, _ := range file.Filters {
 				file.Filters[i].DerivedGroup = name // late filled-up to save kv storages
 			}
@@ -275,7 +275,7 @@ func updateGroupProfileCache(nType cluster.ClusterNotifyType, name string, obj i
 		}
 	case share.CLUSFileAccessRule:
 		access := obj.(share.CLUSFileAccessRule)
-		if len(grpCache.access.Filters)==0 || reflect.DeepEqual(access.Filters, grpCache.access.Filters) == false {
+		if len(grpCache.access.Filters) == 0 || reflect.DeepEqual(access.Filters, grpCache.access.Filters) == false {
 			grpCache.access = &access
 			targets = grpCache.members.Clone()
 			if targets.Cardinality() > 0 {
@@ -323,10 +323,6 @@ func deleteGroupProfileCache(name string) bool {
 func isContainerSelected(c *containerData, group *share.CLUSGroup) bool {
 	// TODO: remove "CriteriaKeyAddress" from entry ??
 	wl := createWorkload(c.info, &c.service, &c.domain)
-	wl.Running = true // from activeContainer
-	wl.Name = c.name
-	wl.Service = c.service
-	wl.Domain = c.domain
 	return share.IsGroupMember(group, wl, getDomainData(wl.Domain))
 }
 
@@ -334,18 +330,19 @@ func isContainerSelected(c *containerData, group *share.CLUSGroup) bool {
 func refreshGroupMembers(grpCache *groupProfileData) {
 	grpCache.members.Clear()
 	if utils.IsGroupNodes(grpCache.group.Name) {
-		grpCache.members.Add("")	// only member : host
+		grpCache.members.Add("") // only member : host
 		return
 	}
 
 	gInfoRLock()
 	for _, c := range gInfo.activeContainers {
 		if isContainerSelected(c, grpCache.group) {
-			if c.parentNS == "" { // docker-native or k8s pod-level
-				if strings.HasPrefix(c.name, "k8s_POD_") {	// k8s pod-level
-					grpCache.members = grpCache.members.Union(c.pods)
-				}
-				grpCache.members.Add(c.id)
+			grpCache.members.Add(c.id)
+
+			// pod-level inclusion
+			if pod, ok := gInfo.activeContainers[c.parentNS]; ok {
+				grpCache.members = grpCache.members.Union(pod.pods)
+				grpCache.members.Add(c.parentNS)
 			}
 		}
 	}
@@ -388,14 +385,11 @@ func procMemberChanges(members utils.Set) {
 	for cid := range members.Iter() {
 		id := cid.(string)
 		if id == "" {
-			applyHostProcGroupProfile("nodes")	// system reserved entry
+			applyHostProcGroupProfile("nodes") // system reserved entry
 			continue
 		}
 
-		gInfoRLock()
-		c, ok := gInfo.activeContainers[id]
-		gInfoRUnlock()
-		if ok {
+		if c, ok := gInfoReadActiveContainer(id); ok {
 			go applyProcGroupProfile(c)
 		} else {
 			log.WithFields(log.Fields{"id": id}).Debug("GRP: left")
@@ -409,14 +403,11 @@ func fileMemberChanges(members utils.Set) {
 	for cid := range members.Iter() {
 		id := cid.(string)
 		if id == "" {
-		//	log.Debug("GRP: not support nodes")
+			//	log.Debug("GRP: not support nodes")
 			continue
 		}
 
-		gInfoRLock()
-		c, ok := gInfo.activeContainers[id]
-		gInfoRUnlock()
-		if ok {
+		if c, ok := gInfoReadActiveContainer(id); ok {
 			applyFileGroupProfile(c)
 		} else {
 			log.WithFields(log.Fields{"id": id}).Debug("GRP: left")
@@ -656,7 +647,7 @@ func calculateProcGroupProfile(id, svc string) (*share.CLUSProcessProfile, bool)
 	proc.HashEnable = svc_proc.HashEnable
 	proc.Process = pp.Process
 
-	if id != "" {	// container only
+	if id != "" { // container only
 		for _, p := range proc.Process { // separate CRD and other types
 			// log.WithFields(log.Fields{"proc": p, "Svc": svc}).Debug("GRP:")
 			if p.Action == share.PolicyActionAllow {
@@ -772,12 +763,12 @@ func applyHostProcGroupProfile(svc string) bool {
 		wlCacheLock.Unlock()
 
 		// put a minimum data set
-		c :=  &containerData {
-			id: 			"",
-			name: 			"host",
-			pid : 			1,
-			capBlock: 		false,	// no process blocking control but kill processes
-			pushPHistory: 	true, 	// no history
+		c := &containerData{
+			id:           "",
+			name:         "host",
+			pid:          1,
+			capBlock:     false, // no process blocking control but kill processes
+			pushPHistory: true,  // no history
 		}
 
 		// log.WithFields(log.Fields{"SVC": svc, "mode": proc.Mode}).Debug("GRP:")
@@ -860,7 +851,7 @@ func uppdateFileGroupAccess(c *containerData) bool {
 }
 
 /////// "host" is not an actual workload, will NOT enter this function
-func workloadJoinGroup(c *containerData) {
+func workloadJoinGroup(c, parent *containerData) {
 	if !agentEnv.systemProfiles {
 		return
 	}
@@ -885,23 +876,17 @@ func workloadJoinGroup(c *containerData) {
 		if utils.IsGroupNodes(name) {
 			continue
 		}
-		if !grpCache.members.Contains(c.id) {
-			if isContainerSelected(c, grpCache.group) {
-				if c.parentNS == "" { // docker-native or k8s pod-level
-					if strings.HasPrefix(c.name, "k8s_POD_") {	// k8s pod-level
-						grpCache.members = grpCache.members.Union(c.pods)
-						grpNotifyProc = grpNotifyProc.Union(c.pods)
-						grpNotifyFile = grpNotifyFile.Union(c.pods)
-					}
-					grpCache.members.Add(c.id)
-					groups.Add(name)	// reference
-				} else {	// k8s child-level
-					// patch: the joined pod was not filled with previous pod's members.
-					if grpCache.members.Contains(c.parentNS) {
-						grpCache.members.Add(c.id)
-						groups.Add(name)	// reference
-					}
-				}
+
+		if isContainerSelected(c, grpCache.group) {
+			grpCache.members.Add(c.id)
+			groups.Add(name) // reference
+
+			// pod-level inclusion
+			if parent != nil {
+				grpCache.members = grpCache.members.Union(parent.pods)
+				grpCache.members.Add(c.parentNS)
+				grpNotifyProc = grpNotifyProc.Union(parent.pods)
+				grpNotifyFile = grpNotifyFile.Union(parent.pods)
 			}
 		}
 	}
@@ -949,7 +934,7 @@ func workloadLeaveGroup(c *containerData) {
 
 ///////// Use GRPC to return actual policy to CTL
 func ObtainGroupProcessPolicy(id string) (*share.CLUSProcessProfile, bool) {
-	if id == "nodes" {	// from controller, workload id from runtime can not be like "nodes"
+	if id == "nodes" { // from controller, workload id from runtime can not be like "nodes"
 		id = ""
 	}
 
@@ -970,7 +955,7 @@ func ObtainGroupProcessPolicy(id string) (*share.CLUSProcessProfile, bool) {
 
 ///////// Use GRPC to return actual policy to CTL
 func ObtainGroupFilePolicies(id string) (*share.CLUSFileMonitorProfile, *share.CLUSFileAccessRule, bool) {
-	if id == "nodes" {	// TODO: from controller, workload id from runtime can not be like "nodes"
+	if id == "nodes" { // TODO: from controller, workload id from runtime can not be like "nodes"
 		id = ""
 	}
 
@@ -992,14 +977,10 @@ func ObtainGroupFilePolicies(id string) (*share.CLUSFileMonitorProfile, *share.C
 /////////////////////////////////////////////////////////////////////////////////
 ////// Estimate the rule from group name or service
 func cbEstimateDeniedProcessdByGroup(id, name, path string) (string, string) {
-	if id == "" {
-		id = "nodes"
-	}
-
 	svcGroup, ok, _ := cbGetLearnedGroupName(id)
 	if !ok {
 		log.WithFields(log.Fields{"id": id}).Error("GRP: no svc")
-		return "", share.CLUSReservedUuidNotAlllowed		// TODO: if possible
+		return "", share.CLUSReservedUuidNotAlllowed // TODO: if possible
 	}
 
 	if profile, ok := ObtainGroupProcessPolicy(id); ok && profile != nil {
@@ -1090,7 +1071,7 @@ func cbEstimateFileAlertByGroup(id, path string, bBlocked bool) string {
 }
 
 func updateContainerFamilyTrees(name string) {
-	if name =="nodes"  {
+	if name == "nodes" {
 		return
 	}
 
@@ -1104,13 +1085,10 @@ func updateContainerFamilyTrees(name string) {
 
 	for _, cid := range cids {
 		bPrivileged := false
-		gInfoRLock()
-		c, ok := gInfo.activeContainers[cid]
-		if ok && c.info != nil {
-			bPrivileged = c.info.Privileged
-		}
-		gInfoRUnlock()
-		if ok {
+		if c, ok := gInfoReadActiveContainer(cid); ok {
+			if c.info != nil {
+				bPrivileged = c.info.Privileged
+			}
 			prober.BuildProcessFamilyGroups(c.id, c.pid, false, bPrivileged)
 		}
 	}
@@ -1142,11 +1120,11 @@ func domainChange(domain share.CLUSDomain) {
 
 	gInfoRLock()
 	for _, c := range gInfo.activeContainers {
-		targets.Add(c.id)	// include all containers
+		targets.Add(c.id) // include all containers
 	}
 
 	for _, cache := range groups {
-		cache.members.Clear()	// reset
+		cache.members.Clear() // reset
 		for _, c := range gInfo.activeContainers {
 			if isContainerSelected(c, cache.group) {
 				cache.members.Add(c.id)

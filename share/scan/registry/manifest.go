@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io/ioutil"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
@@ -17,8 +16,10 @@ import (
 )
 
 const (
-	MediaTypeOCIManifest = "application/vnd.oci.image.manifest.v1+json"
-	MediaTypeOCIIndex    = "application/vnd.oci.image.index.v1+json"
+	MediaTypeOCIManifest    = "application/vnd.oci.image.manifest.v1+json"
+	MediaTypeOCIIndex       = "application/vnd.oci.image.index.v1+json"
+	MediaTypeOCIImageConfig = "application/vnd.oci.image.config.v1+json"
+	MediaTypeContainerImage = "application/vnd.docker.container.image.v1+json"
 
 	MediaTypeOCIMissingManifest = "Accept header does not support OCI manifests"
 	MediaTypeOCIMissingIndex    = "Accept header does not support OCI indexes"
@@ -27,14 +28,22 @@ const (
 type ManifestInfo struct {
 	SignedManifest *manifestV1.SignedManifest
 	Digest         string
-	RunAsRoot      bool
 	Author         string
 	Envs           []string
-	Cmds           []string
 	Labels         map[string]string
+	Cmds           []string
+	EmptyLayers    []bool
+	Created        time.Time
 }
 
-func (r *Registry) ManifestRequest(ctx context.Context, repository, reference string, schema int) (string, []byte, error) {
+type ManifestRequestType int
+
+const (
+	ManifestRequest_Default ManifestRequestType = iota
+	ManifestRequest_CosignSignature
+)
+
+func (r *Registry) ManifestRequest(ctx context.Context, repository, reference string, schema int, reqType ManifestRequestType) (string, []byte, error) {
 	url := r.url("/v2/%s/manifests/%s", repository, reference)
 	log.WithFields(log.Fields{"url": url, "repository": repository, "ref": reference, "schema": schema}).Debug()
 
@@ -46,6 +55,11 @@ func (r *Registry) ManifestRequest(ctx context.Context, repository, reference st
 	retry := 0
 	withOCIManifest := false
 	withOCIIndex := false
+
+	if reqType == ManifestRequest_CosignSignature {
+		withOCIManifest = true
+	}
+
 	for retry < retryTimes {
 		req, err = http.NewRequest(http.MethodGet, url, nil)
 		if err != nil {
@@ -83,9 +97,9 @@ func (r *Registry) ManifestRequest(ctx context.Context, repository, reference st
 			return "", nil, ctx.Err()
 		}
 
-		if !withOCIManifest && strings.Contains(err.Error(), MediaTypeOCIMissingManifest) {
+		if !withOCIManifest && strings.Contains(strings.ToLower(err.Error()), strings.ToLower(MediaTypeOCIMissingManifest)) {
 			withOCIManifest = true
-		} else if !withOCIIndex && strings.Contains(err.Error(), MediaTypeOCIMissingIndex) {
+		} else if !withOCIIndex && strings.Contains(strings.ToLower(err.Error()), strings.ToLower(MediaTypeOCIMissingIndex)) {
 			withOCIIndex = true
 		} else {
 			retry++
@@ -103,16 +117,18 @@ func (r *Registry) ManifestRequest(ctx context.Context, repository, reference st
 
 	dg, _ := digest.Parse(resp.Header.Get("Docker-Content-Digest"))
 
+	// log.WithFields(log.Fields{"schema": schema, "body": string(body[:])}).Debug()
+
 	return string(dg), body, nil
 }
 
 func (r *Registry) Manifest(ctx context.Context, repository, reference string) (*ManifestInfo, error) {
-	dg, body, err := r.ManifestRequest(ctx, repository, reference, 1)
+	dg, body, err := r.ManifestRequest(ctx, repository, reference, 1, ManifestRequest_Default)
 	if err != nil {
 		return nil, err
 	}
 
-	mi, err := r.parseHistory(body)
+	mi, err := parseManifestHistory(body)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +149,7 @@ func (r *Registry) Manifest(ctx context.Context, repository, reference string) (
 }
 
 func (r *Registry) ManifestV2(ctx context.Context, repository, reference string) (*manifestV2.DeserializedManifest, string, error) {
-	dg, body, err := r.ManifestRequest(ctx, repository, reference, 2)
+	dg, body, err := r.ManifestRequest(ctx, repository, reference, 2, ManifestRequest_Default)
 	if err != nil {
 		return nil, "", err
 	}
@@ -199,13 +215,23 @@ type containerConfig2Data struct {
 	} `json:"Cmd"`
 }
 
-var userRegexp = regexp.MustCompile(`USER \[([a-zA-Z0-9_\-\.]+)\]`)
+type imageHistory struct {
+	Created    time.Time `json:"created"`
+	Author     string    `json:"author,omitempty"`
+	CreatedBy  string    `json:"created_by,omitempty"`
+	Comment    string    `json:"comment,omitempty"`
+	EmptyLayer bool      `json:"empty_layer,omitempty"`
+}
 
-func (r *Registry) parseHistory(body []byte) (*ManifestInfo, error) {
+type imageConfigSpec struct {
+	containerConfigData
+	History []imageHistory `json:"history"`
+}
+
+func parseManifestHistory(body []byte) (*ManifestInfo, error) {
 	var manData manifestData
-	var userFound bool
 
-	info := ManifestInfo{RunAsRoot: true, Labels: make(map[string]string)}
+	info := ManifestInfo{Labels: make(map[string]string)}
 	if err := json.Unmarshal(body, &manData); err == nil {
 		for _, comp := range manData.History {
 			v1com := comp.V1Compatibility
@@ -214,6 +240,9 @@ func (r *Registry) parseHistory(body []byte) (*ManifestInfo, error) {
 			if err := json.Unmarshal([]byte(v1com), &confData); err == nil {
 				if info.Author == "" {
 					info.Author = confData.Author
+				}
+				if confData.Created.After(info.Created) {
+					info.Created = confData.Created
 				}
 				if len(confData.ContainerConfig.Cmd) > 0 {
 					cmd = strings.Join(confData.ContainerConfig.Cmd, " ")
@@ -244,20 +273,56 @@ func (r *Registry) parseHistory(body []byte) (*ManifestInfo, error) {
 			}
 
 			info.Cmds = append(info.Cmds, cmd)
-			if !userFound {
-				r := userRegexp.FindStringSubmatch(cmd)
-				if len(r) == 2 {
-					if r[1] == "root" {
-						info.RunAsRoot = true
-					} else {
-						info.RunAsRoot = false
-					}
-					userFound = true
-				}
-			}
 		}
 	} else {
 		return nil, err
 	}
 	return &info, nil
+}
+
+func (r *Registry) ImageConfigSpecV1(ctx context.Context, repository string, reference digest.Digest) (*ManifestInfo, error) {
+	log.WithFields(log.Fields{"digest": reference}).Debug()
+
+	rd, _, err := r.DownloadLayer(ctx, repository, reference)
+	if err == nil {
+		defer rd.Close()
+		if body, err := ioutil.ReadAll(rd); err == nil {
+			// log.WithFields(log.Fields{"body": string(body[:])}).Debug()
+
+			var ics imageConfigSpec
+			if err = json.Unmarshal(body, &ics); err == nil {
+				info := ManifestInfo{Labels: make(map[string]string), Created: ics.Created}
+
+				if ics.ContainerConfig.Env != nil {
+					info.Envs = append(info.Envs, ics.ContainerConfig.Env...)
+				} else if ics.Config.Env != nil {
+					info.Envs = append(info.Envs, ics.ContainerConfig.Env...)
+				}
+				if ics.ContainerConfig.Labels != nil {
+					for k, v := range ics.ContainerConfig.Labels {
+						info.Labels[k] = v
+					}
+				} else if ics.Config.Labels != nil {
+					for k, v := range ics.Config.Labels {
+						info.Labels[k] = v
+					}
+				}
+
+				// in reverse order
+				for i := len(ics.History) - 1; i >= 0; i-- {
+					h := &ics.History[i]
+
+					if info.Author == "" {
+						info.Author = h.Author
+					}
+					info.Cmds = append(info.Cmds, h.CreatedBy)
+					info.EmptyLayers = append(info.EmptyLayers, h.EmptyLayer)
+				}
+
+				return &info, nil
+			}
+		}
+	}
+
+	return nil, err
 }

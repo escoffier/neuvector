@@ -309,7 +309,7 @@ func upgradeProcessProfile(cfg *share.CLUSProcessProfile) (bool, bool) {
 		}
 	}
 
-	for i, _ := range cfg.Process {
+	for i := range cfg.Process {
 		if cfg.Process[i].CreatedAt.IsZero() {
 			cfg.Process[i].CreatedAt = tm
 			upd = true
@@ -542,6 +542,34 @@ func doUpgrade(key string, value []byte) (interface{}, bool) {
 					return &cfg, wrt
 				}
 			}
+		case share.CFGEndpointVulnerability:
+			if key == share.CLUSVulnerabilityProfileKey(share.DefaultVulnerabilityProfileName) {
+				var cfg share.CLUSVulnerabilityProfile
+				if err := json.Unmarshal(value, &cfg); err == nil {
+					upd := false
+					if cfg.CfgType == 0 {
+						cfg.CfgType = share.UserCreated
+						upd = true
+					}
+					if upd {
+						return &cfg, upd
+					}
+				}
+			}
+		case share.CFGEndpointCompliance:
+			if key == share.CLUSComplianceProfileKey(share.DefaultComplianceProfileName) {
+				var cfg share.CLUSComplianceProfile
+				if err := json.Unmarshal(value, &cfg); err == nil {
+					upd := false
+					if cfg.CfgType == 0 {
+						cfg.CfgType = share.UserCreated
+						upd = true
+					}
+					if upd {
+						return &cfg, upd
+					}
+				}
+			}
 		}
 	}
 
@@ -760,7 +788,9 @@ var phases []kvVersions = []kvVersions{
 
 	{"28ea479c", initFedScanRevKey},
 
-	{"FCAB0BF2", nil},
+	{"FCAB0BF2", upgradeDefSecRisksProfiles},
+
+	{"449EC339", nil},
 }
 
 func latestKVVersion() string {
@@ -791,7 +821,8 @@ func putControlVersion(ver *share.CLUSCtrlVersion) error {
 	return cluster.Put(key, value)
 }
 
-func (m clusterHelper) UpgradeClusterKV() {
+// version param is the NV Version embedded in the controller process
+func (m clusterHelper) UpgradeClusterKV(version string) (verUpdated bool) {
 	var run bool
 
 	lock, err := m.AcquireLock(share.CLUSLockUpgradeKey, upgradeClusterLockWait)
@@ -803,6 +834,17 @@ func (m clusterHelper) UpgradeClusterKV() {
 
 	ver := getControlVersion()
 	log.WithFields(log.Fields{"version": ver}).Info("Before upgrade")
+	if !strings.HasPrefix(version, "interim/") {
+		if ver.CtrlVersion != version {
+			users := m.GetAllUsersNoAuth()
+			for _, user := range users {
+				if len(user.AcceptedAlerts) > 0 {
+					user.AcceptedAlerts = nil
+					m.PutUser(user)
+				}
+			}
+		}
+	}
 
 	for i := 0; i < len(phases); i++ {
 		phase := &phases[i]
@@ -823,8 +865,16 @@ func (m clusterHelper) UpgradeClusterKV() {
 	if ver != newVer {
 		putControlVersion(newVer)
 		cfgHelper.writeBackupVersion()
+
+		if !strings.HasPrefix(version, "interim/") {
+			if ver.CtrlVersion != version {
+				verUpdated = true
+			}
+		}
 	}
 	log.WithFields(log.Fields{"version": newVer}).Info("After upgrade")
+
+	return
 }
 
 func (m clusterHelper) UpgradeClusterImport(importVer *share.CLUSCtrlVersion) {
@@ -913,10 +963,10 @@ const (
 
 // check if the request handling cluster can handle request from the requesting cluster
 // for "fed kv version":
-// 1. the request handling cluster & requesting cluster have the same "fed kv version", it means they can handle requests from each other in the same federation
-// 2. if not, it means they shouldn't handle requests from each other
-//	  2-1: if the requesting cluster's "fed kv version" is in the handler cluster's phases, it means the requesting cluster needs upgrade
-//	  2-2: if the requesting cluster's "fed kv version" is not in the handler cluster's phases, it means the handler cluster needs upgrade
+//  1. the request handling cluster & requesting cluster have the same "fed kv version", it means they can handle requests from each other in the same federation
+//  2. if not, it means they shouldn't handle requests from each other
+//     2-1: if the requesting cluster's "fed kv version" is in the handler cluster's phases, it means the requesting cluster needs upgrade
+//     2-2: if the requesting cluster's "fed kv version" is not in the handler cluster's phases, it means the handler cluster needs upgrade
 func CheckFedKvVersion(verifier, reqFedKvVer string) (bool, int, error) {
 	ver := getControlVersion()
 	if ver.KVVersion != latestKVVersion() {
@@ -963,7 +1013,8 @@ func GetFedKvVer() string { // NV clusters with the same "fed kv version" means 
 
 func GetRestVer() string { // NV clusters with the same "rest version" means master cluster can switch UI view to them
 	// return "E907B7AE" // for 5.0
-	return "28ea479c" // for 5.1
+	// return "28ea479c" // for 5.1 ~ 5.2.x
+	return "449EC339" // for 5.3
 }
 
 func genFileAccessRule() {
@@ -1199,10 +1250,23 @@ func ValidateWebhookCert() {
 						log.WithFields(log.Fields{"cn": certInfo.cn}).Info("regen")
 						switch certInfo.svcName {
 						case share.CLUSRootCAKey:
-							createCA()
+							if err := CreateCAFilesAndStoreInKv(AdmCACertPath, AdmCAKeyPath); err != nil {
+								// Make it retry.
+								log.WithError(err).Error("failed to create CA file")
+								continue
+							}
+
 						case resource.NvAdmSvcName, resource.NvCrdSvcName:
 							if orchPlatform == share.PlatformKubernetes {
-								signWebhookTlsCert(certInfo.svcName, resource.NvAdmSvcNamespace, certInfo.cn)
+								tlsKeyPath, tlsCertPath := resource.GetTlsKeyCertPath(certInfo.svcName, resource.NvAdmSvcNamespace)
+
+								if err := GenTlsCertWithCaAndStoreInKv(certInfo.cn,
+									tlsCertPath, tlsKeyPath,
+									AdmCACertPath, AdmCAKeyPath, ValidityPeriod{Year: 10}); err != nil {
+									// Make it retry.
+									log.WithError(err).Error("failed to generate Webhook certs")
+									continue
+								}
 							}
 						}
 					} else {
@@ -1216,7 +1280,11 @@ func ValidateWebhookCert() {
 								os.Remove(certInfo.keyPath)
 								os.Remove(certInfo.certPath)
 								log.WithFields(log.Fields{"cn": certInfo.cn}).Info("invalid cert")
-								signWebhookTlsCert(certInfo.svcName, resource.NvAdmSvcNamespace, certInfo.cn)
+								tlsKeyPath, tlsCertPath := resource.GetTlsKeyCertPath(certInfo.svcName, resource.NvAdmSvcNamespace)
+
+								if err := GenTlsCertWithCaAndStoreInKv(certInfo.cn, tlsCertPath, tlsKeyPath, AdmCACertPath, AdmCAKeyPath, ValidityPeriod{Year: 10, Month: 0, Day: 0}); err != nil {
+									log.WithError(err).Error("failed to generate Webhook certs in ValidateWebhookCert()")
+								}
 								cert, _, _ = clusHelper.GetObjectCertRev(certInfo.cn)
 							}
 						}
@@ -1528,9 +1596,14 @@ func upgradeCrdSecurityRule(cfg *share.CLUSCrdSecurityRule) (bool, bool) {
 		return false, false
 	}
 	var upd bool
-	if cfg.ProcessProfile.Baseline != share.ProfileBasic && cfg.ProcessProfile.Baseline != share.ProfileZeroDrift {
-		cfg.ProcessProfile.Baseline = share.ProfileZeroDrift
-		upd = true
+	if utils.DoesGroupHavePolicyMode(cfg.ProfileName) {
+		if cfg.ProcessProfile == nil {
+			cfg.ProcessProfile = &share.CLUSCrdProcessProfile{}
+		}
+		if cfg.ProcessProfile.Baseline != share.ProfileBasic && cfg.ProcessProfile.Baseline != share.ProfileZeroDrift {
+			cfg.ProcessProfile.Baseline = share.ProfileZeroDrift
+			upd = true
+		}
 	}
 	return upd, upd
 }
@@ -1634,4 +1707,12 @@ func initFedScanRevKey() {
 			log.WithFields(log.Fields{"error": err}).Error("Failed to read scan revision key")
 		}
 	}
+}
+
+func upgradeDefSecRisksProfiles() {
+	acc := access.NewAdminAccessControl()
+	// vulnerability profile
+	clusHelper.GetVulnerabilityProfile(share.DefaultVulnerabilityProfileName, acc)
+	// compliance profile
+	clusHelper.GetComplianceProfile(share.DefaultComplianceProfileName, acc)
 }

@@ -51,15 +51,19 @@ func policyInit() {
 	pe.Init(Host.ID, gInfo.hostIPs, Host.TunnelIP, ObtainGroupProcessPolicy, policyApplyDir)
 }
 
+func policySetTimerWheel(aTimerWheel *utils.TimerWheel) {
+	pe.SetTimerWheel(aTimerWheel)
+}
+
 func updateContainerPolicyMode(id, policyMode string) {
 	cid := ""
-	if c, ok := gInfo.activeContainers[id]; ok {
+	if c, ok := gInfoReadActiveContainer(id); ok {
 		//NVSHAS-6719,sometimes the real traffic is pass even the action is block in oc 4.9+
 		//when parent's pid==0, we need to execute func with child first to make sure datapath
 		//is setup correctly
 		if c.pid == 0 {
 			for podID := range c.pods.Iter() {
-				if pod, ok := gInfo.activeContainers[podID.(string)]; ok {
+				if pod, ok := gInfoReadActiveContainer(podID.(string)); ok {
 					if pod.pid != 0 && pod.hasDatapath {
 						cid = podID.(string)
 						break
@@ -68,7 +72,7 @@ func updateContainerPolicyMode(id, policyMode string) {
 			}
 			//log.WithFields(log.Fields{"cid": cid}).Debug("")
 			if cid != "" {
-				if pc, exist := gInfo.activeContainers[cid]; exist {
+				if pc, exist := gInfoReadActiveContainer(cid); exist {
 					if pc.policyMode != policyMode {
 						pc.policyMode = policyMode
 						inline := isContainerInline(pc)
@@ -145,6 +149,17 @@ func systemConfigUnmanagedWl(detectUnmanagedWl bool) {
 	dp.DPCtrlSetDetectUnmanagedWl(&duw)
 }
 
+func systemConfigEnableIcmpPolicy(enableIcmpPolicy bool) {
+	if gInfo.enableIcmpPolicy == enableIcmpPolicy {
+		return
+	}
+	policy.ToggleIcmpPolicy = true
+	gInfo.enableIcmpPolicy = enableIcmpPolicy
+	//set enableIcmpPolicy to dp
+	eip := gInfo.enableIcmpPolicy
+	dp.DPCtrlSetEnableIcmpPolicy(&eip)
+}
+
 func systemConfigProc(nType cluster.ClusterNotifyType, key string, value []byte) {
 	switch nType {
 	case cluster.ClusterNotifyAdd, cluster.ClusterNotifyModify:
@@ -157,16 +172,22 @@ func systemConfigProc(nType cluster.ClusterNotifyType, key string, value []byte)
 		systemConfigXff(conf.XffEnabled)
 		systemConfigNetPolicy(conf.DisableNetPolicy)
 		systemConfigUnmanagedWl(conf.DetectUnmanagedWl)
+		systemConfigEnableIcmpPolicy(conf.EnableIcmpPolicy)
 	case cluster.ClusterNotifyDelete:
 		systemConfigPolicyMode(defaultPolicyMode)
 		systemConfigTapProxymesh(defaultTapProxymesh)
 		systemConfigXff(defaultXffEnabled)
 		systemConfigNetPolicy(defaultDisableNetPolicy)
 		systemConfigUnmanagedWl(defaultDetectUnmanagedWl)
+		systemConfigEnableIcmpPolicy(defaultEnableIcmpPolicy)
 	}
 }
 
+var policyVerVal uint64 = 0
+const polVerMax uint64 = (1<<16-1)
 func initWorkloadPolicyMap() map[string]*policy.WorkloadIPPolicyInfo {
+	policyVerVal++
+	policyVer := uint16(policyVerVal%polVerMax)
 	workloadPolicyMap := make(map[string]*policy.WorkloadIPPolicyInfo)
 	for wlID, c := range gInfo.activeContainers {
 		//container that has no datapath needs not be
@@ -188,6 +209,7 @@ func initWorkloadPolicyMap() map[string]*policy.WorkloadIPPolicyInfo {
 			HostMode:   c.hostMode,
 			CapIntcp:   c.capIntcp,
 			Configured: false,
+			PolVer: policyVer,
 		}
 
 		for _, pair := range c.intcpPairs {
@@ -249,6 +271,31 @@ func mergeWlPolicyConfig(rules []share.CLUSGroupIPPolicy, ruleslen, wlslots, wle
 	return newGroupIPPolicy
 }
 
+func systemConfigPolicyVersionNode(s share.CLUSGroupIPPolicyVer) []share.CLUSGroupIPPolicy {
+	groupIPPolicy := make([]share.CLUSGroupIPPolicy, 0)
+
+	//check whether key "recalculate/policy/groupIPRules" exist
+	rule_key := fmt.Sprintf("%s/", share.CLUSRecalPolicyIPRulesKey(share.PolicyIPRulesDefaultName))
+	if !cluster.Exist(rule_key) {
+		return groupIPPolicy
+	}
+	// indicate network policy version change.
+	newCommonRuleKey := fmt.Sprintf("%s%s/", rule_key, s.PolicyIPRulesVersion)
+	newNodeRuleKey := fmt.Sprintf("%s%s/%s/", rule_key, Host.ID, s.PolicyIPRulesVersion)
+
+	//combine group ip rules from separate slots
+	groupIPPolicy = getPolicyConfig(newCommonRuleKey, s.CommonSlotNo, s.CommonRulesLen)
+	groupNodeIPPolicy := getPolicyConfig(newNodeRuleKey, s.SlotNo, s.RulesLen)
+	if groupIPPolicy != nil && groupNodeIPPolicy != nil {
+		groupIPPolicy = append(groupIPPolicy, groupNodeIPPolicy...)
+	}
+	if groupIPPolicy != nil && len(groupIPPolicy) > 0 && s.WorkloadSlot > 0 && s.WorkloadLen > 0 {
+		groupIPPolicy = mergeWlPolicyConfig(groupIPPolicy, s.RulesLen, s.WorkloadSlot, s.WorkloadLen)
+	}
+	//log.WithFields(log.Fields{"mergelen":len(groupIPPolicy)}).Debug("after merge")
+	return groupIPPolicy
+}
+
 func systemConfigPolicyVersion(s share.CLUSGroupIPPolicyVer) []share.CLUSGroupIPPolicy {
 	groupIPPolicy := make([]share.CLUSGroupIPPolicy, 0)
 
@@ -299,10 +346,23 @@ func systemConfigPolicy(nType cluster.ClusterNotifyType, key string, value []byt
 		nextNetworkPolicyVer = &s // regulator
 	}
 }
+func printOneEnIPPolicy(p *share.CLUSGroupIPPolicy) {
+	/*value, _ := json.Marshal(p)
+	log.WithFields(log.Fields{"value": string(value)}).Debug("")
+	*/
+}
+
+func printEnIPPolicy(groupIPPolicy []share.CLUSGroupIPPolicy) {
+	/*
+	for _, pol := range groupIPPolicy {
+		printOneEnIPPolicy(&pol)
+	}
+	*/
+}
 
 func systemUpdatePolicy(s share.CLUSGroupIPPolicyVer) bool {
-	// log.WithFields(log.Fields{"ver": s.PolicyIPRulesVersion}).Debug()
-	groupIPPolicy := systemConfigPolicyVersion(s)
+	groupIPPolicy := systemConfigPolicyVersionNode(s)
+	//printEnIPPolicy(groupIPPolicy)
 	if len(groupIPPolicy) == 0 {
 		if pe.NetworkPolicy == nil {
 			log.Error("Empty policy")
@@ -362,7 +422,9 @@ func hostPolicyLookup(conn *dp.Connection) (uint32, uint8, bool) {
 		return 0, C.DP_POLICY_ACTION_OPEN, false
 	}
 
-	gInfoRLock()
+	if conn.ClientIP.IsLinkLocalUnicast() || conn.ServerIP.IsLinkLocalUnicast() {
+		return 0, C.DP_POLICY_ACTION_OPEN, false
+	}
 
 	// Use parent's policy if the connection is reported on child
 	var wlID *string
@@ -376,20 +438,17 @@ func hostPolicyLookup(conn *dp.Connection) (uint32, uint8, bool) {
 		conn.ExternalPeer = !isIPInternal(conn.ServerIP)
 	}
 
-	c, ok := gInfo.activeContainers[*wlID]
+	c, ok := gInfoReadActiveContainer(*wlID)
 	if !ok {
-		gInfoRUnlock()
 		return 0, C.DP_POLICY_ACTION_OPEN, false
 	} else if c.parentNS != "" {
-		pc ,exist := gInfo.activeContainers[c.parentNS]
-		if exist {
+		if pc ,exist := gInfoReadActiveContainer(c.parentNS); exist {
 			if pc.pid != 0 {
 				wlID = &c.parentNS
-				c, _ = gInfo.activeContainers[*wlID]
+				c, _ = gInfoReadActiveContainer(*wlID)
 			}
 		} else {
 			if !c.hasDatapath {
-				gInfoRUnlock()
 				log.WithFields(log.Fields{
 					"wlID": *wlID,
 				}).Error("cannot find parent container")
@@ -397,8 +456,6 @@ func hostPolicyLookup(conn *dp.Connection) (uint32, uint8, bool) {
 			}
 		}
 	}
-
-	gInfoRUnlock()
 
 	if !c.hasDatapath {
 		return 0, C.DP_POLICY_ACTION_OPEN, false
@@ -458,9 +515,20 @@ func systemConfigSpecialSubnet(nType cluster.ClusterNotifyType, key string, valu
 		newSpecialSubnets[subnet.Subnet.String()] = subnet
 	}
 
-	if reflect.DeepEqual(specialSubnets, newSpecialSubnets) == false {
-		specialSubnets = newSpecialSubnets
+	if reflect.DeepEqual(policy.SpecialSubnets, newSpecialSubnets) == false {
+		policy.SpecialSubnets = newSpecialSubnets
 		dp.DPCtrlConfigSpecialIPSubnet(newSpecialSubnets)
+	}
+}
+
+func nodeRuleDerivedProc(nType cluster.ClusterNotifyType, key string, value []byte) {
+	which := share.CLUSNodeRuleKey2Subject(key)
+
+	switch which {
+	case share.PolicyIPRulesVersionID:
+		systemConfigPolicy(nType, key, value)
+	default:
+		log.WithFields(log.Fields{"derived": which}).Debug("Miss handler")
 	}
 }
 
@@ -468,8 +536,8 @@ func networkDerivedProc(nType cluster.ClusterNotifyType, key string, value []byt
 	which := share.CLUSNetworkKey2Subject(key)
 
 	switch which {
-	case share.PolicyIPRulesVersionID:
-		systemConfigPolicy(nType, key, value)
+	//case share.PolicyIPRulesVersionID:
+		//systemConfigPolicy(nType, key, value)
 	case share.InternalIPNetDefaultName:
 		systemConfigInternalSubnet(nType, key, value)
 	case share.SpecialIPNetDefaultName:
@@ -741,7 +809,7 @@ func updateWorkloadDlpRuleConfig(DlpWlRules []*share.CLUSDlpWorkloadRule, dlprul
 		if dre == nil {
 			continue
 		}
-		if c, ok := gInfo.activeContainers[dre.WorkloadId]; ok {
+		if c, ok := gInfoReadActiveContainer(dre.WorkloadId); ok {
 			if c.hasDatapath {
 				dlpWlRule := dp.DPWorkloadDlpRule{
 					WlID:          dre.WorkloadId,
@@ -764,7 +832,7 @@ func updateWorkloadDlpRuleConfig(DlpWlRules []*share.CLUSDlpWorkloadRule, dlprul
 					wlmacs.Add(pair.MAC.String())
 				}
 				//we need to detect traffic between sidecar and service container
-				if gInfo.tapProxymesh && c.info.ProxyMesh {
+				if gInfo.tapProxymesh && isProxyMesh(c) {
 					lomac_str := fmt.Sprintf(container.KubeProxyMeshLoMacStr, (c.pid>>8)&0xff, c.pid&0xff)
 					dlpWlRule.WorkloadMac = append(dlpWlRule.WorkloadMac, lomac_str)
 					wlmacs.Add(lomac_str)
@@ -1096,6 +1164,8 @@ func systemUpdateProc(nType cluster.ClusterNotifyType, key string, value []byte)
 		networkDerivedProc(nType, key, value)
 	case share.CLUSNodeStore:
 		profileDerivedProc(nType, share.CLUSNodeProfileSubkey(key), value)
+	case share.CLUSNodeRuleStore:
+		nodeRuleDerivedProc(nType, key, value)
 	}
 }
 

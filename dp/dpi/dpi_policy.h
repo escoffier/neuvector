@@ -34,6 +34,7 @@ typedef struct dpi_policy_desc_ {
 #define POLICY_DESC_MESH_TO_SVR    0x0080
 #define POLICY_DESC_LINK_LOCAL     0x0100
 #define POLICY_DESC_TMP_OPEN       0x0200
+#define POLICY_DESC_UWLIP          0x0400
     uint16_t hdl_ver;
     uint32_t order;
 } dpi_policy_desc_t;
@@ -95,6 +96,8 @@ int dpi_policy_lookup(dpi_packet_t *p, dpi_policy_hdl_t *hdl, uint32_t app,
 int dpi_policy_reeval(dpi_packet_t *p, bool to_server);
 int dpi_policy_init();
 int snooped_fqdn_ipv4_mapping(char *name, uint32_t *ip, int cnt);
+int sniff_ip_fqdn_storage(char *name, uint32_t *ip, int cnt);
 void dpi_unknown_ip_init(void);
+void dpi_ip_fqdn_storage_init(void);
 
 #endif

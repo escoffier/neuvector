@@ -54,6 +54,9 @@ type CacheInterface interface {
 	GetAllWorkloadsRisk(acc *access.AccessControl) []*common.WorkloadRisk
 	GetWorkloadRisk(id string, acc *access.AccessControl) (*common.WorkloadRisk, error)
 	CanAccessWorkload(id string, acc *access.AccessControl) error
+	GetAllWorkloadsID(acc *access.AccessControl, filteredMap map[string]bool) []string
+	GetAllHostsID(acc *access.AccessControl, filteredMap map[string]bool) []string
+	GetPlatformID(acc *access.AccessControl, filteredMap map[string]bool) string
 
 	GetAllGroups(scope, view string, withCap bool, acc *access.AccessControl) [][]*api.RESTGroup
 	GetAllGroupsBrief(scope string, withCap bool, acc *access.AccessControl) [][]*api.RESTGroupBrief
@@ -145,7 +148,7 @@ type CacheInterface interface {
 	ScanPlatform(acc *access.AccessControl) error
 
 	GetAllScanners(acc *access.AccessControl) []*api.RESTScanner
-	GetScannerCount(acc *access.AccessControl) int
+	GetScannerCount(acc *access.AccessControl) (int, string, string)
 	GetScanConfig(acc *access.AccessControl) (*api.RESTScanConfig, error)
 	GetScanStatus(acc *access.AccessControl) (*api.RESTScanStatus, error)
 	GetScanPlatformSummary(acc *access.AccessControl) (*api.RESTScanPlatformSummary, error)
@@ -161,11 +164,12 @@ type CacheInterface interface {
 	GetAllVulnerabilityProfiles(acc *access.AccessControl) []*api.RESTVulnerabilityProfile
 
 	// Admission control - non-UI
-	SyncAdmCtrlStateToK8s(svcName, nvAdmName string) (bool, error)
+	SyncAdmCtrlStateToK8s(svcName, nvAdmName string, updateDetected bool) (bool, error)
 	WaitUntilApiPathReady() bool
 	IsImageScanned(c *nvsysadmission.AdmContainerInfo) (bool, int, int)
 	MatchK8sAdmissionRules(admType string, admResObject *nvsysadmission.AdmResObject, c *nvsysadmission.AdmContainerInfo,
-		matchData *nvsysadmission.AdmMatchData, stamps *api.AdmCtlTimeStamps, ar *admissionv1beta1.AdmissionReview) (*nvsysadmission.AdmResult, bool)
+		matchData *nvsysadmission.AdmMatchData, stamps *api.AdmCtlTimeStamps, ar *admissionv1beta1.AdmissionReview,
+		containerType string, forTesting bool) (*nvsysadmission.AdmResult, bool)
 	IsAdmControlEnabled(uri *string) (bool, string, int, string, string)
 	UpdateLocalAdmCtrlStats(category string, stats int) error
 	IncrementAdmCtrlProcessing()
@@ -214,6 +218,7 @@ type CacheInterface interface {
 	GetDlpRuleNames() *[]string
 	GetDlpRuleSensorGroupById(id uint32) (string, string, *[]string)
 	GetNewServicePolicyMode() string
+	GetNewServiceProfileBaseline() string
 	GetUnusedGroupAging() uint8
 	GetNetServiceStatus() bool
 	GetNetServicePolicyMode() string

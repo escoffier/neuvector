@@ -42,6 +42,8 @@ var auditLogCache []*share.CLUSAuditLog
 var auditMutex sync.Mutex
 var fqdnIpCache []*share.CLUSFqdnIp
 var fqdnIpMutex sync.Mutex
+var ipFqdnStorageCache map[string]string = make(map[string]string)
+var ipFqdnStorageMutex sync.Mutex
 
 const reportInterval uint32 = 5
 const statsInterval uint32 = 5
@@ -54,6 +56,7 @@ var nextConnectReportTick uint32 = reportInterval
 
 ///
 const memoryRecyclePeriod uint32 = 10                       // minutes
+const memoryCheckPeriod uint32 = 5                          // minutes
 const memEnforcerMediumPeak uint64 = 3 * 512 * 1024 * 1024  // 1.5 GB
 const memEnforcerTopPeak uint64 = 2 * memEnforcerMediumPeak // 3.0 GB
 const memSafeGap uint64 = 64 * 1024 * 1024                  // 64 MB
@@ -62,15 +65,30 @@ var memStatsEnforcerResetMark uint64 = memEnforcerTopPeak - memSafeGap
 func statsLoop(bPassiveContainerDetect bool) {
 	statsTicker := time.Tick(time.Second * time.Duration(statsInterval))
 	memStatsTicker := time.NewTicker(time.Minute * time.Duration(memoryRecyclePeriod))
+	memCheckTicker := time.NewTicker(time.Minute * time.Duration(memoryCheckPeriod))
+
+	agentEnv.memoryLimit = memEnforcerTopPeak
+	if limit, err := global.SYS.GetContainerMemoryLimitUsage(agentEnv.cgroupMemory); err == nil && limit > 0 {
+		agentEnv.memoryLimit = limit
+	}
+	agentEnv.snapshotMemStep = agentEnv.memoryLimit / 10
+	memSnapshotMark := agentEnv.memoryLimit * 3 / 5          // 60% as starting point
+	memStatsEnforcerResetMark = agentEnv.memoryLimit * 3 / 4 // 75% as starting point
+	if agentEnv.autoProfieCapture > 1 {
+		var mark uint64 = (uint64)(agentEnv.autoProfieCapture * 1024 * 1024) // into mega bytes
+		memSnapshotMark = mark * 3 / 5
+		agentEnv.snapshotMemStep = mark / 10
+	}
+
+	if agentEnv.autoProfieCapture > 0 {
+		log.WithFields(log.Fields{"Step": agentEnv.snapshotMemStep, "Snapshot_At": memSnapshotMark}).Info("Memory Snapshots")
+	} else {
+		memCheckTicker.Stop()
+	}
 	if agentEnv.runWithController { // effctive by the enforcer alone
 		memStatsTicker.Stop()
 	} else {
-		if limit, err := global.SYS.GetContainerMemoryLimitUsage(agentEnv.cgroupMemory); err == nil {
-			if limit/2 > memSafeGap {
-				memStatsEnforcerResetMark = limit/2 - memSafeGap
-			}
-			log.WithFields(log.Fields{"Limit": limit, "Controlled_At": memStatsEnforcerResetMark}).Info("Memory Resource")
-		}
+		log.WithFields(log.Fields{"Controlled_Limit": agentEnv.memoryLimit, "Controlled_At": memStatsEnforcerResetMark}).Info("Memory Resource")
 		go global.SYS.MonitorMemoryPressureEvents(memStatsEnforcerResetMark, memoryPressureNotification)
 	}
 
@@ -94,10 +112,17 @@ func statsLoop(bPassiveContainerDetect bool) {
 			gInfoRLock()
 			gone := gInfo.allContainers.Difference(existing)
 			creates := existing.Difference(gInfo.allContainers)
-			if stops != nil {
-				stops = gInfo.allContainers.Intersect(stops)
-			}
 			gInfoRUnlock()
+			if stops != nil {
+				// differentiate from active containers
+				for id := range stops.Iter() {
+					cid := id.(string)
+					if _, ok := gInfoReadActiveContainer(cid); !ok {
+						stops.Remove(cid)
+					}
+				}
+			}
+
 			if stops != nil {
 				for id := range stops.Iter() {
 					log.WithFields(log.Fields{"id": id.(string)}).Debug("Found stop container")
@@ -119,14 +144,19 @@ func statsLoop(bPassiveContainerDetect bool) {
 			creates.Clear()
 			gone, creates = nil, nil
 		case <-memStatsTicker.C:
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
-			agentMem := m.TotalAlloc
-			cgroupMem, _ := global.SYS.GetContainerMemoryUsage(agentEnv.cgroupMemory)
-			if cgroupMem > memEnforcerMediumPeak && ((cgroupMem - agentMem) > 2*agentMem) { // the gap is greater
-				global.SYS.ReCalculateMemoryMetrics(memEnforcerMediumPeak)
-			} else {
-				global.SYS.ReCalculateMemoryMetrics(memStatsEnforcerResetMark)
+			if mStats, err := global.SYS.GetContainerMemoryStats(); err == nil && mStats.WorkingSet > memStatsEnforcerResetMark {
+				var m runtime.MemStats
+				runtime.ReadMemStats(&m)
+				agentMem := m.TotalAlloc
+				if mStats.WorkingSet > memEnforcerMediumPeak && ((mStats.WorkingSet - agentMem) > 2*agentMem) { // the gap is greater
+					global.SYS.ReCalculateMemoryMetrics(memEnforcerMediumPeak)
+				} else {
+					global.SYS.ReCalculateMemoryMetrics(memStatsEnforcerResetMark)
+				}
+			}
+		case <-memCheckTicker.C:
+			if mStats, err := global.SYS.GetContainerMemoryStats(); err == nil && mStats.WorkingSet > memSnapshotMark {
+				memorySnapshot(mStats.WorkingSet)
 			}
 		}
 	}
@@ -165,6 +195,17 @@ func dpTaskCallback(task *dp.DPTask) {
 		fqdnIpMutex.Lock()
 		fqdnIpCache = append(fqdnIpCache, task.Fqdns)
 		fqdnIpMutex.Unlock()
+	case dp.DP_TASK_IP_FQDN_STORAGE_UPDATE:
+		ipFqdnStorageMutex.Lock()
+		ip := task.FqdnStorageUpdate.IP.String()
+		name := task.FqdnStorageUpdate.Name
+		ipFqdnStorageCache[ip] = name
+		ipFqdnStorageMutex.Unlock()
+	case dp.DP_TASK_IP_FQDN_STORAGE_RELEASE:
+		ipFqdnStorageMutex.Lock()
+		ip := task.FqdnStorageRelease.String()
+		delete(ipFqdnStorageCache, ip)
+		ipFqdnStorageMutex.Unlock()
 	case dp.DP_TASK_CONNECTION:
 		connsCacheMutex.Lock()
 		connsCache = append(connsCache, task.Connects...)
@@ -182,15 +223,25 @@ func dpTaskCallback(task *dp.DPTask) {
 }
 
 func updateAgentStats(cpuSystem uint64) {
-	mem, _ := global.SYS.GetContainerMemoryUsage(agentEnv.cgroupMemory)
-	cpu, _ := global.SYS.GetContainerCPUUsage(agentEnv.cgroupCPUAcct)
+	var mem, cpu uint64 = 0, 0
+	if agentEnv.cgroupMemory != "" {
+		mem, _ = global.SYS.GetContainerMemoryUsage(agentEnv.cgroupMemory)
+	}
+	if agentEnv.cgroupCPUAcct != "" {
+		cpu, _ = global.SYS.GetContainerCPUUsage(agentEnv.cgroupCPUAcct)
+	}
 	system.UpdateStats(&gInfo.agentStats, mem, cpu, cpuSystem)
 }
 
 func updateContainerStats(cpuSystem uint64) {
 	for _, c := range gInfo.activeContainers {
-		mem, _ := global.SYS.GetContainerMemoryUsage(c.cgroupMemory)
-		cpu, _ := global.SYS.GetContainerCPUUsage(c.cgroupCPUAcct)
+		var mem, cpu uint64 = 0, 0
+		if c.cgroupMemory != "" {
+			mem, _ = global.SYS.GetContainerMemoryUsage(c.cgroupMemory)
+		}
+		if c.cgroupCPUAcct != "" {
+			cpu, _ = global.SYS.GetContainerCPUUsage(c.cgroupCPUAcct)
+		}
 		system.UpdateStats(&c.stats, mem, cpu, cpuSystem)
 	}
 }
@@ -331,7 +382,7 @@ func updateConnection() {
 				// get the child container too
 				gInfoRLock()
 				for id, con := range gInfo.activeContainers {
-					if _, parent := getSharedContainer(con.info); parent != nil && parent.id == c.id {
+					if _, parent := getSharedContainerWithLock(con.info); parent != nil && parent.id == c.id {
 						ids = append(ids, id)
 					}
 				}
@@ -349,13 +400,9 @@ func updateConnection() {
 }
 
 func updateSidecarConnection(conn *dp.Connection, id string) {
-	gInfoRLock()
-	defer gInfoRUnlock()
-
-	c, ok := gInfo.activeContainers[id]
-	if ok {
+	if c, ok := gInfoReadActiveContainer(id); ok {
 		for podID := range c.pods.Iter() {
-			if pod, ok := gInfo.activeContainers[podID.(string)]; ok {
+			if pod, ok := gInfoReadActiveContainer(podID.(string)); ok {
 				if pod.info.Sidecar {
 					if conn.Ingress {
 						conn.ClientWL = podID.(string)
@@ -461,27 +508,21 @@ func updateHostConnection(conns []*dp.ConnectionData) {
 		}
 
 		// To be consistent with non-host-mode platform container, ignore the connection reprot
-		gInfoRLock()
-		c, ok := gInfo.activeContainers[*id]
+		c, ok := gInfoReadActiveContainer(*id)
 		if !ok {
-			gInfoRUnlock()
 			continue
 		} else if c.parentNS != "" {
 			*id = c.parentNS
-			c, ok = gInfo.activeContainers[*id]
-			if !ok {
+			if c, ok = gInfoReadActiveContainer(*id); !ok {
 				log.WithFields(log.Fields{
 					"wlID": *id,
 				}).Error("cannot find parent container")
-				gInfoRUnlock()
 				continue
 			}
 		}
-		if c.pid !=0 && !c.hasDatapath {
-			gInfoRUnlock()
+		if c.pid != 0 && !c.hasDatapath {
 			continue
 		}
-		gInfoRUnlock()
 
 		conn.AgentID = Agent.ID
 		conn.HostID = Host.ID
@@ -522,6 +563,15 @@ func updateHostConnection(conns []*dp.ConnectionData) {
 const connectionListMax int = 2048 * 4
 
 func conn2CLUS(c *dp.Connection) *share.CLUSConnection {
+	fqdn := ""
+	ipFqdnStorageMutex.Lock()
+	if c.ExternalPeer && len(ipFqdnStorageCache) > 0 {
+		if name, ok := ipFqdnStorageCache[net.IP(c.ServerIP).String()]; ok {
+			fqdn = name
+		}
+	}
+	ipFqdnStorageMutex.Unlock()
+
 	return &share.CLUSConnection{
 		AgentID:      c.AgentID,
 		HostID:       c.HostID,
@@ -554,6 +604,8 @@ func conn2CLUS(c *dp.Connection) *share.CLUSConnection {
 		MeshToSvr:    c.MeshToSvr,
 		LinkLocal:    c.LinkLocal,
 		TmpOpen:      c.TmpOpen,
+		UwlIp:        c.UwlIp,
+		FQDN:         fqdn,
 	}
 }
 

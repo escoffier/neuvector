@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"sync"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/neuvector/neuvector/controller/common"
 	"github.com/neuvector/neuvector/controller/kv"
 	"github.com/neuvector/neuvector/controller/resource"
+	"github.com/neuvector/neuvector/db"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/cluster"
 	"github.com/neuvector/neuvector/share/utils"
@@ -102,6 +104,8 @@ var grpSvcIpByDomainMap map[string]utils.Set = make(map[string]utils.Set) //key 
 var addr2ExtIpMap map[string][]net.IP = make(map[string][]net.IP)         //key svc cluster ip, value is externalIPs
 var extIp2addrMap map[string]net.IP = make(map[string]net.IP)             //key externalIP, value is svc cluster ip
 var addr2ExtIpRefreshMap map[string]bool = make(map[string]bool)          //key svc cluster ip
+var fqdn2GrpMap map[string]utils.Set = make(map[string]utils.Set)         //fqdn->group name(s)
+var grp2FqdnMap map[string]utils.Set = make(map[string]utils.Set)         //group->fqdn name(s)
 
 func getSvcAddrGroupNameByExtIP(ip net.IP, port uint16) string {
 	if addrip, ok := extIp2addrMap[ip.String()]; ok {
@@ -349,7 +353,9 @@ func isNeuvectorContainerGroup(group string) bool {
 				name == "nv.neuvector-scanner-pod" ||
 				name == "nv.neuvector-controller-pod" ||
 				name == "nv.neuvector-enforcer-pod" ||
-				name == "nv.neuvector-updater-pod" {
+				name == "nv.neuvector-updater-pod" ||
+				name == "nv.neuvector-csp-pod" ||
+				name == "nv.neuvector-registry-adapter-pod" {
 				return true
 			}
 		}
@@ -367,6 +373,13 @@ func groupConfigUpdate(nType cluster.ClusterNotifyType, key string, value []byte
 		// post-3.2.2 enforcer report nv containers to controller, if the controller happens to be pre-3.2.2,
 		// for example, in upgrade case, the group will be created. This is to remove the group as we see it.
 		if isNeuvectorContainerGroup(group.Name) {
+			lock, err := clusHelper.AcquireLock(share.CLUSLockPolicyKey, clusterLockWait)
+			if err != nil {
+				log.WithFields(log.Fields{"error": err}).Error("Acquire lock error")
+				return
+			}
+			defer clusHelper.ReleaseLock(lock)
+
 			kv.DeletePolicyByGroup(group.Name)
 			kv.DeleteResponseRuleByGroup(group.Name)
 			clusHelper.DeleteGroup(group.Name)
@@ -375,7 +388,8 @@ func groupConfigUpdate(nType cluster.ClusterNotifyType, key string, value []byte
 		}
 
 		// CRD group cannot change mode but it is scorable
-		capChgMode := utils.DoesGroupHavePolicyMode(group.Name) && (group.CfgType == share.Learned || group.Name == api.AllHostGroup)
+		capChgMode := utils.DoesGroupHavePolicyMode(group.Name) &&
+			(group.CfgType == share.Learned || (group.Name == api.AllHostGroup && group.CfgType != share.GroundCfg))
 		capScorable := utils.DoesGroupHavePolicyMode(group.Name)
 
 		cache := initGroupCache(group.CfgType, group.Name)
@@ -480,6 +494,10 @@ func groupConfigUpdate(nType cluster.ClusterNotifyType, key string, value []byte
 		} else {
 			refreshGroupMember(cache)
 			groupCacheMap[group.Name] = cache
+			//for imported empty group
+			if cache.members.Cardinality() == 0 && cacher.GetUnusedGroupAging() != 0 {
+				scheduleGroupRemoval(cache)
+			}
 		}
 		if ok := isCreateDlpGroup(&group); ok {
 			createDlpGroup(group.Name, group.CfgType)
@@ -538,26 +556,31 @@ func groupConfigUpdate(nType cluster.ClusterNotifyType, key string, value []byte
 		}
 		cacheMutexUnlock()
 
+		if cache != nil && cache.group.Kind == share.GroupKindAddress {
+			deleteFqdn2Group(cache)
+		}
 		if cache != nil && !isIPSvcGrpHidden(cache) {
 			evhdls.Trigger(EV_GROUP_DELETE, name, cache)
 		}
 
-		err1 := clusHelper.DeleteProcessProfile(name)
-		err2 := clusHelper.DeleteFileMonitor(name)
-		if cache != nil && cache.group != nil {
-			if isLeader() && cache.group.CfgType == share.FederalCfg && (err1 == nil || err2 == nil) {
-				fedRole := fedMembershipCache.FedRole
-				if fedRole != api.FedRoleNone {
-					// it's not demote/leave/kicked from fed
-					clusHelper.UpdateFedRulesRevision([]string{share.FedProcessProfilesType, share.FedFileMonitorProfilesType})
-				}
-			}
-			if cache.group.Kind == share.GroupKindContainer {
-				clusHelper.DeleteDlpGroup(name)
-				clusHelper.DeleteWafGroup(name)
+		var err error
+		txn := cluster.Transact()
+		clusHelper.DeleteProcessProfileTxn(txn, name)
+		clusHelper.DeleteFileMonitorTxn(txn, name)
+		if cache != nil && cache.group != nil && cache.group.Kind == share.GroupKindContainer {
+			clusHelper.DeleteDlpGroup(txn, name)
+			clusHelper.DeleteWafGroup(txn, name)
+		}
+		clusHelper.DeleteCustomCheckConfig(txn, name)
+		_, err = txn.Apply()
+		txn.Close()
+
+		if isLeader() && fedMembershipCache.FedRole != api.FedRoleNone && err == nil {
+			if cache != nil && cache.group != nil && cache.group.CfgType == share.FederalCfg {
+				// it's not demote/leave/kicked from fed
+				clusHelper.UpdateFedRulesRevision([]string{share.FedProcessProfilesType, share.FedFileMonitorProfilesType})
 			}
 		}
-		clusHelper.DeleteCustomCheckConfig(name)
 	}
 }
 
@@ -582,41 +605,6 @@ func deleteServiceIPGroup(domain, name string, gCfgType share.TCfgType) {
 		}
 	}
 
-	// Remove all rules that use the group
-	dels := utils.NewSet()
-	keeps := make([]*share.CLUSRuleHead, 0)
-
-	crhs := clusHelper.GetPolicyRuleList()
-	for _, crh := range crhs {
-		if cr, _ := clusHelper.GetPolicyRule(crh.ID); cr != nil {
-			//if cr.From == gname || cr.To == gname {
-			if (cr.CfgType != share.GroundCfg) && (gname == cr.From || gname == cr.To) {
-				// To be deleted if it's not crd policies. crd policies can only be deleted thru k8s
-				dels.Add(crh.ID)
-			} else {
-				keeps = append(keeps, crh)
-			}
-		}
-	}
-
-	// Write updated rules to the cluster
-	if dels.Cardinality() > 0 {
-		txn := cluster.Transact()
-		defer txn.Close()
-
-		clusHelper.PutPolicyRuleListTxn(txn, keeps)
-		for id := range dels.Iter() {
-			clusHelper.DeletePolicyRuleTxn(txn, id.(uint32))
-		}
-		if ok, err := txn.Apply(); err != nil {
-			log.WithFields(log.Fields{"error": err}).Error("")
-			return
-		} else if !ok {
-			log.Error("Atomic write failed")
-			return
-		}
-	}
-	//leave delete group related rule outside of lock
 	lock, err := clusHelper.AcquireLock(share.CLUSLockPolicyKey, policyClusterLockWait)
 	if err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("Acquire lock error")
@@ -624,6 +612,47 @@ func deleteServiceIPGroup(domain, name string, gCfgType share.TCfgType) {
 	}
 	defer clusHelper.ReleaseLock(lock)
 
+	//NVSHAS-7003, deleteServiceIPGroup hold lock for too long
+	//because when we delete service ip group we also delete related policy.
+	//In k8s there are really no policy can be learned related to service ip,
+	//so we can omit this part for k8s platform, we only delete related policy
+	//for oc platform
+	if !policyApplyIngress {
+		// Remove all rules that use the group
+		dels := utils.NewSet()
+		keeps := make([]*share.CLUSRuleHead, 0)
+
+		crhs := clusHelper.GetPolicyRuleList()
+		for _, crh := range crhs {
+			if cr, _ := clusHelper.GetPolicyRule(crh.ID); cr != nil {
+				//if cr.From == gname || cr.To == gname {
+				if (cr.CfgType != share.GroundCfg) && (gname == cr.From || gname == cr.To) {
+					// To be deleted if it's not crd policies. crd policies can only be deleted thru k8s
+					dels.Add(crh.ID)
+				} else {
+					keeps = append(keeps, crh)
+				}
+			}
+		}
+
+		// Write updated rules to the cluster
+		if dels.Cardinality() > 0 {
+			txn := cluster.Transact()
+			defer txn.Close()
+
+			clusHelper.PutPolicyRuleListTxn(txn, keeps)
+			for id := range dels.Iter() {
+				clusHelper.DeletePolicyRuleTxn(txn, id.(uint32))
+			}
+			if ok, err := txn.Apply(); err != nil {
+				log.WithFields(log.Fields{"error": err}).Error("")
+				return
+			} else if !ok {
+				log.Error("Atomic write failed")
+				return
+			}
+		}
+	}
 	if gCfgType != share.GroundCfg {
 		// crd nv.ip.xxx group can only be deleted thru k8s
 		clusHelper.DeleteGroup(gname)
@@ -977,6 +1006,9 @@ type groupRemovalEvent struct {
 	groupname string
 }
 
+var emptyGroups []string
+var emptyGroupsMutex sync.Mutex
+
 func (p *groupRemovalEvent) Expire() {
 	cacheMutexLock()
 	if cache, ok := groupCacheMap[p.groupname]; ok {
@@ -992,18 +1024,61 @@ func (p *groupRemovalEvent) Expire() {
 		//always reset task whether group
 		//is really deleted or not
 		cache.timerTask = ""
-		deleted := deleteGroupFromCluster(p.groupname)
 		cacheMutexUnlock()
 
-		//leave delete policy by group outside any lock
-		//so that not to hold lock too long
-		if deleted {
-			kv.DeletePolicyByGroup(p.groupname)
-			kv.DeleteResponseRuleByGroup(p.groupname)
-			groupRemoveEvent(share.CLUSEvGroupAutoRemove, p.groupname)
-		}
+		//log.WithFields(log.Fields{"group": p.groupname}).Info("To be deleted")
+		emptyGroupsMutex.Lock()
+		emptyGroups = append(emptyGroups, p.groupname)
+		emptyGroupsMutex.Unlock()
 	} else {
 		cacheMutexUnlock()
+	}
+}
+
+func rmEmptyGroupsFromCluster() {
+	if isLeader() == false {
+		return
+	}
+	emptyGroupsMutex.Lock()
+	groups := emptyGroups
+	emptyGroups = nil
+	emptyGroupsMutex.Unlock()
+
+	if len(groups) <= 0 {
+		return
+	}
+
+	lock, err := clusHelper.AcquireLock(share.CLUSLockPolicyKey, clusterLockWait)
+	if err != nil {
+		log.WithFields(log.Fields{"error": err}).Error("Acquire lock error")
+		return
+	}
+	defer clusHelper.ReleaseLock(lock)
+
+	//log.WithFields(log.Fields{"groups": groups}).Debug("")
+	kv.DeletePolicyByGroups(groups)
+	kv.DeleteResponseRuleByGroups(groups)
+
+	accAll := access.NewAdminAccessControl()
+	txn := cluster.Transact()
+	defer txn.Close()
+
+	for _, name := range groups {
+		cg, _, _ := clusHelper.GetGroup(name, accAll)
+		if cg == nil {
+			log.WithFields(log.Fields{"group": name}).Error("Group doesn't exist in kv")
+			if _, ok := groupCacheMap[name]; ok {
+				delete(groupCacheMap, name)
+			}
+		} else {
+			clusHelper.DeleteGroupTxn(txn, name)
+		}
+	}
+	if ok, err1 := txn.Apply(); err1 != nil || !ok {
+		log.WithFields(log.Fields{"ok": ok, "error": err1}).Error("Atomic write to the cluster failed")
+	}
+	for _, name := range groups {
+		groupRemoveEvent(share.CLUSEvGroupAutoRemove, name)
 	}
 }
 
@@ -1033,6 +1108,10 @@ func deleteGroupFromCluster(groupname string) bool {
 			return false
 		}
 	}
+	//needs to execute delete function inside lock
+	//to keep the integrity of policy ruleHeads
+	kv.DeletePolicyByGroup(groupname)
+	kv.DeleteResponseRuleByGroup(groupname)
 	return true
 }
 
@@ -1073,7 +1152,7 @@ func scheduleGroupRemoval(cache *groupCache) {
 	//NVSHAS-7791, because our timer-wheel’s one round duration is 1 hour
 	//task may not be scheduled into current slot which cause it to wait
 	//for 1 more hour to expire. Add additional 10sec to avoid this.
-	groupRemovalDelay := time.Duration(time.Hour * unusedGrpAge) + groupsRemovalAdditionalDelay
+	groupRemovalDelay := time.Duration(time.Hour*unusedGrpAge) + groupsRemovalAdditionalDelay
 
 	task := &groupRemovalEvent{
 		groupname: cache.group.Name,
@@ -1175,6 +1254,7 @@ func hostWorkloadStart(id string, param interface{}) {
 		}
 		host.runningCntrs.Add(wl.ID)
 		host.workloads.Add(wl.ID)
+		db.UpdateHostContainers(wl.HostID, host.workloads.Cardinality())
 	}
 }
 
@@ -1202,6 +1282,36 @@ func hostWorkloadDelete(id string, param interface{}) {
 		host.runningPods.Remove(wl.ID)
 		host.runningCntrs.Remove(wl.ID)
 		host.workloads.Remove(wl.ID)
+		db.UpdateHostContainers(wl.HostID, host.workloads.Cardinality())
+	}
+}
+
+func addImageRelatedContainer2group(cache *groupCache, wlc *workloadCache) {
+	for _, ct := range cache.group.Criteria {
+		if ct.Key != share.CriteriaKeyImage {
+			return
+		}
+	}
+	if cache.group.CfgType != share.Learned {
+		if wlc.workload.ShareNetNS != "" {
+			if pwlc, ok := wlCacheMap[wlc.workload.ShareNetNS]; ok {
+				cache.members.Add(pwlc.workload.ID)
+				pwlc.groups.Add(cache.group.Name)
+				for child := range pwlc.children.Iter() {
+					if childCache, ok1 := wlCacheMap[child.(string)]; ok1 {
+						cache.members.Add(childCache.workload.ID)
+						childCache.groups.Add(cache.group.Name)
+					}
+				}
+			}
+		} else {
+			for child := range wlc.children.Iter() {
+				if childCache, ok := wlCacheMap[child.(string)]; ok {
+					cache.members.Add(childCache.workload.ID)
+					childCache.groups.Add(cache.group.Name)
+				}
+			}
+		}
 	}
 }
 
@@ -1271,7 +1381,8 @@ func groupWorkloadJoin(id string, param interface{}) {
 				memberUpdated = true
 				log.WithFields(log.Fields{"group": cache.group.Name}).Debug("Join group")
 			}
-
+			//NVSHAS-8136, container is selected based on image=xxx criteria, add related containers to group
+			addImageRelatedContainer2group(cache, wlc)
 			if bHasGroupProfile {
 				dptCustomGrpAdds.Add(cache.group.Name)
 			}
@@ -1323,6 +1434,47 @@ func svcipGroupJoin(svcipcache *groupCache) {
 	}
 }
 
+func updateFqdn2Group(cache *groupCache) {
+	deleteFqdn2Group(cache)
+	for _, ct := range cache.group.Criteria {
+		if ct.Key == share.CriteriaKeyAddress {
+			if a := getIPList(ct.Value); a == nil {
+				fqdname := ct.Value
+				if strings.HasPrefix(fqdname, share.CLUSWLFqdnVhPrefix) {
+					fqdname = fqdname[len(share.CLUSWLFqdnVhPrefix):]
+				}
+				if fqdn2GrpMap[fqdname] == nil {
+					fqdn2GrpMap[fqdname] = utils.NewSet()
+				}
+				fqdn2GrpMap[fqdname].Add(cache.group.Name)
+
+				if grp2FqdnMap[cache.group.Name] == nil {
+					grp2FqdnMap[cache.group.Name] = utils.NewSet()
+				}
+				grp2FqdnMap[cache.group.Name].Add(fqdname)
+			}
+		}
+	}
+}
+
+func deleteFqdn2Group(cache *groupCache) {
+	if gfqs, ok := grp2FqdnMap[cache.group.Name]; ok {
+		for fq := range gfqs.Iter() {
+			fqn := fq.(string)
+			if f2gs, ok1 := fqdn2GrpMap[fqn]; ok1 {
+				f2gs.Remove(cache.group.Name)
+				if f2gs.Cardinality() == 0 {
+					delete(fqdn2GrpMap, fqn)
+				}
+			}
+		}
+		if gfqs != nil {
+			gfqs.Clear()
+		}
+		delete(grp2FqdnMap, cache.group.Name)
+	}
+}
+
 func refreshGroupMember(cache *groupCache) {
 	// Remove group from it's members' group list
 	for m := range cache.members.Iter() {
@@ -1337,6 +1489,10 @@ func refreshGroupMember(cache *groupCache) {
 	if cache.group.Kind == share.GroupKindNode {
 		cache.members.Add("") // for all nodes
 		return
+	}
+
+	if cache.group.Kind == share.GroupKindAddress {
+		updateFqdn2Group(cache)
 	}
 
 	if cache.group.Kind != share.GroupKindContainer {
@@ -1380,6 +1536,8 @@ func refreshGroupMember(cache *groupCache) {
 		if share.IsGroupMember(cache.group, wlc.workload, getDomainData(wlc.workload.Domain)) {
 			cache.members.Add(wlc.workload.ID)
 			wlc.groups.Add(cache.group.Name)
+			//NVSHAS-8136, container is selected based on image=xxx criteria, add related containers to group
+			addImageRelatedContainer2group(cache, wlc)
 
 			if cache.group.CfgType == share.Learned && common.OEMIgnoreWorkload(wlc.workload) {
 				cache.oemHide = true
@@ -1700,16 +1858,21 @@ func (m CacheMethod) DeleteGroupCache(name string, acc *access.AccessControl) er
 		delete(groupCacheMap, name)
 	}
 	cacheMutexUnlock()
+
+	txn := cluster.Transact()
 	//delete group related policy
-	clusHelper.DeleteProcessProfile(name)
-	clusHelper.DeleteFileMonitor(name)
+	clusHelper.DeleteProcessProfileTxn(txn, name)
+	clusHelper.DeleteFileMonitorTxn(txn, name)
 	if cache != nil && cache.group != nil {
 		if cache.group.Kind == share.GroupKindContainer {
-			clusHelper.DeleteDlpGroup(name)
-			clusHelper.DeleteWafGroup(name)
+			clusHelper.DeleteDlpGroup(txn, name)
+			clusHelper.DeleteWafGroup(txn, name)
 		}
 	}
-	clusHelper.DeleteCustomCheckConfig(name)
+	clusHelper.DeleteCustomCheckConfig(txn, name)
+	txn.Apply()
+	txn.Close()
+
 	return nil
 }
 
@@ -1816,6 +1979,7 @@ func group2Service(gc *groupCache, view string, withCap bool) *api.RESTService {
 		Domain:          gc.group.Domain,
 		PlatformRole:    gc.group.PlatformRole,
 		BaselineProfile: gc.group.BaselineProfile,
+		Comment:         gc.group.Comment,
 	}
 	if withCap {
 		sv.CapChgMode = &gc.capChgMode
@@ -1922,7 +2086,7 @@ func (m CacheMethod) GetService(name string, view string, withCap bool, acc *acc
 }
 
 func isNeuvectorContainerName(name string) bool {
-	if matched, err := regexp.MatchString(`^neuvector-(controller|enforcer|manager|allinone|updater|scanner)-pod`, name); err == nil {
+	if matched, err := regexp.MatchString(`^neuvector-(controller|enforcer|manager|allinone|updater|scanner|csp|registry-adapter)-pod`, name); err == nil {
 		return matched
 	}
 	return false

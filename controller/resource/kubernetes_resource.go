@@ -75,28 +75,32 @@ const (
 )
 
 const (
-	nvOperatorsRole         = "neuvector-binding-co"
-	nvOperatorsRoleBinding  = nvOperatorsRole
-	NvAppRole               = "neuvector-binding-app"
-	nvAppRoleBinding        = NvAppRole
-	NvRbacRole              = "neuvector-binding-rbac"
-	nvRbacRoleBinding       = NvRbacRole
-	NvAdmCtrlRole           = "neuvector-binding-admission"
-	nvAdmCtrlRoleBinding    = NvAdmCtrlRole
-	nvCrdRole               = "neuvector-binding-customresourcedefinition"
-	nvCrdRoleBinding        = nvCrdRole
-	nvCrdSecRuleRole        = "neuvector-binding-nvsecurityrules"
-	nvCrdSecRoleBinding     = nvCrdSecRuleRole
-	nvCrdAdmCtrlRole        = "neuvector-binding-nvadmissioncontrolsecurityrules"
-	nvCrdAdmCtrlRoleBinding = nvCrdAdmCtrlRole
-	nvCrdDlpRole            = "neuvector-binding-nvdlpsecurityrules"
-	nvCrdDlpRoleBinding     = nvCrdDlpRole
-	nvCrdWafRole            = "neuvector-binding-nvwafsecurityrules"
-	nvCrdWafRoleBinding     = nvCrdWafRole
-	NvScannerRole           = "neuvector-binding-scanner"
-	NvScannerRoleBinding    = NvScannerRole
-	NvAdminRoleBinding      = "neuvector-admin"
-	nvViewRoleBinding       = "neuvector-binding-view"
+	nvOperatorsRole             = "neuvector-binding-co"
+	nvOperatorsRoleBinding      = nvOperatorsRole
+	NvAppRole                   = "neuvector-binding-app"
+	nvAppRoleBinding            = NvAppRole
+	NvRbacRole                  = "neuvector-binding-rbac"
+	nvRbacRoleBinding           = NvRbacRole
+	NvAdmCtrlRole               = "neuvector-binding-admission"
+	nvAdmCtrlRoleBinding        = NvAdmCtrlRole
+	nvCrdRole                   = "neuvector-binding-customresourcedefinition"
+	nvCrdRoleBinding            = nvCrdRole
+	nvCrdSecRuleRole            = "neuvector-binding-nvsecurityrules"
+	nvCrdSecRoleBinding         = nvCrdSecRuleRole
+	nvCrdAdmCtrlRole            = "neuvector-binding-nvadmissioncontrolsecurityrules"
+	nvCrdAdmCtrlRoleBinding     = nvCrdAdmCtrlRole
+	nvCrdDlpRole                = "neuvector-binding-nvdlpsecurityrules"
+	nvCrdDlpRoleBinding         = nvCrdDlpRole
+	nvCrdWafRole                = "neuvector-binding-nvwafsecurityrules"
+	nvCrdWafRoleBinding         = nvCrdWafRole
+	nvCrdVulnProfileRole        = "neuvector-binding-nvvulnerabilityprofiles"
+	nvCrdVulnProfileRoleBinding = nvCrdVulnProfileRole
+	nvCrdCompProfileRole        = "neuvector-binding-nvcomplianceprofiles"
+	nvCrdCompProfileRoleBinding = nvCrdCompProfileRole
+	NvScannerRole               = "neuvector-binding-scanner"
+	NvScannerRoleBinding        = NvScannerRole
+	NvAdminRoleBinding          = "neuvector-admin"
+	nvViewRoleBinding           = "neuvector-binding-view"
 )
 
 const (
@@ -164,7 +168,7 @@ type NvCrdInfo struct {
 	ShortNames        []string
 }
 
-//--- for generic types in admissionregistration v1/vebeta1
+// --- for generic types in admissionregistration v1/vebeta1
 type K8sAdmRegServiceReference struct {
 	Namespace *string
 	Name      *string
@@ -211,8 +215,6 @@ type NvAdmRegRuleSetting struct {
 	Scope      string
 }
 
-type NvCrdInitFunc func(leader bool, cspType share.TCspType)
-
 type NvQueryK8sVerFunc func()
 
 type NvVerifyK8sNsFunc func(admCtrlEnabled bool, nsName string, nsLabels map[string]string)
@@ -240,7 +242,7 @@ var rbacApiGroups = utils.NewSet(k8sRbacApiGroup)
 var opCreateDelete = utils.NewSet(Create, Update)
 
 var admResForCreateSet = utils.NewSet(K8sResCronjobs, K8sResDaemonsets, K8sResDeployments, K8sResJobs, K8sResPods, K8sResReplicasets, K8sResReplicationControllers, K8sResStatefulSets)
-var admResForUpdateSet = utils.NewSet(K8sResDaemonsets, K8sResDeployments, K8sResReplicationControllers, K8sResStatefulSets)
+var admResForUpdateSet = utils.NewSet(K8sResDaemonsets, K8sResDeployments, K8sResReplicationControllers, K8sResStatefulSets, K8sResPods)
 var admRbacResForCreateUpdate1 = utils.NewSet(K8sResRoles, K8sResRolebindings)
 var admRbacResForCreateUpdate2 = utils.NewSet(K8sResClusterRoles, K8sResClusterRolebindings)
 var AdmResForOpsSettings = []*NvAdmRegRuleSetting{
@@ -272,7 +274,7 @@ var AdmResForOpsSettings = []*NvAdmRegRuleSetting{
 }
 
 var crdResForAllOpSet = utils.NewSet(RscTypeCrdSecurityRule, RscTypeCrdClusterSecurityRule, RscTypeCrdAdmCtrlSecurityRule, RscTypeCrdDlpSecurityRule,
-	RscTypeCrdWafSecurityRule, RscTypeCrdNvCspUsage)
+	RscTypeCrdWafSecurityRule, RscTypeCrdVulnProfile, RscTypeCrdCompProfile)
 var CrdResForOpsSettings = []*NvAdmRegRuleSetting{
 	&NvAdmRegRuleSetting{
 		ApiGroups:  allApiGroups,
@@ -305,11 +307,9 @@ var ocVersionMajor int
 
 var cacheEventFunc common.CacheEventFunc
 
-var nvCrdInitFunc NvCrdInitFunc
 var nvQueryK8sVerFunc NvQueryK8sVerFunc
 var nvVerifyK8sNsFunc NvVerifyK8sNsFunc
 var isLeader bool
-var CtrlPlaneOpInWhExpr string
 var cspType share.TCspType
 
 var watchFailedFlag int32
@@ -390,6 +390,30 @@ var resourceMakers map[string]k8sResource = map[string]k8sResource{
 				func() k8s.Resource { return new(appsv1.DaemonSet) },
 				func() k8s.ResourceList { return new(appsv1.DaemonSetList) },
 				xlateDaemonSet,
+				nil,
+			},
+		},
+	},
+	RscTypeReplicaSet: k8sResource{
+		apiGroup: "apps",
+		makers: []*resourceMaker{
+			&resourceMaker{
+				"v1",
+				func() k8s.Resource { return new(appsv1.ReplicaSet) },
+				func() k8s.ResourceList { return new(appsv1.ReplicaSetList) },
+				xlateReplicaSet,
+				nil,
+			},
+		},
+	},
+	RscTypeStatefulSet: k8sResource{
+		apiGroup: "apps",
+		makers: []*resourceMaker{
+			&resourceMaker{
+				"v1",
+				func() k8s.Resource { return new(appsv1.StatefulSet) },
+				func() k8s.ResourceList { return new(appsv1.StatefulSetList) },
+				xlateStatefulSet,
 				nil,
 			},
 		},
@@ -581,8 +605,32 @@ var resourceMakers map[string]k8sResource = map[string]k8sResource{
 			},
 		},
 	},
-	RscTypeCrdNvCspUsage: k8sResource{
+	RscTypeCrdVulnProfile: k8sResource{
 		apiGroup: constApiGroupNV,
+		makers: []*resourceMaker{
+			&resourceMaker{
+				"v1",
+				func() k8s.Resource { return new(NvVulnProfileSecurityRule) },
+				func() k8s.ResourceList { return new(NvVulnProfileSecurityRuleList) },
+				xlateCrdVulnProfile,
+				nil,
+			},
+		},
+	},
+	RscTypeCrdCompProfile: k8sResource{
+		apiGroup: constApiGroupNV,
+		makers: []*resourceMaker{
+			&resourceMaker{
+				"v1",
+				func() k8s.Resource { return new(NvCompProfileSecurityRule) },
+				func() k8s.ResourceList { return new(NvCompProfileSecurityRuleList) },
+				xlateCrdCompProfile,
+				nil,
+			},
+		},
+	},
+	RscTypeCrdNvCspUsage: k8sResource{
+		apiGroup: "susecloud.net",
 		makers: []*resourceMaker{
 			&resourceMaker{
 				"v1",
@@ -907,6 +955,40 @@ func xlateDaemonSet(obj k8s.Resource) (string, interface{}) {
 	return "", nil
 }
 
+func xlateReplicaSet(obj k8s.Resource) (string, interface{}) {
+	if o, ok := obj.(*appsv1.ReplicaSet); ok && o != nil {
+		meta := o.Metadata
+		if meta == nil {
+			return "", nil
+		}
+		r := &ReplicaSet{
+			UID:    meta.GetUid(),
+			Name:   meta.GetName(),
+			Domain: meta.GetNamespace(),
+		}
+		return r.UID, r
+	}
+
+	return "", nil
+}
+
+func xlateStatefulSet(obj k8s.Resource) (string, interface{}) {
+	if o, ok := obj.(*appsv1.StatefulSet); ok && o != nil {
+		meta := o.Metadata
+		if meta == nil {
+			return "", nil
+		}
+		r := &StatefulSet{
+			UID:    meta.GetUid(),
+			Name:   meta.GetName(),
+			Domain: meta.GetNamespace(),
+		}
+		return r.UID, r
+	}
+
+	return "", nil
+}
+
 func xlateCronJob(obj k8s.Resource) (string, interface{}) {
 	if o, ok := obj.(*batchv1b1.CronJob); ok && o != nil {
 		meta := o.Metadata
@@ -1096,6 +1178,38 @@ func xlateCrdWafSecurityRule(obj k8s.Resource) (string, interface{}) {
 	return "", nil
 }
 
+func xlateCrdVulnProfile(obj k8s.Resource) (string, interface{}) {
+	if o, ok := obj.(*NvVulnProfileSecurityRule); ok {
+		if o.Metadata == nil {
+			return "", nil
+		}
+		meta := o.Metadata
+		r := &CRD{
+			UID:  meta.GetUid(),
+			Name: meta.GetName(),
+		}
+		return r.UID, o
+	}
+
+	return "", nil
+}
+
+func xlateCrdCompProfile(obj k8s.Resource) (string, interface{}) {
+	if o, ok := obj.(*NvCompProfileSecurityRule); ok {
+		if o.Metadata == nil {
+			return "", nil
+		}
+		meta := o.Metadata
+		r := &CRD{
+			UID:  meta.GetUid(),
+			Name: meta.GetName(),
+		}
+		return r.UID, o
+	}
+
+	return "", nil
+}
+
 func xlateCrdCspUsage(obj k8s.Resource) (string, interface{}) {
 	if o, ok := obj.(*NvCspUsage); ok {
 		if o.Metadata == nil {
@@ -1154,12 +1268,15 @@ func xlateValidatingWebhookConfiguration(obj k8s.Resource) (string, interface{})
 	} else if o, ok := obj.(*apiv1beta1.ValidatingWebhookConfiguration); ok {
 		meta = o.Metadata
 	}
-	if meta != nil && meta.GetName() == NvAdmValidatingName {
-		r := &AdmissionWebhookConfiguration{
-			AdmType: nvAdmValidateType,
-			Name:    meta.GetName(),
+	if meta != nil {
+		name := meta.GetName()
+		if name == NvAdmValidatingName || name == NvPruneValidatingName {
+			r := &AdmissionWebhookConfiguration{
+				AdmType: nvAdmValidateType,
+				Name:    name,
+			}
+			return meta.GetUid(), r
 		}
-		return meta.GetUid(), r
 	}
 	return "", nil
 }
@@ -1247,8 +1364,7 @@ func (d *kubernetes) watchResource(rt string, maker *resourceMaker, watcher *k8s
 
 func (d *kubernetes) RegisterResource(rt string) error {
 	var err error
-	switch rt {
-	case RscTypeImage:
+	if rt == RscTypeImage {
 		_, err = d.discoverResource(rt)
 		if err == nil {
 			d.lock.Lock()
@@ -1256,50 +1372,41 @@ func (d *kubernetes) RegisterResource(rt string) error {
 			k8s.RegisterList("image.openshift.io", "v1", "imagestreams", true, &ocImageStreamList{})
 			d.lock.Unlock()
 		}
-	case RscTypeCrdSecurityRule:
+	} else {
 		d.lock.Lock()
-		k8s.Register("neuvector.com", "v1", NvSecurityRulePlural, true, &NvSecurityRule{})
-		k8s.RegisterList("neuvector.com", "v1", NvSecurityRulePlural, true, &NvSecurityRuleList{})
+		switch rt {
+		case RscTypeCrdSecurityRule:
+			k8s.Register("neuvector.com", "v1", NvSecurityRulePlural, true, &NvSecurityRule{})
+			k8s.RegisterList("neuvector.com", "v1", NvSecurityRulePlural, true, &NvSecurityRuleList{})
+		case RscTypeCrdClusterSecurityRule:
+			k8s.Register("neuvector.com", "v1", NvClusterSecurityRulePlural, false, &NvClusterSecurityRule{})
+			k8s.RegisterList("neuvector.com", "v1", NvClusterSecurityRulePlural, false, &NvClusterSecurityRuleList{})
+		case RscTypeCrdAdmCtrlSecurityRule:
+			k8s.Register("neuvector.com", "v1", NvAdmCtrlSecurityRulePlural, false, &NvAdmCtrlSecurityRule{})
+			k8s.RegisterList("neuvector.com", "v1", NvAdmCtrlSecurityRulePlural, false, &NvAdmCtrlSecurityRuleList{})
+		case RscTypeCrdDlpSecurityRule:
+			k8s.Register("neuvector.com", "v1", NvDlpSecurityRulePlural, false, &NvDlpSecurityRule{})
+			k8s.RegisterList("neuvector.com", "v1", NvDlpSecurityRulePlural, false, &NvDlpSecurityRuleList{})
+		case RscTypeCrdWafSecurityRule:
+			k8s.Register("neuvector.com", "v1", NvWafSecurityRulePlural, false, &NvWafSecurityRule{})
+			k8s.RegisterList("neuvector.com", "v1", NvWafSecurityRulePlural, false, &NvWafSecurityRuleList{})
+		case RscTypeCrdVulnProfile:
+			k8s.Register("neuvector.com", "v1", NvVulnProfileSecurityRulePlural, false, &NvVulnProfileSecurityRule{})
+			k8s.RegisterList("neuvector.com", "v1", NvVulnProfileSecurityRulePlural, false, &NvVulnProfileSecurityRuleList{})
+		case RscTypeCrdCompProfile:
+			k8s.Register("neuvector.com", "v1", NvCompProfileSecurityRulePlural, false, &NvCompProfileSecurityRule{})
+			k8s.RegisterList("neuvector.com", "v1", NvCompProfileSecurityRulePlural, false, &NvCompProfileSecurityRuleList{})
+		case RscTypeCrdNvCspUsage:
+			k8s.Register("susecloud.net", "v1", NvCspUsagePlural, false, &NvCspUsage{})
+			k8s.RegisterList("susecloud.net", "v1", NvCspUsagePlural, false, &NvCspUsageList{})
+		default:
+			err = ErrResourceNotSupported
+		}
 		d.lock.Unlock()
 
-		_, err = d.discoverResource(rt)
-	case RscTypeCrdClusterSecurityRule:
-		d.lock.Lock()
-		k8s.Register("neuvector.com", "v1", NvClusterSecurityRulePlural, false, &NvClusterSecurityRule{})
-		k8s.RegisterList("neuvector.com", "v1", NvClusterSecurityRulePlural, false, &NvClusterSecurityRuleList{})
-		d.lock.Unlock()
-
-		_, err = d.discoverResource(rt)
-	case RscTypeCrdAdmCtrlSecurityRule:
-		d.lock.Lock()
-		k8s.Register("neuvector.com", "v1", NvAdmCtrlSecurityRulePlural, false, &NvAdmCtrlSecurityRule{})
-		k8s.RegisterList("neuvector.com", "v1", NvAdmCtrlSecurityRulePlural, false, &NvAdmCtrlSecurityRuleList{})
-		d.lock.Unlock()
-
-		_, err = d.discoverResource(rt)
-	case RscTypeCrdDlpSecurityRule:
-		d.lock.Lock()
-		k8s.Register("neuvector.com", "v1", NvDlpSecurityRulePlural, false, &NvDlpSecurityRule{})
-		k8s.RegisterList("neuvector.com", "v1", NvDlpSecurityRulePlural, false, &NvDlpSecurityRuleList{})
-		d.lock.Unlock()
-
-		_, err = d.discoverResource(rt)
-	case RscTypeCrdWafSecurityRule:
-		d.lock.Lock()
-		k8s.Register("neuvector.com", "v1", NvWafSecurityRulePlural, false, &NvWafSecurityRule{})
-		k8s.RegisterList("neuvector.com", "v1", NvWafSecurityRulePlural, false, &NvWafSecurityRuleList{})
-		d.lock.Unlock()
-
-		_, err = d.discoverResource(rt)
-	case RscTypeCrdNvCspUsage:
-		d.lock.Lock()
-		k8s.Register("neuvector.com", "v1", NvCspUsagePlural, false, &NvCspUsage{})
-		k8s.RegisterList("neuvector.com", "v1", NvCspUsagePlural, false, &NvCspUsageList{})
-		d.lock.Unlock()
-
-		_, err = d.discoverResource(rt)
-	default:
-		err = ErrResourceNotSupported
+		if err == nil {
+			_, err = d.discoverResource(rt)
+		}
 	}
 	if err != nil {
 		log.WithFields(log.Fields{"resource": rt, "error": err}).Error("fail to register")
@@ -1588,7 +1695,7 @@ func (d *kubernetes) GetResource(rt, namespace, name string) (interface{}, error
 	//case RscTypeMutatingWebhookConfiguration:
 	case RscTypeNamespace, RscTypeService, K8sRscTypeClusRole, K8sRscTypeClusRoleBinding, k8sRscTypeRole, k8sRscTypeRoleBinding, RscTypeValidatingWebhookConfiguration,
 		RscTypeCrd, RscTypeConfigMap, RscTypeCrdSecurityRule, RscTypeCrdClusterSecurityRule, RscTypeCrdAdmCtrlSecurityRule, RscTypeCrdDlpSecurityRule, RscTypeCrdWafSecurityRule,
-		RscTypeDeployment, RscTypeCrdNvCspUsage:
+		RscTypeDeployment, RscTypeReplicaSet, RscTypeStatefulSet, RscTypeCrdNvCspUsage, RscTypeCrdVulnProfile, RscTypeCrdCompProfile:
 		return d.getResource(rt, namespace, name)
 	case RscTypePod, RscTypeNode, RscTypeCronJob, RscTypeDaemonSet:
 		if r, err := d.getResource(rt, namespace, name); err == nil {
@@ -1606,7 +1713,7 @@ func (d *kubernetes) GetResource(rt, namespace, name string) (interface{}, error
 }
 
 func (d *kubernetes) getResource(rt, namespace, name string) (interface{}, error) {
-	log.WithFields(log.Fields{"resource": rt}).Debug()
+	//log.WithFields(log.Fields{"resource": rt}).Debug()
 
 	maker, err := d.discoverResource(rt)
 	if err != nil {
@@ -1717,7 +1824,8 @@ func (d *kubernetes) DeleteResource(rt string, res interface{}) error {
 	switch rt {
 	//case RscTypeMutatingWebhookConfiguration:
 	case RscTypeValidatingWebhookConfiguration, RscTypeCrd, RscTypeCrdSecurityRule, RscTypeCrdClusterSecurityRule,
-		RscTypeCrdAdmCtrlSecurityRule, RscTypeCrdDlpSecurityRule, RscTypeCrdWafSecurityRule, RscTypeCrdNvCspUsage:
+		RscTypeCrdAdmCtrlSecurityRule, RscTypeCrdDlpSecurityRule, RscTypeCrdWafSecurityRule, RscTypeCrdNvCspUsage,
+		RscTypeCrdVulnProfile, RscTypeCrdCompProfile:
 		return d.deleteResource(rt, res)
 	}
 	return ErrResourceNotSupported
@@ -1757,10 +1865,14 @@ func (d *kubernetes) SetFlavor(flavor string) error {
 	return nil
 }
 
-func IsK8sNvWebhookConfigured(whName, failurePolicy string, wh *K8sAdmRegWebhook, checkNsSelector bool) bool {
+// revertCount: how many times the ValidatingWebhookConfiguration resource has been reverted by this controller.
+//              if it's >= 1, do not revert the ValidatingWebhookConfiguration resource just becuase of unknown matchExpressions keys
+func IsK8sNvWebhookConfigured(whName, failurePolicy string, wh *K8sAdmRegWebhook, checkNsSelector bool, revertCount *uint32,
+	unexpectedMatchKeys utils.Set) bool {
+
 	var nvOpResources []*NvAdmRegRuleSetting // is for what nv expects
 	// key/operator in webhook NamespaceSelector's MatchExpressions.
-	selKeyOps := map[string]string{NsSelectorKeyCtrlPlane: NsSelectorOpNotExist}
+	selKeyOps := map[string]string{}
 	switch whName {
 	case NvAdmValidatingWebhookName:
 		nvOpResources = AdmResForOpsSettings
@@ -1806,37 +1918,21 @@ func IsK8sNvWebhookConfigured(whName, failurePolicy string, wh *K8sAdmRegWebhook
 		}
 	}
 	if checkNsSelector {
-		var ctrlPlaneOpInWhExpr string
 		for _, expr := range wh.NamespaceSelector.MatchExpressions {
 			key := expr.GetKey()
-			value := expr.GetOperator()
-			if op, ok := selKeyOps[key]; !ok || op != value {
-				// an unexpected label(key/value) is found in webhook NamespaceSelector's MatchExpressions
-				log.WithFields(log.Fields{"key": key, "value": value}).Info("unexpected label")
-				return false
-			}
-			if key == NsSelectorKeyCtrlPlane { // "control-plane" key is also in MatchExpressions on AKS
-				ctrlPlaneOpInWhExpr = value
-			}
-			delete(selKeyOps, key)
-		}
-		if whName == NvAdmValidatingWebhookName && CtrlPlaneOpInWhExpr != ctrlPlaneOpInWhExpr {
-			CtrlPlaneOpInWhExpr = ctrlPlaneOpInWhExpr
-			log.WithFields(log.Fields{"ctrlPlaneOp": CtrlPlaneOpInWhExpr}).Info()
-			if isLeader && nvVerifyK8sNsFunc != nil {
-				if objs, err := global.ORCH.ListResource(RscTypeNamespace); len(objs) > 0 {
-					for _, obj := range objs {
-						if nsObj := obj.(*Namespace); nsObj != nil {
-							nvVerifyK8sNsFunc(true, nsObj.Name, nsObj.Labels)
-						}
-					}
-				} else {
-					log.WithFields(log.Fields{"err": err}).Error()
+			op := expr.GetOperator()
+			if expectedOp, ok := selKeyOps[key]; !ok || expectedOp != op {
+				// an unexpected label(key/op) is found in webhook NamespaceSelector's MatchExpressions
+				if revertCount != nil && *revertCount <= 1 {
+					unexpectedMatchKeys.Add(key)
+					log.WithFields(log.Fields{"key": key, "op": op}).Info("unexpected label")
 				}
+			} else {
+				delete(selKeyOps, key)
 			}
 		}
-		delete(selKeyOps, NsSelectorKeyCtrlPlane)
 		if len(selKeyOps) > 0 {
+			unexpectedMatchKeys.Clear()
 			return false
 		}
 	}
@@ -1867,16 +1963,15 @@ func AdjustAdmResForOC() {
 				},
 			}}
 		rbacRoleBindingsWanted[nvOperatorsRoleBinding] = &k8sRbacBindingInfo{
-			subject:  &ctrlerSubjectWanted,
+			subjects: enforcerSubjecstWanted,
 			rbacRole: rbacRolesWanted[nvOperatorsRole],
 		}
 	}
 }
 
-func AdjustAdmWebhookName(f1 NvCrdInitFunc, f2 NvQueryK8sVerFunc, f3 NvVerifyK8sNsFunc, cspType_ share.TCspType) {
-	nvCrdInitFunc = f1
-	nvQueryK8sVerFunc = f2
-	nvVerifyK8sNsFunc = f3
+func AdjustAdmWebhookName(f1 NvQueryK8sVerFunc, f2 NvVerifyK8sNsFunc, cspType_ share.TCspType) {
+	nvQueryK8sVerFunc = f1
+	nvVerifyK8sNsFunc = f2
 	cspType = cspType_
 	NvAdmMutatingWebhookName = fmt.Sprintf("%s.%s.svc", NvAdmMutatingName, NvAdmSvcNamespace)           // ex: neuvector-mutating-admission-webhook.neuvector.svc
 	NvAdmValidatingWebhookName = fmt.Sprintf("%s.%s.svc", NvAdmValidatingName, NvAdmSvcNamespace)       // ex: neuvector-validating-admission-webhook.neuvector.svc
@@ -1890,14 +1985,14 @@ func AdjustAdmWebhookName(f1 NvCrdInitFunc, f2 NvQueryK8sVerFunc, f3 NvVerifyK8s
 			name: nvCspUsageRole,
 			rules: []*k8sRbacRoleRuleInfo{
 				&k8sRbacRoleRuleInfo{
-					apiGroup:  constApiGroupNV,
+					apiGroup:  "susecloud.net",
 					resources: utils.NewSet(RscTypeCrdNvCspUsage),
 					verbs:     utils.NewSet("get", "create", "update", "delete"),
 				},
 			},
 		}
 		rbacRoleBindingsWanted[nvCspUsageRoleBinding] = &k8sRbacBindingInfo{
-			subject:  &ctrlerSubjectWanted,
+			subjects: ctrlerSubjectsWanted,
 			rbacRole: rbacRolesWanted[nvCspUsageRole],
 		}
 	}
@@ -1999,55 +2094,36 @@ func UpdateDeploymentReplicates(name string, replicas int32) error {
 	return nil
 }
 
-func getNeuvectorSvcAccount(objName string) error {
-	type tPodInfo struct {
-		ownerRT   string
-		podPrefix string
-		sa        *string
-	}
-
-	// controller's sa is known by k8s token
-	resInfo := map[string]tPodInfo{
-		"neuvector-updater-pod": tPodInfo{
-			ownerRT: RscTypeCronJob,
-			sa:      &updaterSubjectWanted,
-		},
-		/*
-			"neuvector-enforcer-pod": tPodInfo{
-				ownerRT:   RscTypeDaemonSet,
-				sa:        &enforcerSubjectWanted,
-			},
-		*/
-	}
-	for name, info := range resInfo {
-		if objName == name {
-			sa := "default"
-			obj, err := global.ORCH.GetResource(info.ownerRT, NvAdmSvcNamespace, objName)
-			if err != nil {
-				log.WithFields(log.Fields{"name": objName, "err": err}).Error("resource no found")
-				return err
-			}
-			switch objName {
-			case "neuvector-updater-pod": // get updater cronjob service account
-				if cronjobObj, ok := obj.(*CronJob); ok {
-					sa = cronjobObj.SA
-				}
-				/*
-				   case "neuvector-enforcer-pod": // get enforcer daemonset service account
-				   				if dsObj, ok := obj.(*DaemonSet); ok {
-				   					sa = dsObj.SA
-				   				}
-				*/
-			default:
-				return ErrResourceNotSupported
-			}
-			if *info.sa != sa {
-				*info.sa = sa
-			}
-			log.WithFields(log.Fields{"name": objName, "sa": sa}).Info()
-			return nil
+func getNeuvectorSvcAccount(resInfo map[string]string) {
+	// controller's sa is known by k8s token, not by deployment resource
+	for objName, rt := range resInfo {
+		var sa string
+		obj, err := global.ORCH.GetResource(rt, NvAdmSvcNamespace, objName)
+		if err != nil {
+			log.WithFields(log.Fields{"name": objName, "rt": rt, "err": err}).Error("resource no found")
+			continue
 		}
+		switch objName {
+		case "neuvector-updater-pod": // get updater cronjob service account
+			if cronjobObj, ok := obj.(*CronJob); ok {
+				sa = cronjobObj.SA
+				if updaterSubjectWanted != sa {
+					updaterSubjectWanted = sa
+					scannerSubjecstWanted[0] = ctrlerSubjectWanted
+					scannerSubjecstWanted[1] = updaterSubjectWanted
+				}
+			}
+		case "neuvector-enforcer-pod": // get enforcer daemonset service account
+			if dsObj, ok := obj.(*DaemonSet); ok {
+				sa = dsObj.SA
+				if enforcerSubjectWanted != sa {
+					enforcerSubjectWanted = sa
+					enforcerSubjecstWanted[0] = ctrlerSubjectWanted
+					enforcerSubjecstWanted[1] = enforcerSubjectWanted
+				}
+			}
+		}
+		log.WithFields(log.Fields{"name": objName, "sa": sa}).Info()
+		continue
 	}
-
-	return common.ErrObjectNotFound
 }

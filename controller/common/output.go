@@ -3,9 +3,11 @@ package common
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"syscall"
@@ -21,15 +23,18 @@ import (
 
 const syslogFacility = syslog.LOG_LOCAL0
 const notificationHeader = "notification"
-const syslogTimeout = time.Second * 8
+const syslogTimeout = time.Second * 30
+const syslogDialTimeout = time.Second * 30
 
 type Syslogger struct {
-	writer *syslog.Writer
-	proto  string
-	addr   string
-	catSet utils.Set
-	prio   syslog.Priority
-	inJSON bool
+	syslog     bool
+	stdin      bool
+	writer     *syslog.Writer
+	proto      string
+	addr       string
+	catSet     utils.Set
+	prio       syslog.Priority
+	inJSON     bool
 	serverCert string
 }
 
@@ -59,11 +64,13 @@ func NewSyslogger(cfg *share.CLUSSyslogConfig) *Syslogger {
 		}
 	}
 	return &Syslogger{
-		proto:  proto,
-		addr:   fmt.Sprintf("%s:%d", server, cfg.SyslogPort),
-		catSet: catSet,
-		prio:   prio,
-		inJSON: cfg.SyslogInJSON,
+		syslog:     cfg.SyslogEnable,
+		stdin:      cfg.OutputEventToLogs,
+		proto:      proto,
+		addr:       fmt.Sprintf("%s:%d", server, cfg.SyslogPort),
+		catSet:     catSet,
+		prio:       prio,
+		inJSON:     cfg.SyslogInJSON,
 		serverCert: cfg.SyslogServerCert,
 	}
 }
@@ -72,6 +79,10 @@ func (s *Syslogger) Close() {
 	if s.writer != nil {
 		s.writer.Close()
 	}
+}
+
+func (s *Syslogger) Identifier() string {
+	return s.proto + ":" + s.addr + ":" + s.serverCert // a string to identify its connection criteria
 }
 
 func (s *Syslogger) Send(elog interface{}, level, cat, header string) error {
@@ -83,19 +94,30 @@ func (s *Syslogger) Send(elog interface{}, level, cat, header string) error {
 		return nil
 	}
 
+	var err error
 	if s.inJSON {
 		if data, _ := json.Marshal(elog); len(data) > 2 {
 			logText := fmt.Sprintf("{\"%s\": \"%s\", %s", notificationHeader, header, string(data[1:][:]))
-			return s.send(logText, prio)
+			if s.stdin {
+				fmt.Println(logText)
+			}
+			if s.syslog {
+				err = s.send(logText, prio)
+			}
 		}
 	} else {
 		if logText := struct2Text(elog); logText != "" {
 			logText = fmt.Sprintf("%s=%s,%s", notificationHeader, header, logText)
-			return s.send(logText, prio)
+			if s.stdin {
+				fmt.Println(logText)
+			}
+			if s.syslog {
+				err = s.send(logText, prio)
+			}
 		}
 	}
 
-	return nil
+	return err
 }
 
 func appendLogField(logText string, tag string, v reflect.Value) string {
@@ -184,7 +206,7 @@ func (s *Syslogger) send(text string, prio syslog.Priority) error {
 
 		s.Close()
 	}
-	if wr, err := s.makeDial(prio); err != nil {
+	if wr, err := s.makeDial(prio, syslogDialTimeout); err != nil {
 		return err
 	} else {
 		wr.SetFormatter(syslog.RFC5424Formatter)
@@ -194,56 +216,39 @@ func (s *Syslogger) send(text string, prio syslog.Priority) error {
 	}
 }
 
-func (s *Syslogger) makeDial(prio syslog.Priority) (*syslog.Writer, error) {
+func (s *Syslogger) makeDial(prio syslog.Priority, timeout time.Duration) (*syslog.Writer, error) {
 	if s.proto == "tcp+tls" {
-		return syslog.DialWithTLSCert("tcp+tls", s.addr, syslogFacility|prio, "neuvector", []byte(s.serverCert))
+		return syslog.DialWithTLSCert("tcp+tls", s.addr, timeout, syslogFacility|prio, "neuvector", []byte(s.serverCert))
 	}
 
-	return syslog.Dial(s.proto, s.addr, syslogFacility|prio, "neuvector")
+	return syslog.Dial(s.proto, s.addr, timeout, syslogFacility|prio, "neuvector")
 }
 
 // --
-
-const contentType = "application/json"
 
 const webhookInfo = "Neuvector webhook is configured."
 const requestTimeout = time.Duration(5 * time.Second)
 
 type Webhook struct {
 	url    string
-	client *http.Client
+	target string
 }
 
-func NewWebHook(url string) *Webhook {
+func NewWebHook(url, target string) *Webhook {
 	w := &Webhook{
-		url: url,
-		client: &http.Client{
-			Timeout: requestTimeout,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
-			},
-		},
+		url:    url,
+		target: target,
 	}
 	return w
 }
 
-func (w *Webhook) Validate() error {
-	log.WithFields(log.Fields{"url": w.url}).Debug("")
-	fields := make(map[string]string)
-	fields["text"] = fmt.Sprintf("%s", webhookInfo)
-	jsonValue, _ := json.Marshal(fields)
-
-	return w.httpRequest(jsonValue)
-}
-
-func (w *Webhook) Notify(elog interface{}, target, level, category, cluster, title string) {
+func (w *Webhook) Notify(elog interface{}, level, category, cluster, title string, proxy *share.CLUSProxy) {
 	log.WithFields(log.Fields{"title": title}).Debug()
 
 	if logText := struct2Text(elog); logText != "" {
 		var data []byte
-		if target == api.WebhookTypeSlack {
+		switch w.target {
+		case api.WebhookTypeSlack:
 			// Prefix category
 			logText = fmt.Sprintf("%s=%s,%s", notificationHeader, category, logText)
 			// Prefix category and title with styles
@@ -252,31 +257,76 @@ func (w *Webhook) Notify(elog interface{}, target, level, category, cluster, tit
 			fields["text"] = logText
 			fields["username"] = fmt.Sprintf("NeuVector - %s", cluster)
 			data, _ = json.Marshal(fields)
-		} else if target == api.WebhookTypeTeams {
+		case api.WebhookTypeTeams:
 			fields := make(map[string]string)
 			fields["title"] = fmt.Sprintf("%s: %s level", strings.Title(category), strings.ToUpper(LevelToString(level)))
 			logText = fmt.Sprintf("%s=%s,%s", notificationHeader, category, logText)
 			fields["text"] = fmt.Sprintf("%s\n> %s", title, logText)
 			data, _ = json.Marshal(fields)
-		} else if target == api.WebhookTypeJSON {
+		case api.WebhookTypeJSON:
 			extra := fmt.Sprintf("{\"level\":\"%s\",\"cluster\":\"%s\",", strings.ToUpper(LevelToString(level)), cluster)
 			data, _ = json.Marshal(elog)
 			data = append([]byte(extra), data[1:]...)
-		} else {
+		default:
 			msg := fmt.Sprintf("level=%s,cluster=%s,%s", strings.ToUpper(LevelToString(level)), cluster, logText)
 			data = []byte(msg)
 		}
 
-		w.httpRequest(data)
+		w.httpRequest(data, proxy)
 	}
 }
 
-func (w *Webhook) httpRequest(data []byte) error {
+func (w *Webhook) httpRequest(data []byte, proxy *share.CLUSProxy) error {
+	client := &http.Client{
+		Timeout: requestTimeout,
+	}
+
+	var authHdr string
+	if proxy != nil && proxy.Username != "" {
+		authHdr = "Basic " + base64.StdEncoding.EncodeToString([]byte(proxy.Username+":"+proxy.Password))
+	}
+
+	if strings.HasPrefix(w.url, "https://") {
+		transport := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		}
+		if proxy != nil {
+			transport.Proxy = func(r *http.Request) (*url.URL, error) {
+				return url.Parse(proxy.URL)
+			}
+			if authHdr != "" {
+				transport.ProxyConnectHeader = http.Header{}
+				transport.ProxyConnectHeader.Add(
+					"Proxy-Authorization", authHdr,
+				)
+			}
+		}
+
+		client.Transport = transport
+	} else if strings.HasPrefix(w.url, "http://") {
+		if proxy != nil {
+			transport := &http.Transport{
+				Proxy: func(r *http.Request) (*url.URL, error) {
+					return url.Parse(proxy.URL)
+				},
+			}
+			client.Transport = transport
+		}
+	}
+
 	var err error
 	var resp *http.Response
 	retry := 0
 	for retry < 3 {
-		resp, err = w.client.Post(w.url, contentType, bytes.NewBuffer(data))
+		req, _ := http.NewRequest("POST", w.url, bytes.NewReader(data))
+		// if authHdr is not empty, proxy must be enabled.
+		if strings.HasPrefix(w.url, "http://") && authHdr != "" {
+			req.Header.Add("Proxy-Authorization", authHdr)
+		}
+
+		resp, err = client.Do(req)
 		if err != nil {
 			log.WithFields(log.Fields{"error": err}).Error("Webhook Send HTTP fail")
 			return err

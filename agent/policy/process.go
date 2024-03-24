@@ -384,47 +384,35 @@ func buildManagerProfileList(serviceGroup string) *share.CLUSProcessProfile {
 	var whtLst []ProcProfileBrief = []ProcProfileBrief{
 		/////////////////////////////////
 		// python
-		{"support", "/usr/bin/*"}, // support
-		{"cli", "/usr/bin/*"},     // cli
-
-		// manager cores :  wildcard
+		{"support", "*"}, // support
+		{"cli", "*"},     // cli
+		{"python", "/usr/bin/*"},// cli
 		{"*", "/usr/lib/jvm/*"}, // JVM
-		//	{"java", "/usr/lib/jvm/java-1.8-openjdk/jre/bin/java"}
+
+		// tools
+		{"ps", "*"},
+		{"lsof", "*"},
+		{"sh", "*"},
+		{"bash", "*"},	// arm64
+		{"dash", "*"},
+		{"kill", "*"},
 
 		// busybox
 		{"busybox", "/bin/busybox"}, // below busybox and its symbolic links
-		{"lsof", "/bin/busybox"},    // replaced
-		{"netstat", "/bin/busybox"},
-		{"ps", "/bin/busybox"}, // replaced
-		{"sh", "/bin/busybox"},
-		{"touch", "/bin/busybox"}, // detect container layer on the AUFS
-		{"uname", "/bin/busybox"}, // cli
-		{"which", "/bin/busybox"}, // cli
-		{"cat", "*"},              // k8s readiness and openshift operations
-		{"echo", "/bin/busybox"},
+		{"uname", "*"}, // cli
+		{"which", "*"}, // cli
+		{"echo", "*"},
 
 		// below entries for debug purpose : docker exec -ti manager sh
-		{"sh", "/bin/dash"},
 		{"ip", "/sbin/ip"},
-		{"ps", "/usr/bin/ps"},   // new procps package
-		{"top", "/usr/bin/top"}, // new procps package
-		{"kill", "/bin/kill"},   // new procps package
-		{"ls", "/bin/busybox"},
-		{"kill", "/bin/busybox"}, // replaced
-		{"top", "/bin/busybox"},  // replaced
-		{"nslookup", "/bin/busybox"},
-		{"nc", "/bin/busybox"},
+		{"ls", "*"},
 		{"tee", "/usr/bin/tee"},
-		{"stat", "/usr/bin/stat"}, // bench scripts
-		{"stty", "/bin/busybox"},  // python3.9
+		{"stty", "*"},  // python
 
 		// k8s or openshift environment
 		{"pause", "/pause"},     // k8s, pause
 		{"pod", "/usr/bin/pod"}, // openshift, pod
 		{"mount", "*"},          // k8s volume plug-in
-		{"grep", "*"},           // CIS bench tests
-		{"pgrep", "*"},
-		{"sed", "*"},
 	}
 
 	return buildCustomizedProfile(serviceGroup, share.PolicyModeEnforce, whtLst, nil)
@@ -435,40 +423,67 @@ func buildScannerProfileList(serviceGroup string) *share.CLUSProcessProfile {
 	log.WithFields(log.Fields{"serviceGroup": serviceGroup}).Debug("PROC: scanner")
 	var whtLst []ProcProfileBrief = []ProcProfileBrief{
 		/////////////////////////////////
-		// scanner cores :  wildcard
 		{"monitor", "/usr/local/bin/monitor"},
 		{"scanner", "/usr/local/bin/scanner"},
 		{"scannerTask", "/usr/local/bin/scannerTask"},
+		{"sigstore-interface", "/usr/local/bin/sigstore-interface"},
 
-		// busybox
-		{"busybox", "/bin/busybox"}, // below busybox and its symbolic links
-		{"netstat", "/bin/busybox"},
-		{"sh", "/bin/busybox"},
-		{"uname", "/bin/busybox"},
-		{"which", "/bin/busybox"},
-		{"touch", "/bin/busybox"}, // detect container layer on the AUFS
-		{"cat", "*"},              // k8s readiness and openshift operations
-
-		// below entries for debug purpose : docker exec -ti manager sh
-		{"sh", "/bin/dash"},
-		{"ip", "/sbin/ip"},
-		{"ps", "/usr/bin/ps"}, // new procps package
-		{"kill", "/bin/kill"}, // new procps package
-		{"ls", "/bin/busybox"},
-		{"lsof", "/usr/bin/lsof"}, // new lsof package
-		{"nslookup", "/bin/busybox"},
-		{"nc", "/bin/busybox"},
-		{"echo", "/bin/busybox"},
-		{"tee", "/usr/bin/tee"},
-		{"stat", "/usr/bin/stat"}, // bench scripts
+		// tools
+		{"ps", "*"},
+		{"lsof", "*"},
+		{"sh", "*"},
+		{"bash", "*"},	         // arm64
 
 		// k8s or openshift environment
 		{"pause", "/pause"},     // k8s, pause
 		{"pod", "/usr/bin/pod"}, // openshift, pod
 		{"mount", "*"},          // k8s volume plug-in
-		{"grep", "*"},           // CIS bench tests
-		{"pgrep", "*"},
-		{"sed", "*"},
+	}
+
+	return buildCustomizedProfile(serviceGroup, share.PolicyModeEnforce, whtLst, nil)
+}
+
+func buildCspProfileList(serviceGroup string) *share.CLUSProcessProfile {
+	log.WithFields(log.Fields{"serviceGroup": serviceGroup}).Debug("PROC: csp")
+	var whtLst []ProcProfileBrief = []ProcProfileBrief{
+		/////////////////////////////////
+		{"csp-billing-ada", "*"},
+		{"ldconfig", "/sbin/ldconfig"},
+		{"python3", "/usr/bin/*"},
+		{"uname", "/usr/bin/uname"},
+
+		// tools
+		{"ps", "*"},
+		{"lsof", "*"},
+		{"sh", "*"},
+		{"bash", "*"},
+
+		// k8s or openshift environment
+		{"pause", "/pause"},     // k8s, pause
+		{"pod", "/usr/bin/pod"}, // openshift, pod
+		{"mount", "*"},          // k8s volume plug-in
+	}
+
+	return buildCustomizedProfile(serviceGroup, share.PolicyModeEnforce, whtLst, nil)
+}
+
+func buildRegistryAdapterProfileList(serviceGroup string) *share.CLUSProcessProfile {
+	log.WithFields(log.Fields{"serviceGroup": serviceGroup}).Debug("PROC: registry adapter")
+	var whtLst []ProcProfileBrief = []ProcProfileBrief{
+		/////////////////////////////////
+		{"adapter", "/usr/local/bin/adapter"},
+
+		// tools
+		{"ps", "*"},
+		{"lsof", "*"},
+		{"sh", "*"},
+		{"bash", "*"},	          // arm64
+		{"ls", "*"},
+
+		// k8s or openshift environment
+		{"pause", "/pause"},     // k8s, pause
+		{"pod", "/usr/bin/pod"}, // openshift, pod
+		{"mount", "*"},          // k8s volume plug-in
 	}
 
 	return buildCustomizedProfile(serviceGroup, share.PolicyModeEnforce, whtLst, nil)
@@ -494,41 +509,33 @@ func buildControllerProfileList(serviceGroup string) *share.CLUSProcessProfile {
 		{"getconf", "/usr/bin/getconf"},  // get configuration values
 		{"getent", "/usr/bin/getent"},    // get entries from Name Service Switch libraries
 		{"iconv", "/usr/bin/iconv"},      // convert encoding of given files from one encoding to another
-		{"lsof", "/usr/bin/lsof"},        // new lsof package
+		{"ps", "*"},
+		{"lsof", "*"},
+		{"sh", "*"},
+		{"bash", "*"},	                  // arm64
+		{"cat", "*"},                     // k8s readiness and openshift operations
+		{"grep", "*"},                    // monitor
 
 		// busybox
 		{"busybox", "/bin/busybox"}, // below busybox and its symbolic links
 		{"mv", "/bin/busybox"},
-		{"lsof", "/bin/busybox"}, // replaced
-		{"netstat", "/bin/busybox"},
-		{"ps", "/bin/busybox"},
-		{"sh", "/bin/busybox"},
+		{"netstat", "/bin/busybox"},     // monitor
 		{"touch", "/bin/busybox"},       // detect container layer on the AUFS
-		{"cat", "*"},                    // k8s readiness and openshift operations
 		{"teardown.sh", "/bin/busybox"}, // monitor tool
 
 		// below entries for debug purpose : docker exec -ti allinone sh
-		{"sh", "/bin/dash"},
 		{"ip", "/sbin/ip"},
-		{"ps", "/usr/bin/ps"},   // new procps package
 		{"top", "/usr/bin/top"}, // new procps package
 		{"kill", "/bin/kill"},   // new procps package
 		{"ls", "/bin/busybox"},
 		{"kill", "/bin/busybox"}, // replaced
 		{"top", "/bin/busybox"},  // replaced
 		{"nslookup", "/bin/busybox"},
-		{"nc", "/bin/busybox"},
-		{"echo", "/bin/busybox"},
-		{"tee", "/usr/bin/tee"},
-		{"stat", "/usr/bin/stat"}, // bench scripts
 
 		// k8s or openshift environment
 		{"pause", "/pause"},     // k8s, pause
 		{"pod", "/usr/bin/pod"}, // openshift, pod
 		{"mount", "*"},          // k8s volume plug-in
-		{"grep", "*"},           // CIS bench tests
-		{"pgrep", "*"},
-		{"sed", "*"},
 	}
 
 	return buildCustomizedProfile(serviceGroup, share.PolicyModeEnforce, whtLst, nil)
@@ -559,43 +566,53 @@ func buildEnforcerProfileList(serviceGroup string) *share.CLUSProcessProfile {
 		{"curl", "/usr/bin/curl"},        // cis benchmark
 		{"jq", "/usr/bin/jq"},            // cis benchmark
 		{"timeout", "/usr/bin/timeout"},  // could be used by tcpdump
+		{"ps", "*"},
+		{"lsof", "*"},
+		{"sh", "*"},
+		{"bash", "*"},	                  // arm64
+		{"dash", "*"},
+		{"cat", "*"},                     // k8s readiness and openshift operations
 
 		// busybox
-		{"busybox", "/bin/busybox"}, // below busybox and its symbolic links
+		{"busybox", "/bin/busybox"},      // below busybox and its symbolic links
 		{"mv", "/bin/busybox"},
-		{"lsof", "/bin/busybox"}, // replaced
-		{"netstat", "/bin/busybox"},
-		{"ps", "/bin/busybox"},
-		{"sh", "/bin/busybox"},
-		{"touch", "/bin/busybox"},        // detect container layer on the AUFS
-		{"cat", "*"},                     // k8s readiness and openshift operations
-		{"configure.sh", "/bin/busybox"}, // monitor tool
-		{"teardown.sh", "/bin/busybox"},  // monitor tool
+		{"netstat", "/bin/busybox"},      // monitor
+		{"touch", "*"},                   // detect container layer on the AUFS
+		{"configure.sh", "*"},            // monitor tool
+		{"teardown.sh", "*"},             // monitor tool
+		{"nproc", "/bin/busybox"},        // dp
 
 		// below entries for debug purpose : docker exec -ti allinone sh
-		{"sh", "/bin/dash"},
 		{"ip", "/sbin/ip"},
 		{"iptables", "/sbin/xtables-legacy-multi"},      // dp
 		{"iptables-save", "/sbin/xtables-legacy-multi"}, // dp
-		{"ps", "/usr/bin/ps"},                           // new procps package
 		{"top", "/usr/bin/top"},                         // new procps package
 		{"kill", "/bin/kill"},                           // new procps package
 		{"ls", "/bin/busybox"},
 		{"kill", "/bin/busybox"}, // replaced
 		{"top", "/bin/busybox"},  // replaced
 		{"nslookup", "/bin/busybox"},
-		{"nc", "/bin/busybox"},
-		{"echo", "/bin/busybox"},
-		{"tee", "/usr/bin/tee"},
-		{"stat", "/usr/bin/stat"}, // bench scripts
 
 		// k8s or openshift environment
 		{"pause", "/pause"},     // k8s, pause
 		{"pod", "/usr/bin/pod"}, // openshift, pod
 		{"mount", "*"},          // k8s volume plug-in
-		{"grep", "*"},           // CIS bench tests
+		{"which", "*"},
+
+		// bench scripts
+		{"awk", "*"},
+		{"cut", "*"},
+		{"echo", "*"},
+		{"find", "*"},
+		{"grep", "*"},
 		{"pgrep", "*"},
 		{"sed", "*"},
+		{"sort", "*"},
+		{"stat", "*"},
+		{"tail", "*"},
+		{"tee", "*"},
+		{"tr", "*"},
+		{"yq", "*"},
 	}
 
 	return buildCustomizedProfile(serviceGroup, share.PolicyModeEnforce, whtLst, nil)
@@ -609,8 +626,8 @@ func buildAllinOneProfileList(serviceGroup string) *share.CLUSProcessProfile {
 		// python: python2.7 or python3.8
 		{"python", "/usr/bin/*"},      // runtime-gdb.py
 		{"supervisord", "/usr/bin/*"}, // start-up
-		{"support", "/usr/bin/*"},     // support
-		{"cli", "/usr/bin/*"},         // cli
+		{"support", "*"},     // support
+		{"cli", "*"},         // cli
 
 		// manager cores :  wildcard
 		{"*", "/usr/lib/jvm/*"}, // JVM
@@ -639,45 +656,57 @@ func buildAllinOneProfileList(serviceGroup string) *share.CLUSProcessProfile {
 		{"curl", "/usr/bin/curl"},        // cis benchmark
 		{"jq", "/usr/bin/jq"},            // cis benchmark
 		{"timeout", "/usr/bin/timeout"},  // could be used by tcpdump
+		{"ps", "*"},
+		{"lsof", "*"},
+		{"sh", "*"},
+		{"bash", "*"},	                  // arm64
+		{"dash", "*"},
+		{"cat", "*"},                     // k8s readiness and openshift operations
 
 		// busybox
 		{"busybox", "/bin/busybox"}, // below busybox and its symbolic links
 		{"mv", "/bin/busybox"},
-		{"lsof", "/bin/busybox"}, // replaced
-		{"netstat", "/bin/busybox"},
-		{"ps", "/bin/busybox"},
-		{"sh", "/bin/busybox"},
-		{"touch", "/bin/busybox"},        // detect container layer on the AUFS
-		{"uname", "/bin/busybox"},        // cli
-		{"which", "/bin/busybox"},        // cli
-		{"cat", "*"},                     // k8s readiness and openshift operations
-		{"configure.sh", "/bin/busybox"}, // monitor tool
-		{"teardown.sh", "/bin/busybox"},  // monitor tool
-		{"stty", "/bin/busybox"},         // python3.9
+		{"netstat", "/bin/busybox"},      // monitor
+		{"touch", "*"},                   // detect container layer on the AUFS
+		{"uname", "*"},                   // cli
+		{"which", "*"},                   // cli
+		{"configure.sh", "*"},            // monitor tool
+		{"teardown.sh", "*"},             // monitor tool
+		{"stty", "*"},         			  // python
+		{"nproc", "/bin/busybox"},        // dp
 
 		// below entries for debug purpose : docker exec -ti allinone sh
-		{"sh", "/bin/dash"},
 		{"ip", "/sbin/ip"},
 		{"iptables", "/sbin/xtables-legacy-multi"},      // dp
 		{"iptables-save", "/sbin/xtables-legacy-multi"}, // dp
-		{"ps", "/usr/bin/ps"},                           // new procps package
 		{"top", "/usr/bin/top"},                         // new procps package
 		{"kill", "/bin/kill"},                           // new procps package
 		{"ls", "/bin/busybox"},
 		{"kill", "/bin/busybox"}, // replaced
 		{"top", "/bin/busybox"},  // replaced
 		{"nslookup", "/bin/busybox"},
-		{"nc", "/bin/busybox"},
-		{"echo", "/bin/busybox"},
-		{"tee", "/usr/bin/tee"},
 
 		// k8s or openshift environment
 		{"pause", "/pause"},     // k8s, pause
 		{"pod", "/usr/bin/pod"}, // openshift, pod
 		{"mount", "*"},          // k8s volume plug-in
-		{"grep", "*"},           // CIS bench tests
+		{"grep", "*"},           // monitor, CIS bench tests
+		{"which", "*"},
+
+		// bench scripts
+		{"awk", "*"},
+		{"cut", "*"},
+		{"echo", "*"},
+		{"find", "*"},
+		{"grep", "*"},
 		{"pgrep", "*"},
 		{"sed", "*"},
+		{"sort", "*"},
+		{"stat", "*"},
+		{"tail", "*"},
+		{"tee", "*"},
+		{"tr", "*"},
+		{"yq", "*"},
 	}
 
 	return buildCustomizedProfile(serviceGroup, share.PolicyModeEnforce, whtLst, nil)
@@ -700,6 +729,10 @@ func (e *Engine) InsertNeuvectorProcessProfilePolicy(group, role string) {
 		profile = buildScannerProfileList(group)
 	case "updater", "fetcher": // should not have protection, phase-out soon
 		profile = buildAllowAllProfile(group)
+	case "csp":
+		profile = buildCspProfileList(group)
+	case "registry-adapter":
+		profile = buildRegistryAdapterProfileList(group)
 	}
 
 	// now, we use minimum policy for other neuvector containers

@@ -35,6 +35,7 @@ type ScanInterface interface {
 	StopRegistry(name string) error
 	GetFedRegistryCache(getCfg, getNames bool) ([]*share.CLUSRegistryConfig, utils.Set)
 	CheckRegistry(name string) bool
+	GetRegistryImagesIDs(name string, vpf scanUtils.VPFInterface, showTag string, acc *access.AccessControl, filteredMap map[string]bool) ([]string, error)
 
 	// GetScannedImageSummary(reqImgRegistry utils.Set, reqImgRepo, reqImgTag string, vpf scanUtils.VPFInterface) []*nvsysadmission.ScannedImageSummary
 	// RegistryImageStateUpdate(name, id string, sum *share.CLUSRegistryImageSummary, vpf scanUtils.VPFInterface) (utils.Set, []string, []string)
@@ -55,7 +56,7 @@ func refreshScanCache(rs *Registry, id string, sum *share.CLUSRegistryImageSumma
 		if report := clusHelper.GetScanReport(key); report != nil {
 			var highs, meds []string
 			alives := vpf.FilterVulTraits(c.vulTraits, images2IDNames(rs, sum))
-			highs, meds, c.highVulsWithFix, c.vulScore, c.vulInfo, c.lowVulInfo = countVuln(report.Vuls, alives)
+			highs, meds, _, c.highVulsWithFix, c.vulScore, c.vulInfo, c.lowVulInfo = countVuln(report.Vuls, nil, alives)
 			c.highVuls = len(highs)
 			c.medVuls = len(meds)
 			c.filteredTime = time.Now()
@@ -160,6 +161,37 @@ func getScannedImages(reqImgRegistry utils.Set, reqImgRepo, reqImgTag string, vp
 	return sumMap
 }
 
+// Normalize the request if the registry URL is added to the repo field
+func FixRegRepoForAdmCtrl(result *share.ScanResult) {
+	if result.Registry == "" && result.Repository != "" {
+		var proto string
+		regRepoTag := result.Repository
+		for _, proto = range []string{"http://", "https://"} {
+			if strings.HasPrefix(regRepoTag, proto) {
+				regRepoTag = regRepoTag[len(proto):]
+				break
+			}
+		}
+		if proto == "" {
+			proto = "https://"
+		}
+		if ss := strings.Split(regRepoTag, "/"); len(ss) > 1 {
+			// see splitDockerDomain() in https://github.com/docker/distribution/blob/release/2.7/reference/normalize.go
+			if !strings.ContainsAny(ss[0], ".:") && ss[0] != "localhost" {
+				// there is no registry info in regRepoTag, like "library/centos"
+			} else {
+				// there is registry info in regRepoTag, like "docker.io/library/centos" or "10.1.127.3:5000/......" or "localhost/........"
+				result.Registry = fmt.Sprintf("%s%s/", proto, ss[0])
+				result.Repository = strings.Join(ss[1:], "/")
+			}
+		} else if len(ss) == 1 {
+			// there is no registry info in regRepoTag, like "centos". Adm ctrl always prefix library, so keep the behavior same here
+			// if the local image is 'centos', then it is scanned as 'centos' but store the result as 'library/centos'
+			result.Repository = fmt.Sprintf("library/%s", ss[0])
+		}
+	}
+}
+
 func GetScannedImageSummary(reqImgRegistry utils.Set, reqImgRepo, reqImgTag string, vpf scanUtils.VPFInterface) []*nvsysadmission.ScannedImageSummary {
 	log.WithFields(log.Fields{"registry": reqImgRegistry, "repo": reqImgRepo, "tag": reqImgTag}).Debug()
 
@@ -195,6 +227,7 @@ func GetScannedImageSummary(reqImgRegistry utils.Set, reqImgRepo, reqImgTag stri
 			SecretsCnt:      len(s.cache.secrets),
 			SetIDPermCnt:    len(s.cache.setIDPerm),
 			Modules:         s.cache.modules,
+			Verifiers:       s.cache.signatureVerifiers,
 		}
 		for _, v := range s.cache.vulTraits {
 			if !v.IsFiltered() {
@@ -242,6 +275,7 @@ func image2RESTSummary(rs *Registry, id string, sum *share.CLUSRegistryImageSumm
 	if !sum.ScannedAt.IsZero() {
 		s.ScannedTimeStamp = sum.ScannedAt.Unix()
 		s.ScannedAt = api.RESTTimeString(sum.ScannedAt)
+		s.CreatedAt = api.RESTTimeString(sum.CreatedAt)
 		s.Result = scanUtils.ScanErrorToStr(sum.Result)
 		s.Size = sum.Size
 		s.Author = sum.Author
@@ -314,8 +348,14 @@ func (m *scanMethod) StoreRepoScanResult(result *share.ScanResult) error {
 		Author:    result.Author,
 		ScanFlags: share.ScanFlagCVE,
 	}
+	if c, err := time.Parse(time.RFC3339, result.Created); err == nil {
+		sum.CreatedAt = c
+	}
 	if result.Secrets != nil {
 		sum.ScanFlags |= share.ScanFlagFiles
+	}
+	if result.SignatureInfo != nil {
+		sum.Verifiers = result.SignatureInfo.Verifiers
 	}
 	sum.RunAsRoot, _, _ = scanUtils.ParseImageCmds(result.Cmds)
 	rs.summary[result.ImageID] = sum
@@ -405,7 +445,7 @@ func (m *scanMethod) GetRegistryVulnerabilities(name string, vpf scanUtils.VPFIn
 			if sum, ok := rs.summary[id]; ok {
 				refreshScanCache(rs, id, sum, c, vpf)
 
-				vmap[id] = scanUtils.FillVulDetails(sdb.CVEDB, sum.BaseOS, c.vulTraits, showTag)
+				vmap[id] = scanUtils.FillVulTraits(sdb.CVEDB, sum.BaseOS, c.vulTraits, showTag, false)
 				nmap[id] = images2IDNames(rs, sum)
 			}
 		}
@@ -415,7 +455,7 @@ func (m *scanMethod) GetRegistryVulnerabilities(name string, vpf scanUtils.VPFIn
 				if acc.Authorize(sum, func(s string) share.AccessObject { return rs.config }) {
 					refreshScanCache(rs, id, sum, c, vpf)
 
-					vmap[id] = scanUtils.FillVulDetails(sdb.CVEDB, sum.BaseOS, c.vulTraits, showTag)
+					vmap[id] = scanUtils.FillVulTraits(sdb.CVEDB, sum.BaseOS, c.vulTraits, showTag, false)
 					nmap[id] = images2IDNames(rs, sum)
 				}
 			}
@@ -506,7 +546,7 @@ func (m *scanMethod) GetRegistryImageReport(name, id string, vpf scanUtils.VPFIn
 			rrpt.Cmds = c.cmds
 
 			refreshScanCache(rs, id, sum, c, vpf)
-			rrpt.Vuls = scanUtils.FillVulDetails(sdb.CVEDB, sum.BaseOS, c.vulTraits, showTag)
+			rrpt.Vuls = scanUtils.FillVulTraits(sdb.CVEDB, sum.BaseOS, c.vulTraits, showTag, false)
 			// The checks are still to be filtered
 			rrpt.Checks = scanUtils.ImageBench2REST(c.cmds, c.secrets, c.setIDPerm, tagMap)
 
@@ -525,6 +565,15 @@ func (m *scanMethod) GetRegistryImageReport(name, id string, vpf scanUtils.VPFIn
 			rrpt.Modules = make([]*api.RESTScanModule, len(c.modules))
 			for i, m := range c.modules {
 				rrpt.Modules[i] = scanUtils.ScanModule2REST(m)
+			}
+
+			rrpt.SignatureInfo = &api.RESTScanSignatureInfo{
+				VerificationTimestamp: c.signatureVerificationTimestamp,
+			}
+
+			rrpt.SignatureInfo.Verifiers = make([]string, len(c.signatureVerifiers))
+			for i, v := range c.signatureVerifiers {
+				rrpt.SignatureInfo.Verifiers[i] = v
 			}
 		}
 	}
@@ -573,7 +622,7 @@ func (m *scanMethod) GetRegistryLayersReport(name, id string, vpf scanUtils.VPFI
 			for i, vul := range layer.Vuls {
 				rvuls[i] = scanUtils.ScanVul2REST(sdb.CVEDB, sum.BaseOS, vul)
 			}
-			rvuls = vpf.FilterVulnerabilities(rvuls, idns, showTag)
+			rvuls = vpf.FilterVulREST(rvuls, idns, showTag)
 
 			var rsecrets []*api.RESTScanSecret
 			if !rs.config.DisableFiles && layer.Secrets != nil {
@@ -854,4 +903,67 @@ func (m *scanMethod) TestRegistry(ctx context.Context, config *share.CLUSRegistr
 	}
 
 	return nil
+}
+
+func (m *scanMethod) GetRegistryImagesIDs(name string, vpf scanUtils.VPFInterface, showTag string, acc *access.AccessControl, filteredMap map[string]bool) ([]string, error) {
+	var rs *Registry
+	var ok bool
+
+	if name == common.RegistryRepoScanName {
+		rs = repoScanRegistry
+	} else if name == common.RegistryFedRepoScanName {
+		rs = repoFedScanRegistry
+	} else if rs, ok = regMapLookup(name); !ok {
+		return nil, common.ErrObjectNotFound
+	}
+
+	rs.stateLock()
+	defer rs.stateUnlock()
+	if !acc.Authorize(rs.config, nil) {
+		return nil, common.ErrObjectAccessDenied
+	}
+
+	allowed := make([]string, 0)
+
+	// sdb := scanUtils.GetScannerDB()
+	if acc.HasGlobalPermissions(share.PERM_REG_SCAN, 0) {
+		// To avoid authorize for every image - run faster.
+		for id, c := range rs.cache {
+			if sum, ok := rs.summary[id]; ok {
+				allowed = append(allowed, id)
+
+				refreshScanCache(rs, id, sum, c, vpf)
+
+				// vpf handling
+				for _, v := range c.vulTraits {
+					if v.IsFiltered() {
+						key := fmt.Sprintf("%s;%s", id, v.Name)
+						filteredMap[key] = true
+						filteredMap[v.Name] = true
+					}
+				}
+			}
+		}
+	} else {
+		for id, c := range rs.cache {
+			if sum, ok := rs.summary[id]; ok {
+				if acc.Authorize(sum, func(s string) share.AccessObject { return rs.config }) {
+					allowed = append(allowed, id)
+
+					refreshScanCache(rs, id, sum, c, vpf)
+
+					// vpf handling
+					for _, v := range c.vulTraits {
+						if v.IsFiltered() {
+							key := fmt.Sprintf("%s;%s", id, v.Name)
+							filteredMap[key] = true
+							filteredMap[v.Name] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return allowed, nil
 }

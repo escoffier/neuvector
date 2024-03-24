@@ -6,8 +6,9 @@ import "C"
 import (
 	"bufio"
 	"compress/gzip"
-	"crypto/rsa"
+	"crypto/md5"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -120,7 +121,7 @@ func handlerSystemUsage(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 		resp.TelemetryStatus = api.RESTTeleStatus{
 			TeleFreq:       _teleFreq,
 			TeleURL:        _teleNeuvectorURL,
-			CurrentVersion: nvAppFullVersion,
+			CurrentVersion: cctx.NvAppFullVersion,
 		}
 
 		var nvUpgradeInfo share.CLUSCheckUpgradeInfo
@@ -202,7 +203,7 @@ func handlerSystemSummary(w http.ResponseWriter, r *http.Request, ps httprouter.
 		summary.Controllers = cacher.GetControllerCount(acc)
 		summary.Agents = cacher.GetAgentCount(acc, "")
 		summary.OfflineAgents = cacher.GetAgentCount(acc, api.StateOffline)
-		summary.Scanners = cacher.GetScannerCount(acc)
+		summary.Scanners, _, _ = cacher.GetScannerCount(acc)
 		summary.CompoVersions = cacher.GetComponentVersions(acc)
 	}
 	summary.Workloads, summary.RunningWorkloads, summary.RunningPods = cacher.GetWorkloadCount(accSysConfig)
@@ -238,7 +239,10 @@ func handlerSystemGetConfigBase(apiVer string, w http.ResponseWriter, r *http.Re
 					Webhooks: make([]api.RESTWebhook, len(cconf.Webhooks)),
 				}
 				for i, wh := range cconf.Webhooks {
-					fedConf.Webhooks[i] = api.RESTWebhook{Name: wh.Name, Url: wh.Url, Enable: wh.Enable, Type: wh.Type, CfgType: api.CfgTypeFederal}
+					fedConf.Webhooks[i] = api.RESTWebhook{
+						Name: wh.Name, Url: wh.Url, Enable: wh.Enable, UseProxy: wh.UseProxy,
+						Type: wh.Type, CfgType: api.CfgTypeFederal,
+					}
 				}
 				sort.Slice(fedConf.Webhooks, func(i, j int) bool { return fedConf.Webhooks[i].Name < fedConf.Webhooks[j].Name })
 			}
@@ -253,10 +257,14 @@ func handlerSystemGetConfigBase(apiVer string, w http.ResponseWriter, r *http.Re
 			return
 		} else {
 			sort.Slice(rconf.Webhooks, func(i, j int) bool { return rconf.Webhooks[i].Name < rconf.Webhooks[j].Name })
+			sort.Slice(rconf.RemoteRepositories, func(i, j int) bool {
+				return rconf.RemoteRepositories[i].Nickname < rconf.RemoteRepositories[j].Nickname
+			})
 		}
 		if !k8sPlatform && scope == share.ScopeLocal {
 			rconf.ScannerAutoscale = api.RESTSystemConfigAutoscale{}
 			rconf.ScannerAutoscale.Strategy = api.AutoScaleNA
+			rconf.ScannerAutoscale.DisabledByOthers = false
 		}
 		if rconf.ScannerAutoscale.MinPods == 0 {
 			rconf.ScannerAutoscale.MinPods = 1
@@ -270,6 +278,14 @@ func handlerSystemGetConfigBase(apiVer string, w http.ResponseWriter, r *http.Re
 	if scope == share.ScopeFed {
 		resp.FedConfig = fedConf
 	} else if scope == share.ScopeLocal || scope == share.ScopeAll {
+		_, rconf.CspType = common.GetMappedCspType(nil, &cctx.CspType)
+		if rconf.CspType == "none" || rconf.CspType == "" {
+			if fedRole := cacher.GetFedMembershipRoleNoAuth(); fedRole == api.FedRoleJoint {
+				masterCluster := cacher.GetFedMasterCluster(acc)
+				cached := cacher.GetFedJoinedClusterStatus(masterCluster.ID, acc)
+				_, rconf.CspType = common.GetMappedCspType(nil, &cached.CspType)
+			}
+		}
 		if scope == share.ScopeAll && fedConf != nil && len(fedConf.Webhooks) > 0 {
 			rconf.Webhooks = append(fedConf.Webhooks, rconf.Webhooks...)
 		}
@@ -289,7 +305,9 @@ func handlerSystemGetConfigBase(apiVer string, w http.ResponseWriter, r *http.Re
 						SyslogCategories:   rconf.SyslogCategories,
 						SyslogInJSON:       rconf.SyslogInJSON,
 						SingleCVEPerSyslog: rconf.SingleCVEPerSyslog,
+						SyslogCVEInLayers:  rconf.SyslogCVEInLayers,
 						SyslogServerCert:   rconf.SyslogServerCert,
+						OutputEventToLogs:  rconf.OutputEventToLogs,
 					},
 					Auth: api.RESTSystemConfigAuthV2{
 						AuthOrder:      rconf.AuthOrder,
@@ -304,8 +322,10 @@ func handlerSystemGetConfigBase(apiVer string, w http.ResponseWriter, r *http.Re
 						MonitorServiceMesh: rconf.MonitorServiceMesh,
 						XffEnabled:         rconf.XffEnabled,
 						NoTelemetryReport:  rconf.NoTelemetryReport,
+						CspType:            rconf.CspType,
 					},
-					Webhooks: rconf.Webhooks,
+					Webhooks:           rconf.Webhooks,
+					RemoteRepositories: rconf.RemoteRepositories,
 					Proxy: api.RESTSystemConfigProxyV2{
 						RegistryHttpProxyEnable:  rconf.RegistryHttpProxyEnable,
 						RegistryHttpsProxyEnable: rconf.RegistryHttpsProxyEnable,
@@ -333,9 +353,11 @@ func handlerSystemGetConfigBase(apiVer string, w http.ResponseWriter, r *http.Re
 					ScannerAutoscale: rconf.ScannerAutoscale,
 				},
 			}
-			if scope == share.ScopeLocal || scope == share.ScopeAll {
-				_, strCspType := common.GetMappedCspType(nil, &cctx.CspType)
-				respV2.Config.Misc.CspType = strCspType
+			if respV2.Config.ModeAuto.ModeAutoD2MDuration == 0 {
+				respV2.Config.ModeAuto.ModeAutoD2MDuration = 1
+			}
+			if respV2.Config.ModeAuto.ModeAutoM2PDuration == 0 {
+				respV2.Config.ModeAuto.ModeAutoM2PDuration = 1
 			}
 			restRespSuccess(w, r, respV2, acc, login, nil, "Get system configuration")
 			return
@@ -343,7 +365,6 @@ func handlerSystemGetConfigBase(apiVer string, w http.ResponseWriter, r *http.Re
 			resp.Config = rconf
 		}
 	}
-
 	restRespSuccess(w, r, resp, acc, login, nil, "Get system configuration")
 }
 
@@ -525,7 +546,10 @@ func configWebhooks(rcWebhookUrl *string, rcWebhooks *[]*api.RESTWebhook, cconfW
 		}
 
 		newWebhookNames.Add(api.WebhookDefaultName)
-		h := share.CLUSWebhook{Name: api.WebhookDefaultName, Url: *rcWebhookUrl, Enable: true, Type: api.WebhookTypeSlack, CfgType: cfgType}
+		h := share.CLUSWebhook{
+			Name: api.WebhookDefaultName, Url: *rcWebhookUrl, Enable: true,
+			Type: api.WebhookTypeSlack, UseProxy: false, CfgType: cfgType,
+		}
 		if !acc.Authorize(&h, nil) {
 			return nil, api.RESTErrObjectAccessDenied, common.ErrObjectAccessDenied
 		}
@@ -554,7 +578,10 @@ func configWebhooks(rcWebhookUrl *string, rcWebhooks *[]*api.RESTWebhook, cconfW
 			}
 
 			newWebhookNames.Add(h.Name)
-			newWebhooks = append(newWebhooks, share.CLUSWebhook{Name: h.Name, Url: h.Url, Enable: h.Enable, Type: h.Type, CfgType: cfgType})
+			newWebhooks = append(newWebhooks, share.CLUSWebhook{
+				Name: h.Name, Url: h.Url, Enable: h.Enable, UseProxy: h.UseProxy,
+				Type: h.Type, CfgType: cfgType,
+			})
 		}
 	}
 
@@ -618,11 +645,12 @@ func handlerSystemWebhookCreate(w http.ResponseWriter, r *http.Request, ps httpr
 	}
 
 	cwh := share.CLUSWebhook{
-		Name:    rwh.Name,
-		Url:     rwh.Url,
-		Enable:  rwh.Enable,
-		Type:    rwh.Type,
-		CfgType: share.UserCreated,
+		Name:     rwh.Name,
+		Url:      rwh.Url,
+		Enable:   rwh.Enable,
+		UseProxy: rwh.UseProxy,
+		Type:     rwh.Type,
+		CfgType:  share.UserCreated,
 	}
 	if rwh.CfgType == api.CfgTypeFederal {
 		cwh.CfgType = share.FederalCfg
@@ -788,7 +816,13 @@ func handlerSystemWebhookConfig(w http.ResponseWriter, r *http.Request, ps httpr
 		var found bool
 		for i, _ := range cconf.Webhooks {
 			if cconf.Webhooks[i].Name == rwh.Name {
-				cconf.Webhooks[i] = share.CLUSWebhook{Name: rwh.Name, Url: rwh.Url, Enable: rwh.Enable, Type: rwh.Type}
+				cconf.Webhooks[i] = share.CLUSWebhook{
+					Name:     rwh.Name,
+					Url:      rwh.Url,
+					Enable:   rwh.Enable,
+					UseProxy: rwh.UseProxy,
+					Type:     rwh.Type,
+				}
 				found = true
 				break
 			}
@@ -961,7 +995,7 @@ func configSystemConfig(w http.ResponseWriter, acc *access.AccessControl, login 
 		}
 
 		// Acquire lock if auth order or webhook is changing
-		if rc.AuthOrder != nil || (rc.WebhookUrl != nil && *rc.WebhookUrl != "") || rc.Webhooks != nil {
+		if rc.AuthOrder != nil || (rc.WebhookUrl != nil && *rc.WebhookUrl != "") || rc.Webhooks != nil || rc.RemoteRepositories != nil {
 			lock, err := clusHelper.AcquireLock(share.CLUSLockServerKey, clusterLockWait)
 			if err != nil {
 				restRespErrorMessage(w, http.StatusInternalServerError, api.RESTErrFailLockCluster, err.Error())
@@ -1164,6 +1198,18 @@ func configSystemConfig(w http.ResponseWriter, acc *access.AccessControl, login 
 				}
 			}
 
+			if rc.SyslogServerCert != nil {
+				cconf.SyslogServerCert = *rc.SyslogServerCert
+			}
+			if cconf.SyslogIPProto == api.SyslogProtocolTCPTLS && (rc.SyslogIPProto != nil || rc.SyslogServerCert != nil) {
+				if certErr := validateCertificate(cconf.SyslogServerCert); certErr != nil {
+					e := "Invalid syslog server certificate"
+					log.WithFields(log.Fields{"error": certErr}).Error(e)
+					restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrInvalidRequest, e)
+					return kick, errors.New(e)
+				}
+			}
+
 			if rc.SyslogPort != nil {
 				if *rc.SyslogPort == 0 {
 					cconf.SyslogPort = api.SyslogDefaultUDPPort
@@ -1207,9 +1253,12 @@ func configSystemConfig(w http.ResponseWriter, acc *access.AccessControl, login 
 			if rc.SingleCVEPerSyslog != nil {
 				cconf.SingleCVEPerSyslog = *rc.SingleCVEPerSyslog
 			}
+			if rc.SyslogCVEInLayers != nil {
+				cconf.SyslogCVEInLayers = *rc.SyslogCVEInLayers
+			}
 
-			if rc.SyslogServerCert != nil {
-				cconf.SyslogServerCert = *rc.SyslogServerCert
+			if rc.OutputEventToLogs != nil {
+				cconf.OutputEventToLogs = *rc.OutputEventToLogs
 			}
 
 			// Auth order
@@ -1275,6 +1324,41 @@ func configSystemConfig(w http.ResponseWriter, acc *access.AccessControl, login 
 					return kick, err
 				} else {
 					cconf.Webhooks = webhooks
+				}
+			}
+
+			// remote registories
+			if rc.RemoteRepositories != nil {
+				if len(*rc.RemoteRepositories) == 0 {
+					cconf.RemoteRepositories = make([]share.CLUSRemoteRepository, 0)
+				} else {
+					rr := (*rc.RemoteRepositories)[0]
+					if len(cconf.RemoteRepositories) != 1 {
+						cconf.RemoteRepositories = make([]share.CLUSRemoteRepository, 1)
+					}
+					cr := share.CLUSRemoteRepository{
+						Nickname: rr.Nickname,
+						Provider: rr.Provider,
+						Comment:  rr.Comment,
+					}
+					if rr.GitHubConfiguration != nil {
+						githubCfg := *rr.GitHubConfiguration
+						cr.GitHubConfiguration = &share.RemoteRepository_GitHubConfiguration{
+							RepositoryOwnerUsername:          githubCfg.RepositoryOwnerUsername,
+							RepositoryName:                   githubCfg.RepositoryName,
+							RepositoryBranchName:             githubCfg.RepositoryBranchName,
+							PersonalAccessToken:              githubCfg.PersonalAccessToken,
+							PersonalAccessTokenCommitterName: githubCfg.PersonalAccessTokenCommitterName,
+							PersonalAccessTokenEmail:         githubCfg.PersonalAccessTokenEmail,
+						}
+					}
+					if len(*rc.RemoteRepositories) > 1 || !cr.IsValid() {
+						err := errors.New("Unsupported remote repository nickname or provider")
+						log.WithFields(log.Fields{"err": err}).Error()
+						restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrInvalidRequest, err.Error())
+						return kick, err
+					}
+					cconf.RemoteRepositories[0] = cr
 				}
 			}
 
@@ -1394,6 +1478,8 @@ func configSystemConfig(w http.ResponseWriter, acc *access.AccessControl, login 
 							if max == 0 {
 								max = 3
 							}
+							// always reset DisabledByOthers when user intentionally enable autoscale
+							cconf.ScannerAutoscale.DisabledByOthers = false
 						}
 						strategy = *autoscale.Strategy
 						allowed := utils.NewSet(api.AutoScaleNone, api.AutoScaleImmediate, api.AutoScaleDelayed)
@@ -1489,15 +1575,9 @@ func handlerSystemConfigBase(apiVer string, w http.ResponseWriter, r *http.Reque
 				config.SyslogCategories = configV2.SyslogCfg.SyslogCategories
 				config.SyslogInJSON = configV2.SyslogCfg.SyslogInJSON
 				config.SingleCVEPerSyslog = configV2.SyslogCfg.SingleCVEPerSyslog
+				config.SyslogCVEInLayers = configV2.SyslogCfg.SyslogCVEInLayers
 				config.SyslogServerCert = configV2.SyslogCfg.SyslogServerCert
-
-				if *config.SyslogIPProto == api.SyslogProtocolTCPTLS {
-					if certErr := validateCertificate(*config.SyslogServerCert); certErr != nil {
-						log.WithFields(log.Fields{"error": err}).Error("Request error,  invalid syslog server certificate")
-						restRespError(w, http.StatusBadRequest, api.RESTErrInvalidRequest)
-						return
-					}
-				}
+				config.OutputEventToLogs = configV2.SyslogCfg.OutputEventToLogs
 			}
 			if configV2.AuthCfg != nil {
 				config.AuthOrder = configV2.AuthCfg.AuthOrder
@@ -1512,6 +1592,9 @@ func handlerSystemConfigBase(apiVer string, w http.ResponseWriter, r *http.Reque
 			}
 			if configV2.Webhooks != nil {
 				config.Webhooks = configV2.Webhooks
+			}
+			if configV2.RemoteRepositories != nil {
+				config.RemoteRepositories = configV2.RemoteRepositories
 			}
 			if configV2.IbmsaCfg != nil {
 				config.IBMSAEpEnabled = configV2.IbmsaCfg.IBMSAEpEnabled
@@ -1843,24 +1926,19 @@ func handlerSystemGetRBAC(w http.ResponseWriter, r *http.Request, ps httprouter.
 		return
 	}
 
-	emptySlice := make([]string, 0)
 	var resp api.RESTK8sNvRbacStatus = api.RESTK8sNvRbacStatus{
-		ClusterRoleErrors:        emptySlice,
-		ClusterRoleBindingErrors: emptySlice,
-		RoleErrors:               emptySlice,
-		RoleBindingErrors:        emptySlice,
-		NvUpgradeInfo:            &api.RESTCheckUpgradeInfo{},
-		NvCrdSchemaErrors:        emptySlice,
+		NvUpgradeInfo: &api.RESTCheckUpgradeInfo{},
 	}
+	var clusterRoleErrors, clusterRoleBindingErrors, roleErrors, roleBindingErrors, nvCrdSchemaErrors []string
 	if k8sPlatform {
-		resp.ClusterRoleErrors, resp.ClusterRoleBindingErrors, resp.RoleErrors, resp.RoleBindingErrors =
+		clusterRoleErrors, clusterRoleBindingErrors, roleErrors, roleBindingErrors =
 			resource.VerifyNvK8sRBAC(localDev.Host.Flavor, "", false)
 		if checkCrdSchemaFunc != nil {
 			var leader bool
 			if lead := atomic.LoadUint32(&_isLeader); lead == 1 {
 				leader = true
 			}
-			resp.NvCrdSchemaErrors = checkCrdSchemaFunc(leader, false, cctx.CspType)
+			nvCrdSchemaErrors = checkCrdSchemaFunc(leader, false, false, cctx.CspType)
 		}
 	}
 
@@ -1887,6 +1965,51 @@ func handlerSystemGetRBAC(w http.ResponseWriter, r *http.Request, ps httprouter.
 	if nvUpgradeInfo.MinUpgradeVersion == empty && nvUpgradeInfo.MaxUpgradeVersion == empty {
 		resp.NvUpgradeInfo = nil
 	}
+
+	var accepted []string
+	if user, _, _ := clusHelper.GetUserRev(common.ReservedNvSystemUser, access.NewReaderAccessControl()); user != nil {
+		accepted = user.AcceptedAlerts
+	}
+	if user, _, _ := clusHelper.GetUserRev(login.fullname, acc); user != nil {
+		accepted = append(accepted, user.AcceptedAlerts...)
+	}
+	acceptedAlerts := utils.NewSetFromStringSlice(accepted)
+	var acceptable [5]map[string]string
+	var acceptableAlerts api.RESTK8sNvAcceptableAlerts
+	for i, alerts := range [][]string{clusterRoleErrors, clusterRoleBindingErrors, roleErrors, roleBindingErrors, nvCrdSchemaErrors} {
+		if len(alerts) > 0 {
+			acceptable[i] = make(map[string]string, 0)
+			for _, alert := range alerts {
+				b := md5.Sum([]byte(alert))
+				key := hex.EncodeToString(b[:])
+				if !acceptedAlerts.Contains(key) {
+					// this alert has not been accepted yet. put it in the response
+					acceptable[i][key] = alert
+				}
+			}
+		}
+	}
+	acceptableAlerts.ClusterRoleErrors = acceptable[0]
+	acceptableAlerts.ClusterRoleBindingErrors = acceptable[1]
+	acceptableAlerts.RoleErrors = acceptable[2]
+	acceptableAlerts.RoleBindingErrors = acceptable[3]
+	acceptableAlerts.NvCrdSchemaErrors = acceptable[4]
+	resp.AcceptableAlerts = &api.RESTK8sNvAcceptableAlerts{
+		ClusterRoleErrors:        acceptable[0],
+		ClusterRoleBindingErrors: acceptable[1],
+		RoleErrors:               acceptable[2],
+		RoleBindingErrors:        acceptable[3],
+		NvCrdSchemaErrors:        acceptable[4],
+	}
+
+	var acceptedManagerAlerts []string
+	for _, key := range []string{share.AlertNvNewVerAvailable, share.AlertNvInMultiVersions, share.AlertCveDbTooOld} {
+		if acceptedAlerts.Contains(key) {
+			// this manager-generated alert key has been accepted. put it in the response
+			acceptedManagerAlerts = append(acceptedManagerAlerts, key)
+		}
+	}
+	resp.AcceptedAlerts = acceptedManagerAlerts
 
 	restRespSuccess(w, r, &resp, acc, login, nil, "Get missing Kubernetes RBAC")
 }
@@ -2087,6 +2210,24 @@ func multipartImportRead(r *http.Request, params map[string]string, tmpfile *os.
 	return lines, nil
 }
 
+func _preprocessImportBody(body []byte) []byte {
+	bomUtf8 := []byte{0xc3, 0xaf, 0xc2, 0xbb, 0xc2, 0xbf}
+	if len(body) >= len(bomUtf8) {
+		found := true
+		for i, b := range bomUtf8 {
+			if b != body[i] {
+				found = false
+				break
+			}
+		}
+		if found {
+			body = body[len(bomUtf8):]
+		}
+	}
+
+	return body
+}
+
 func _importHandler(w http.ResponseWriter, r *http.Request, tid, importType, tempFilePrefix string, acc *access.AccessControl, login *loginSession) {
 	importRunning := false
 	importNoResponse := false
@@ -2128,7 +2269,11 @@ func _importHandler(w http.ResponseWriter, r *http.Request, tid, importType, tem
 		}
 		if importTask.TID == tid {
 			if !importRunning && resp.Data.Status != share.IMPORT_DONE {
-				restRespErrorMessageEx(w, http.StatusInternalServerError, api.RESTErrFailImport, importTask.Status, resp)
+				status := http.StatusInternalServerError
+				if importTask.Status == "Invalid security rule(s)" {
+					status = http.StatusBadRequest
+				}
+				restRespErrorMessageEx(w, status, api.RESTErrFailImport, importTask.Status, resp)
 			} else {
 				// import is not running and caller tries to query the last import status
 				restRespSuccess(w, r, &resp, acc, login, nil, "")
@@ -2179,6 +2324,7 @@ func _importHandler(w http.ResponseWriter, r *http.Request, tid, importType, tem
 			}
 		} else {
 			body, _ := ioutil.ReadAll(r.Body)
+			body = _preprocessImportBody(body)
 			json_data, err := yaml.YAMLToJSON(body)
 			if err != nil {
 				log.WithFields(log.Fields{"error": err, "importType": importType}).Error("Request error")
@@ -2196,7 +2342,7 @@ func _importHandler(w http.ResponseWriter, r *http.Request, tid, importType, tem
 					Server:   login.server,
 				}
 				domainRoles := access.DomainRole{access.AccessDomainGlobal: api.UserRoleImportStatus}
-				_, tempToken, _ = jwtGenerateToken(user, domainRoles, login.remote, login.mainSessionID, "")
+				_, tempToken, _ = jwtGenerateToken(user, domainRoles, login.remote, login.mainSessionID, "", nil)
 			}
 
 			importTask.TotalLines = lines
@@ -2219,6 +2365,17 @@ func _importHandler(w http.ResponseWriter, r *http.Request, tid, importType, tem
 				go importDlp(share.ScopeLocal, login.domainRoles, importTask, postImportOp)
 			case share.IMPORT_TYPE_WAF:
 				go importWaf(share.ScopeLocal, login.domainRoles, importTask, postImportOp)
+			case share.IMPORT_TYPE_VULN_PROFILE:
+				option := "merge"
+				query := restParseQuery(r)
+				if query != nil {
+					if value, ok := query.pairs["option"]; ok && value == "replace" {
+						option = value
+					}
+				}
+				go importVulnProfile(share.ScopeLocal, option, login.domainRoles, importTask, postImportOp)
+			case share.IMPORT_TYPE_COMP_PROFILE:
+				go importCompProfile(share.ScopeLocal, login.domainRoles, importTask, postImportOp)
 			}
 
 			resp := api.RESTImportTaskData{
@@ -2254,6 +2411,10 @@ func _importHandler(w http.ResponseWriter, r *http.Request, tid, importType, tem
 		msgToken = "DLP configurations"
 	case share.IMPORT_TYPE_WAF:
 		msgToken = "WAF configurations"
+	case share.IMPORT_TYPE_VULN_PROFILE:
+		msgToken = "vulnerability profile"
+	case share.IMPORT_TYPE_COMP_PROFILE:
+		msgToken = "compliance profile"
 	}
 	configLog(share.CLUSEvImportFail, login, fmt.Sprintf("Failed to import %s", msgToken))
 	return
@@ -2289,7 +2450,7 @@ func postImportOp(err error, importTask share.CLUSImportTask, loginDomainRoles a
 	var msgToken string
 	switch importType {
 	case share.IMPORT_TYPE_CONFIG:
-		cacher.SyncAdmCtrlStateToK8s(resource.NvAdmSvcName, resource.NvAdmValidatingName)
+		cacher.SyncAdmCtrlStateToK8s(resource.NvAdmSvcName, resource.NvAdmValidatingName, false)
 		msgToken = "configurations"
 	case share.IMPORT_TYPE_GROUP_POLICY:
 		msgToken = "group policy"
@@ -2299,6 +2460,10 @@ func postImportOp(err error, importTask share.CLUSImportTask, loginDomainRoles a
 		msgToken = "DLP rules"
 	case share.IMPORT_TYPE_WAF:
 		msgToken = "WAF rules"
+	case share.IMPORT_TYPE_VULN_PROFILE:
+		msgToken = "vulnerability profile"
+	case share.IMPORT_TYPE_COMP_PROFILE:
+		msgToken = "compliance profile"
 	}
 
 	importTask.LastUpdateTime = time.Now().UTC()
@@ -2358,6 +2523,18 @@ func postImportOp(err error, importTask share.CLUSImportTask, loginDomainRoles a
 				LockKey:       share.CLUSLockPolicyKey,
 				KvCrdKind:     resource.NvWafSecurityRuleKind,
 			},
+			&resource.NvCrdInfo{
+				RscType:       resource.RscTypeCrdVulnProfile,
+				SpecNamesKind: resource.NvVulnProfileSecurityRuleKind,
+				LockKey:       share.CLUSLockVulnKey,
+				KvCrdKind:     resource.NvVulnProfileSecurityRuleKind,
+			},
+			&resource.NvCrdInfo{
+				RscType:       resource.RscTypeCrdCompProfile,
+				SpecNamesKind: resource.NvCompProfileSecurityRuleKind,
+				LockKey:       share.CLUSLockCompKey,
+				KvCrdKind:     resource.NvCompProfileSecurityRuleKind,
+			},
 		}
 		for _, crdInfo := range nvCrdInfo {
 			CrossCheckCrd(crdInfo.SpecNamesKind, crdInfo.RscType, crdInfo.KvCrdKind, crdInfo.LockKey, true)
@@ -2414,12 +2591,15 @@ func validateCertificate(certificate string) error {
 	if block == nil {
 		return errors.New("Invalid certificate")
 	}
-	cert, err := x509.ParseCertificate(block.Bytes)
+	_, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		return errors.New("Invalid certificate")
 	}
-	if _, ok := cert.PublicKey.(*rsa.PublicKey); !ok {
-		return errors.New("Invalid certificate, certificate doesn't contain a public key")
-	}
+
+	// No need to check the specific type of public key; relying on x509.ParseCertificate() should be sufficient.
+	// Different signature algorithms have different types.
+	// if _, ok := cert.PublicKey.(*rsa.PublicKey); !ok {
+	// 	return errors.New("Invalid certificate, certificate doesn't contain a public key")
+	// }
 	return nil
 }

@@ -20,10 +20,8 @@ import (
 	"github.com/neuvector/neuvector/share/utils"
 )
 
-func bench2REST(bench share.BenchType, item *share.CLUSBenchItem, cpf *complianceProfileFilter) *api.RESTBenchItem {
+func bench2REST(bench share.BenchType, item *share.CLUSBenchItem, cpf *complianceProfileFilter, metaMap map[string]api.RESTBenchMeta) *api.RESTBenchItem {
 	var r *api.RESTBenchItem
-
-	_, metaMap := scanUtils.GetComplianceMeta()
 
 	if c, ok := metaMap[item.TestNum]; ok {
 		r = &api.RESTBenchItem{
@@ -83,8 +81,10 @@ func bench2REST(bench share.BenchType, item *share.CLUSBenchItem, cpf *complianc
 	for _, m := range item.Message {
 		r.Message = append(r.Message, m)
 	}
+
 	if len(r.Message) > 0 {
-		r.Description = fmt.Sprintf("%s - %s", r.Description, r.Message[0])
+		allMessages := strings.Join(r.Message, ", ")
+		r.Description = fmt.Sprintf("%s - %s", r.Description, allMessages)
 	}
 
 	// add tags
@@ -282,6 +282,13 @@ func handlerCustomCheckConfig(w http.ResponseWriter, r *http.Request, ps httprou
 		return
 	}
 
+	if cctx.CustomCheckControl == share.CustomCheckControl_Disable ||
+		(cctx.CustomCheckControl == share.CustomCheckControl_Strict && !acc.CanWriteCluster()) {
+		// only admin/fedAdmin-role users can configure custom check scripts in "strict" control
+		restRespAccessDenied(w, login)
+		return
+	}
+
 	group := ps.ByName("group")
 
 	if !cacher.AuthorizeCustomCheck(group, acc) {
@@ -410,9 +417,23 @@ func handlerCustomCheckShow(w http.ResponseWriter, r *http.Request, ps httproute
 		return
 	}
 
+	var enabled bool  // custom check script can run on enforcer or not
+	var writable bool // custom check script can be configured by this user or not
+	if cctx.CustomCheckControl != share.CustomCheckControl_Disable {
+		// in "loose"  control, users with compliance(w) permission on the group can configure the group's custom check scripts
+		// in "strict" control, only admin/fedAdmin-role users can configure custom check scripts
+		if cacher.AuthorizeCustomCheck(group, acc.NewWithOp(access.AccessOPWrite)) {
+			if (cctx.CustomCheckControl == share.CustomCheckControl_Strict && acc.CanWriteCluster()) ||
+				cctx.CustomCheckControl == share.CustomCheckControl_Loose {
+				writable = true
+			}
+		}
+		enabled = true
+	}
+
 	oldConfig, _ := clusHelper.GetCustomCheckConfig(group)
 
-	config := api.RESTCustomChecks{Group: group}
+	config := api.RESTCustomChecks{Group: group, Enabled: enabled, Writable: writable}
 	if oldConfig != nil {
 		for _, script := range oldConfig.Scripts {
 			scp := &api.RESTCustomCheck{
@@ -437,12 +458,34 @@ func handlerCustomCheckList(w http.ResponseWriter, r *http.Request, ps httproute
 
 	scripts := clusHelper.GetAllCustomCheckConfig()
 
+	var enabled bool // custom check script can run on enforcer or not
+	if cctx.CustomCheckControl != share.CustomCheckControl_Disable {
+		enabled = true
+	}
+
+	// only for checking whether this user can configure custom check for determining the 'configurable' value
+	// do not use it for other authorization checking !!
+	accTemp := acc.NewWithOp(access.AccessOPWrite)
+
 	configs := make([]*api.RESTCustomChecks, 0)
 	for group, script := range scripts {
 		if !cacher.AuthorizeCustomCheck(group, acc) {
 			continue
 		}
-		config := api.RESTCustomChecks{Group: group}
+
+		var writable bool // custom check script can be configured by this user or not
+		if cctx.CustomCheckControl != share.CustomCheckControl_Disable {
+			// in "loose"  control, users with compliance(w) permission on the group can configure the group's custom check scripts
+			// in "strict" control, only admin/fedAdmin-role users can configure custom check scripts
+			if cacher.AuthorizeCustomCheck(group, accTemp) {
+				if (cctx.CustomCheckControl == share.CustomCheckControl_Strict && acc.CanWriteCluster()) ||
+					cctx.CustomCheckControl == share.CustomCheckControl_Loose {
+					writable = true
+				}
+			}
+		}
+
+		config := api.RESTCustomChecks{Group: group, Enabled: enabled, Writable: writable}
 		for _, scr := range script.Scripts {
 			scp := &api.RESTCustomCheck{
 				Name:   scr.Name,
@@ -644,9 +687,11 @@ func _getCISReportFromCluster(bench share.BenchType, id string, readData bool, c
 		Items:          make([]*api.RESTBenchItem, 0),
 	}
 
+	_, metaMap := scanUtils.GetComplianceMeta()
+
 	// Add check tags
 	for _, item := range r.Items {
-		if ritem := bench2REST(bench, item, cpf); ritem != nil {
+		if ritem := bench2REST(bench, item, cpf, metaMap); ritem != nil {
 			rpt.Items = append(rpt.Items, ritem)
 		}
 	}
@@ -716,9 +761,11 @@ func decodeCISReport(bench share.BenchType, value []byte, cpf *complianceProfile
 		Items:          make([]*api.RESTBenchItem, 0),
 	}
 
+	_, metaMap := scanUtils.GetComplianceMeta()
+
 	// Add check tags
 	for _, item := range r.Items {
-		if ritem := bench2REST(bench, item, cpf); ritem != nil {
+		if ritem := bench2REST(bench, item, cpf, metaMap); ritem != nil {
 			rpt.Items = append(rpt.Items, ritem)
 		}
 	}

@@ -64,6 +64,7 @@ type graphEntry struct {
 	last         uint32
 	xff          uint8
 	toSidecar    uint8
+	fqdn         string // server fqdn if it is egress direction. otherwise, the fqdn is empty
 }
 
 type graphKey struct {
@@ -180,6 +181,7 @@ func conn2Violation(conn *share.CLUSConnection, server uint32) *api.Violation {
 		Sessions:      conn.Sessions,
 		ClientIP:      net.IP(conn.ClientIP).String(),
 		ServerIP:      net.IP(conn.ServerIP).String(),
+		FQDN:          conn.FQDN,
 		ClientName:    cwln.name,
 		ClientDomain:  cwln.domain,
 		ClientImage:   cwln.image,
@@ -227,8 +229,17 @@ func isHostOrUnmanagedWorkload(name string) bool {
 		strings.HasPrefix(name, api.LearnedWorkloadPrefix)
 }
 
+func isFqdnGroup(name string) bool {
+	if gfqs, ok := grp2FqdnMap[name]; ok {
+		if gfqs != nil && gfqs.Cardinality() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func isNonWorkloadLearnedEndpoint(name string) bool {
-	return isHostOrUnmanagedWorkload(name) || name == api.LearnedExternal ||
+	return isHostOrUnmanagedWorkload(name) || isFqdnGroup(name) || name == api.LearnedExternal ||
 		strings.HasPrefix(name, api.LearnedGroupPrefix)
 }
 
@@ -274,6 +285,35 @@ func isAddressGroup(name string) bool {
 		}
 	}
 	return false
+}
+
+func getFqdnAddrGroupName(fqdn string) string {
+	if grps, ok := fqdn2GrpMap[fqdn]; ok {
+		return grps.Any().(string)
+	}
+	//try wildcard
+	fn := strings.Split(fqdn, ".")
+	fqdnlen := len(fn)
+	for i := 0; i < fqdnlen-2; i++ {
+		tfqdn := "*"
+		for j := i+1; j < fqdnlen; j++ {
+			tfqdn = fmt.Sprintf("%s.%s", tfqdn, fn[j])
+		}
+		if fgrps, ok := fqdn2GrpMap[tfqdn]; ok {
+			return fgrps.Any().(string)
+		}
+	}
+	if fqdnlen == 2 {
+		tfqdn := fmt.Sprintf("%s.%s", "www", fqdn)
+		if fgrps, ok := fqdn2GrpMap[tfqdn]; ok {
+			return fgrps.Any().(string)
+		}
+		tfqdn = fmt.Sprintf("%s.%s", "*", fqdn)
+		if fgrps, ok := fqdn2GrpMap[tfqdn]; ok {
+			return fgrps.Any().(string)
+		}
+	}
+	return ""
 }
 
 func getAddrGroupNameFromPolicy(polid uint32, client bool) string {
@@ -512,6 +552,7 @@ func UpdateConnections(conns []*share.CLUSConnection) {
 			"toSidecar":      conn.ToSidecar,
 			"meshToSvr":      conn.MeshToSvr,
 			"linkLocal":      conn.LinkLocal,
+			"fqdn":           conn.FQDN,
 		}).Debug()
 
 		addConnectToGraph(conn, ca, sa, stip)
@@ -638,6 +679,20 @@ func connectFromGlobal(conn *share.CLUSConnection, ca *nodeAttr, stip *serverTip
 	if wl, alive := getWorkloadFromGlobalIP(conn.ClientIP); wl != "" {
 		if alive == false && wouldGenerateUnmanagedEndpoint(conn, true) {
 			scheduleControllerResync(resyncRequestReasonEphemeral)
+		}
+		if conn.UwlIp {
+			// Unmanaged workload
+			if ep := getAddrGroupNameFromPolicy(conn.PolicyId, true); ep != "" {
+				conn.ClientWL = ep
+				ca.addrgrp = true
+			} else {
+				ipStr := net.IP(conn.ClientIP).String()
+				ep = specialEPName(api.LearnedWorkloadPrefix, ipStr)
+				conn.ClientWL = ep
+			}
+			stip.wlPort = uint16(conn.ServerPort)
+			ca.workload = true
+			return true
 		}
 		cctx.ConnLog.WithFields(log.Fields{
 			"client": net.IP(conn.ClientIP), "server": net.IP(conn.ServerIP),
@@ -1068,6 +1123,16 @@ func preProcessConnect(conn *share.CLUSConnection) (*nodeAttr, *nodeAttr, *serve
 						if ep := getAddrGroupNameFromPolicy(conn.PolicyId, false); ep != "" {
 							conn.ServerWL = ep
 							sa.addrgrp = true
+						} else if conn.FQDN != "" && conn.PolicyId == 0 &&
+							conn.PolicyAction <= C.DP_POLICY_ACTION_LEARN {
+							//learn to predefined address group
+							if fqdngrp := getFqdnAddrGroupName(conn.FQDN); fqdngrp != "" {
+								conn.ServerWL = fqdngrp
+								sa.addrgrp = true
+								cctx.ConnLog.WithFields(log.Fields{
+									"ServerWL": conn.ServerWL, "policyaction":conn.PolicyAction,
+								}).Debug("To FQDN address group")
+							}
 						}
 						stip.wlPort = uint16(conn.ServerPort)
 					}
@@ -1349,12 +1414,24 @@ func graphAttr2REST(attr *graphAttr) *api.RESTConversationReport {
 	ports := utils.NewSet()
 
 	var eventype map[string]string = make(map[string]string)
+	var entries []*api.RESTConversationReportEntry
+
 	for key, ge := range attr.entries {
+		entry := &api.RESTConversationReportEntry{
+			Bytes:        ge.bytes,
+			Sessions:     ge.sessions,
+			PolicyAction: common.PolicyActionRESTString(ge.policyAction),
+			CIP:          utils.Int2IPv4( key.cip).String(),
+			SIP:          utils.Int2IPv4(key.sip).String(),
+			FQDN:         ge.fqdn,
+		}
 		protos.Add(key.ipproto)
 		if key.application == 0 || key.application == C.DPI_APP_NOT_CHECKED {
 			ports.Add(utils.GetPortLink(key.ipproto, key.port))
+			entry.Port = utils.GetPortLink(key.ipproto, key.port)
 		} else {
 			apps.Add(key.application)
+			entry.Application = common.AppNameMap[key.application]
 		}
 		if _, ok := common.LogThreatMap[ge.threatID]; ok {
 			eventype[share.EventThreat] = share.EventThreat
@@ -1368,6 +1445,7 @@ func graphAttr2REST(attr *graphAttr) *api.RESTConversationReport {
 		if ge.xff > 0 {
 			conver.XffEntry = true
 		}
+		entries = append(entries, entry)
 	}
 	conver.EventType = make([]string, 0)
 	for _, et := range eventype {
@@ -1388,6 +1466,8 @@ func graphAttr2REST(attr *graphAttr) *api.RESTConversationReport {
 		str := port.(string)
 		conver.Ports = append(conver.Ports, str)
 	}
+	conver.Entries = entries
+
 	return conver
 }
 
@@ -1618,6 +1698,7 @@ func (m CacheMethod) getApplicationConver(src, dst string, acc *access.AccessCon
 				LastSeenAt:   api.RESTTimeString(time.Unix(int64(entry.last), 0).UTC()),
 				CIP:          utils.Int2IPv4(key.cip).String(),
 				SIP:          utils.Int2IPv4(key.sip).String(),
+				FQDN:         entry.fqdn,
 			}
 			c.Application, _ = common.AppNameMap[key.application]
 			c.Server, _ = common.AppNameMap[entry.server]
@@ -1654,6 +1735,7 @@ func (m CacheMethod) GetApplicationConver(src, dst string, srcList, dstList []st
 		apps := utils.NewSet()
 		ports := utils.NewSet()
 		entries := make([]*api.RESTConversationEntry, 0)
+		reportEntries := make([]*api.RESTConversationReportEntry, 0)
 
 		for _, s := range srcList {
 			for _, d := range dstList {
@@ -1675,6 +1757,7 @@ func (m CacheMethod) GetApplicationConver(src, dst string, srcList, dstList []st
 						for _, a := range r.Apps {
 							apps.Add(a)
 						}
+						reportEntries = append(reportEntries, r.Entries...)
 					}
 				}
 			}
@@ -1682,7 +1765,8 @@ func (m CacheMethod) GetApplicationConver(src, dst string, srcList, dstList []st
 
 		report.Protos = protos.ToStringSlice()
 		report.Ports = ports.ToStringSlice()
-		report.Ports = apps.ToStringSlice()
+		report.Apps = apps.ToStringSlice()
+		report.Entries = reportEntries
 
 		accReadAll := access.NewReaderAccessControl()
 		from, _ := m.GetConverEndpoint(src, accReadAll)

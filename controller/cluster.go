@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -114,7 +115,14 @@ func leadChangeHandler(newLead, oldLead string) {
 		Ctrler.Leader = (newLead == Ctrler.ClusterIP)
 
 		// update self ctrl key
-		value, _ := json.Marshal(Ctrler)
+		connStatus, connLastError := GetOrchConnStatus()
+
+		value, _ := json.Marshal(share.CLUSController{
+			CLUSDevice:        Ctrler.CLUSDevice,
+			Leader:            Ctrler.Leader,
+			OrchConnStatus:    connStatus,
+			OrchConnLastError: connLastError,
+		})
 		key := share.CLUSControllerKey(Host.ID, Ctrler.ID)
 		if err := cluster.Put(key, value); err != nil {
 			log.WithFields(log.Fields{"error": err}).Error("")
@@ -227,15 +235,37 @@ func logController(ev share.TLogEvent) {
 	evqueue.Append(&clog)
 }
 
+var snapshotIndex int
+
+func memorySnapshot(usage uint64) {
+	if ctrlEnv.autoProfieCapture > 0 {
+		log.WithFields(log.Fields{"usage": usage}).Debug()
+		if usage > ctrlEnv.peakMemoryUsage {
+			ctrlEnv.peakMemoryUsage = usage + ctrlEnv.snapshotMemStep // level up
+
+			label := "p" // peak
+
+			if snapshotIndex < 4 { // keep atmost 4 copies + an extra peak copy
+				snapshotIndex++
+				label = strconv.Itoa(snapshotIndex)
+			}
+			log.WithFields(log.Fields{"label": label, "next": ctrlEnv.peakMemoryUsage}).Debug()
+			utils.PerfSnapshot(1, ctrlEnv.memoryLimit, ctrlEnv.autoProfieCapture, usage, share.SnaphotFolder, Ctrler.ID, "ctl.", label)
+		}
+	}
+}
+
 var curMemoryPressure uint64
+
 func memoryPressureNotification(rpt *system.MemoryPressureReport) {
 	log.WithFields(log.Fields{"rpt": rpt}).Info()
-	if rpt.Level > 2 {  // cap its maximum
+	if rpt.Level >= 2 { // cap its maximum
 		rpt.Level = 2
+		memorySnapshot(rpt.Stats.WorkingSet)
 	}
 
 	if rpt.Level == curMemoryPressure {
-		return  // skip report
+		return // skip report
 	}
 
 	// launch falling-edge watcher, there is not actual level=0 event
@@ -245,21 +275,21 @@ func memoryPressureNotification(rpt *system.MemoryPressureReport) {
 			var mStats *system.CgroupMemoryStats
 
 			acc := 0
-			for(acc < 7) {
-				time.Sleep(time.Minute*1)
+			for acc < 7 {
+				time.Sleep(time.Minute * 1)
 				if mStats, err = global.SYS.GetContainerMemoryStats(); err != nil {
 					log.WithFields(log.Fields{"error": err}).Error("mem stat")
 					continue
 				}
 
-				limit :=  mStats.Usage.Limit
+				limit := mStats.Usage.Limit
 				if mStats.Usage.Limit == 0 { // it's hitting node's limit
 					limit = uint64(Host.Memory)
 				}
 
 				ratio := uint64(rpt.Stats.WorkingSet * 100 / limit)
 				// log.WithFields(log.Fields{"ratio": ratio, "acc": acc, "limit": limit}).Debug()
-				if ratio <= 50 {     // what is the reasonable threshold?
+				if ratio <= 50 { // what is the reasonable threshold?
 					acc++
 				} else {
 					acc = 0
@@ -267,12 +297,12 @@ func memoryPressureNotification(rpt *system.MemoryPressureReport) {
 			}
 
 			rptt := &system.MemoryPressureReport{
-				Level: 0,  // assumption
+				Level: 0, // assumption
 				Stats: *mStats,
 			}
 
 			putMemoryPressureEvent(rptt, false)
-			curMemoryPressure = 0   // reset
+			curMemoryPressure = 0 // reset
 		}()
 	}
 
@@ -301,18 +331,18 @@ func putMemoryPressureEvent(rpt *system.MemoryPressureReport, setRisingEdge bool
 		}
 	}
 
-	report := map[string]interface{} {
-		"Description": description,
-		"Level": rpt.Level,
-		"UsageLimit": rpt.Stats.Usage.Limit,
-		"NetUsage": rpt.Stats.WorkingSet,
-		"MaxUsage": rpt.Stats.Usage.MaxUsage,
-		"ActiveAnon": rpt.Stats.Stats["active_anon"],
+	report := map[string]interface{}{
+		"Description":  description,
+		"Level":        rpt.Level,
+		"UsageLimit":   rpt.Stats.Usage.Limit,
+		"NetUsage":     rpt.Stats.WorkingSet,
+		"MaxUsage":     rpt.Stats.Usage.MaxUsage,
+		"ActiveAnon":   rpt.Stats.Stats["active_anon"],
 		"InactiveAnon": rpt.Stats.Stats["inactive_anon"],
-		"Cache": rpt.Stats.Stats["cache"],
-		"PageFaults": rpt.Stats.Stats["pgfault"],
-		"RSS": rpt.Stats.Stats["rss"],
-		"Failcnt": rpt.Stats.Usage.Failcnt,
+		"Cache":        rpt.Stats.Stats["cache"],
+		"PageFaults":   rpt.Stats.Stats["pgfault"],
+		"RSS":          rpt.Stats.Stats["rss"],
+		"Failcnt":      rpt.Stats.Usage.Failcnt,
 	}
 
 	b := new(bytes.Buffer)
@@ -346,7 +376,14 @@ func ctlrPutLocalInfo() {
 			log.WithFields(log.Fields{"error": err}).Error("")
 		}
 	*/
-	value, _ = json.Marshal(Ctrler)
+	connStatus, connLastError := GetOrchConnStatus()
+
+	value, _ = json.Marshal(share.CLUSController{
+		CLUSDevice:        Ctrler.CLUSDevice,
+		Leader:            Ctrler.Leader,
+		OrchConnStatus:    connStatus,
+		OrchConnLastError: connLastError,
+	})
 	key = share.CLUSControllerKey(Host.ID, Ctrler.ID)
 	if err := cluster.Put(key, value); err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("")

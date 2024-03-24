@@ -2288,6 +2288,24 @@ static int dp_ctrl_detect_unmanaged_wl(json_t *msg)
     return 0;
 }
 
+uint8_t g_enable_icmp_policy = 0;
+
+static int dp_ctrl_enable_icmp_policy(json_t *msg)
+{
+    json_t *enable_icmp_policy_obj;
+    bool enable_icmp_policy = false;
+
+    enable_icmp_policy_obj = json_object_get(msg, "enable_icmp_policy");
+    if (enable_icmp_policy_obj != NULL) {
+        enable_icmp_policy = json_boolean_value(enable_icmp_policy_obj);
+    }
+    g_enable_icmp_policy = enable_icmp_policy ? 1 : 0;
+
+    DEBUG_CTRL("g_enable_icmp_policy=%u\n", g_enable_icmp_policy);
+
+    return 0;
+}
+
 #define BUF_SIZE 8192
 char ctrl_msg_buf[BUF_SIZE];
 static int dp_ctrl_handler(int fd)
@@ -2389,6 +2407,8 @@ static int dp_ctrl_handler(int fd)
             ret = dp_ctrl_disable_net_policy(msg);
         } else if (strcmp(key, "ctrl_detect_unmanaged_wl") == 0) {
             ret = dp_ctrl_detect_unmanaged_wl(msg);
+        } else if (strcmp(key, "ctrl_enable_icmp_policy") == 0) {
+            ret = dp_ctrl_enable_icmp_policy(msg);
         }
         DEBUG_CTRL("\"%s\" done\n", key);
     }
@@ -2647,6 +2667,9 @@ int dp_ctrl_connect_report(DPMsgSession *log, int count_session, int count_viola
             if (FLAGS_TEST(log->Flags, DPSESS_FLAG_TMP_OPEN)) {
                 FLAGS_SET(conn->Flags, DPCONN_FLAG_TMP_OPEN);
             }
+            if (FLAGS_TEST(log->Flags, DPSESS_FLAG_UWLIP)) {
+                FLAGS_SET(conn->Flags, DPCONN_FLAG_UWLIP);
+            }
             conn->FirstSeenAt = conn->LastSeenAt = get_current_time() - log->Idle;
             conn->Bytes = log->ClientBytes + log->ServerBytes;
             conn->Sessions = count_session;
@@ -2819,6 +2842,54 @@ static void dp_ctrl_update_fqdn_ip(void)
     }
 }
 
+static void dp_ctrl_update_ip_fqdn_storage(void)
+{
+    //this function is called in ctrl thread, but th_ip_fqdn_storage_map is initialized
+    //in data thread, no guarantee th_ip_fqdn_storage_map is already initialized when ctrl
+    //thread reach here during dp start, so we check null value here
+    if (th_ip_fqdn_storage_map.map == NULL) {
+        return;
+    }
+    struct cds_lfht_node *ip_fqdn_storage_node;
+
+    // Iterate through fqdn map
+    RCU_MAP_FOR_EACH(&th_ip_fqdn_storage_map, ip_fqdn_storage_node) {
+        dpi_ip_fqdn_storage_entry_t *entry = STRUCT_OF(ip_fqdn_storage_node, dpi_ip_fqdn_storage_entry_t, node);
+
+        if (uatomic_cmpxchg(&entry->r->record_updated, 1, 0) == 0) {
+            continue;
+        }
+
+        DPMsgHdr *hdr = (DPMsgHdr *)g_notify_msg;
+        DPMsgIpFqdnStorageUpdateHdr *fh = (DPMsgIpFqdnStorageUpdateHdr *)(g_notify_msg + sizeof(*hdr));
+
+        hdr->Kind = DP_KIND_IP_FQDN_STORAGE_UPDATE;
+        ip4_cpy(fh->IP, (uint8_t *)&entry->r->ip);
+        strlcpy(fh->Name, entry->r->name, DP_POLICY_FQDN_NAME_MAX_LEN);
+        uint16_t len = sizeof(*hdr) + sizeof(*fh);
+        hdr->Length = htons(len);
+
+        DEBUG_CTRL("update ip-fqdn storage, ip=%x name=%s len=%u\n", fh->IP, fh->Name, len);
+
+        dp_ctrl_notify_ctrl(g_notify_msg, len);
+    }
+}
+
+void dp_ctrl_release_ip_fqdn_storage(dpi_ip_fqdn_storage_entry_t *entry)
+{
+    DPMsgHdr *hdr = (DPMsgHdr *)g_notify_msg;
+    DPMsgIpFqdnStorageReleaseHdr *fh = (DPMsgIpFqdnStorageReleaseHdr *)(g_notify_msg + sizeof(*hdr));
+
+    hdr->Kind = DP_KIND_IP_FQDN_STORAGE_RELEASE;
+    ip4_cpy(fh->IP, (uint8_t *)&entry->r->ip);
+    uint16_t len = sizeof(*hdr) + sizeof(*fh);
+    hdr->Length = htons(len);
+
+    DEBUG_CTRL("release ip-fqdn storage, ip=%x len=%u\n", fh->IP, len);
+    
+    dp_ctrl_notify_ctrl(g_notify_msg, len);
+}
+
 // -- ctrl loop
 
 void dp_ctrl_init_thread_data(void)
@@ -2891,6 +2962,7 @@ void dp_ctrl_loop(void)
             dp_ctrl_update_app(false);
             dp_ctrl_update_fqdn_ip();
             dp_ctrl_consume_threat_log();
+            dp_ctrl_update_ip_fqdn_storage();
 
             // every 6s
             if ((round % 3) == 0) {

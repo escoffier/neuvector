@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"reflect"
 
 	"github.com/neuvector/neuvector/controller/access"
 	"github.com/neuvector/neuvector/controller/api"
@@ -16,8 +17,9 @@ import (
 )
 
 type webhookCache struct {
-	conn   *common.Webhook
-	target string
+	c        *common.Webhook
+	url      string
+	useProxy bool
 }
 
 var systemConfigCache share.CLUSSystemConfig = common.DefaultSystemConfig
@@ -63,7 +65,7 @@ func agentConfig(nType cluster.ClusterNotifyType, key string, value []byte) {
 }
 
 func setControllerDebug(debug []string, debugCPath bool) {
-	var hasCPath, hasConn, hasMutex, hasScan, hasCluster bool
+	var hasCPath, hasConn, hasMutex, hasScan, hasCluster, hasK8sMonitor bool
 
 	for _, d := range debug {
 		switch d {
@@ -77,6 +79,8 @@ func setControllerDebug(debug []string, debugCPath bool) {
 			hasScan = true
 		case "cluster":
 			hasCluster = true
+		case "k8s_monitor":
+			hasK8sMonitor = true
 		}
 	}
 	if debugCPath || hasCPath {
@@ -103,6 +107,11 @@ func setControllerDebug(debug []string, debugCPath bool) {
 		cluster.SetLogLevel(log.DebugLevel)
 	} else {
 		cluster.SetLogLevel(log.InfoLevel)
+	}
+	if hasK8sMonitor {
+		cctx.K8sResLog.Level = log.DebugLevel
+	} else {
+		cctx.K8sResLog.Level = log.InfoLevel
 	}
 }
 
@@ -255,6 +264,9 @@ func (m CacheMethod) GetSystemConfig(acc *access.AccessControl) *api.RESTSystemC
 		SyslogCategories:          systemConfigCache.SyslogCategories,
 		SyslogInJSON:              systemConfigCache.SyslogInJSON,
 		SingleCVEPerSyslog:        systemConfigCache.SingleCVEPerSyslog,
+		SyslogCVEInLayers:         systemConfigCache.SyslogCVEInLayers,
+		SyslogServerCert:          systemConfigCache.SyslogServerCert,
+		OutputEventToLogs:         systemConfigCache.OutputEventToLogs,
 		AuthOrder:                 systemConfigCache.AuthOrder,
 		AuthByPlatform:            systemConfigCache.AuthByPlatform,
 		RancherEP:                 systemConfigCache.RancherEP,
@@ -276,7 +288,6 @@ func (m CacheMethod) GetSystemConfig(acc *access.AccessControl) *api.RESTSystemC
 		ModeAutoM2P:               systemConfigCache.ModeAutoM2P,
 		ModeAutoM2PDuration:       systemConfigCache.ModeAutoM2PDuration,
 		NoTelemetryReport:         systemConfigCache.NoTelemetryReport,
-		SyslogServerCert:          systemConfigCache.SyslogServerCert,
 	}
 	if systemConfigCache.SyslogIP != nil {
 		rconf.SyslogServer = systemConfigCache.SyslogIP.String()
@@ -289,7 +300,35 @@ func (m CacheMethod) GetSystemConfig(acc *access.AccessControl) *api.RESTSystemC
 
 	rconf.Webhooks = make([]api.RESTWebhook, len(systemConfigCache.Webhooks))
 	for i, wh := range systemConfigCache.Webhooks {
-		rconf.Webhooks[i] = api.RESTWebhook{Name: wh.Name, Url: wh.Url, Enable: wh.Enable, Type: wh.Type, CfgType: api.CfgTypeUserCreated}
+		rconf.Webhooks[i] = api.RESTWebhook{
+			Name:     wh.Name,
+			Url:      wh.Url,
+			Type:     wh.Type,
+			Enable:   wh.Enable,
+			UseProxy: wh.UseProxy,
+			CfgType:  api.CfgTypeUserCreated,
+		}
+	}
+
+	rconf.RemoteRepositories = make([]api.RESTRemoteRepository, len(systemConfigCache.RemoteRepositories))
+	for i, rr := range systemConfigCache.RemoteRepositories {
+		repo := api.RESTRemoteRepository{
+			Nickname: rr.Nickname,
+			Comment:  rr.Comment,
+			Provider: rr.Provider,
+			Enable:   rr.Enable,
+		}
+		if rr.Provider == share.RemoteRepositoryProvider_GitHub && rr.GitHubConfiguration != nil {
+			repo.GitHubConfiguration = &api.RESTRemoteRepo_GitHubConfig{
+				RepositoryOwnerUsername:          rr.GitHubConfiguration.RepositoryOwnerUsername,
+				RepositoryName:                   rr.GitHubConfiguration.RepositoryName,
+				RepositoryBranchName:             rr.GitHubConfiguration.RepositoryBranchName,
+				PersonalAccessToken:              rr.GitHubConfiguration.PersonalAccessToken,
+				PersonalAccessTokenCommitterName: rr.GitHubConfiguration.PersonalAccessTokenCommitterName,
+				PersonalAccessTokenEmail:         rr.GitHubConfiguration.PersonalAccessTokenEmail,
+			}
+		}
+		rconf.RemoteRepositories[i] = repo
 	}
 
 	proxy := systemConfigCache.RegistryHttpProxy
@@ -309,9 +348,10 @@ func (m CacheMethod) GetSystemConfig(acc *access.AccessControl) *api.RESTSystemC
 
 	autoscale := systemConfigCache.ScannerAutoscale
 	rconf.ScannerAutoscale = api.RESTSystemConfigAutoscale{
-		Strategy: autoscale.Strategy,
-		MinPods:  autoscale.MinPods,
-		MaxPods:  autoscale.MaxPods,
+		Strategy:         autoscale.Strategy,
+		MinPods:          autoscale.MinPods,
+		MaxPods:          autoscale.MaxPods,
+		DisabledByOthers: autoscale.DisabledByOthers,
 	}
 
 	return &rconf
@@ -380,14 +420,14 @@ func (m CacheMethod) GetSystemConfigClusterName(acc *access.AccessControl) strin
 }
 
 func systemConfigUpdate(nType cluster.ClusterNotifyType, key string, value []byte) {
-	log.WithFields(log.Fields{"type": cluster.ClusterNotifyName[nType], "key": key}).Debug("")
+	log.WithFields(log.Fields{"type": cluster.ClusterNotifyName[nType], "key": key}).Debug()
 
 	var cfg share.CLUSSystemConfig
 	bSchedulePolicy := false
 	switch nType {
 	case cluster.ClusterNotifyAdd, cluster.ClusterNotifyModify:
 		json.Unmarshal(value, &cfg)
-		log.WithFields(log.Fields{"config": cfg}).Debug("")
+		log.WithFields(log.Fields{"config": cfg}).Debug()
 
 		if cfg.IBMSAConfigNV.EpEnabled && cfg.IBMSAConfigNV.EpStart == 1 {
 			if isLeader() {
@@ -428,7 +468,10 @@ func systemConfigUpdate(nType cluster.ClusterNotifyType, key string, value []byt
 		scan.UpdateProxy(&cfg.RegistryHttpProxy, &cfg.RegistryHttpsProxy)
 	}
 
+	var oldSyslogCfg share.CLUSSyslogConfig
+
 	cacheMutexLock()
+	oldSyslogCfg = systemConfigCache.CLUSSyslogConfig
 	systemConfigCache = cfg
 	putInternalIPNetToCluseter(true)
 	cacheMutexUnlock()
@@ -445,7 +488,11 @@ func systemConfigUpdate(nType cluster.ClusterNotifyType, key string, value []byt
 	webhookCachTemp := make(map[string]*webhookCache, 0)
 	for _, h := range systemConfigCache.Webhooks {
 		if h.Enable {
-			webhookCachTemp[h.Name] = &webhookCache{conn: common.NewWebHook(h.Url), target: h.Type}
+			webhookCachTemp[h.Name] = &webhookCache{
+				c:        common.NewWebHook(h.Url, h.Type),
+				url:      h.Url,
+				useProxy: h.UseProxy,
+			}
 		}
 	}
 	webhookCacheMap = webhookCachTemp
@@ -453,11 +500,47 @@ func systemConfigUpdate(nType cluster.ClusterNotifyType, key string, value []byt
 	syslogMutexLock()
 	defer syslogMutexUnlock()
 
-	if systemConfigCache.SyslogEnable {
-		syslogger = common.NewSyslogger(&systemConfigCache.CLUSSyslogConfig)
+	if systemConfigCache.SyslogEnable || systemConfigCache.OutputEventToLogs {
+		if !reflect.DeepEqual(oldSyslogCfg, cfg.CLUSSyslogConfig) {
+			if syslogger != nil {
+				syslogger.Close()
+			}
+			syslogger = common.NewSyslogger(&systemConfigCache.CLUSSyslogConfig)
+			log.Info("new syslog applied")
+		}
 	} else if syslogger != nil {
 		syslogger.Close()
 		syslogger = nil
+	}
+}
+
+func configIcmpPolicy(ctx *Context) {
+	acc := access.NewReaderAccessControl()
+	cfg, rev := clusHelper.GetSystemConfigRev(acc)
+	retry := 0
+	for retry < 3 {
+		if cfg == nil {
+			if cfg, rev = clusHelper.GetSystemConfigRev(acc); cfg != nil {
+				break
+			}
+			retry++
+		} else {
+			break
+		}
+	}
+	if cfg == nil {
+		cfg = &common.DefaultSystemConfig
+		rev = 0
+	}
+	cfg.EnableIcmpPolicy = ctx.EnableIcmpPolicy
+
+	retry = 0
+	for retry < 3 {
+		if err := clusHelper.PutSystemConfigRev(cfg, rev); err != nil {
+			retry++
+		} else {
+			break
+		}
 	}
 }
 
@@ -465,6 +548,9 @@ func configInit() {
 	acc := access.NewReaderAccessControl()
 	cfg, rev := clusHelper.GetSystemConfigRev(acc)
 	systemConfigCache = *cfg
+	if systemConfigCache.SyslogEnable || systemConfigCache.OutputEventToLogs {
+		syslogger = common.NewSyslogger(&systemConfigCache.CLUSSyslogConfig)
+	}
 	if localDev.Host.Platform == share.PlatformKubernetes && localDev.Host.Flavor == share.FlavorRancher {
 		if cctx.RancherSSO {
 			systemConfigCache.AuthByPlatform = true

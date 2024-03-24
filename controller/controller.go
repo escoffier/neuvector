@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"net"
 	"os"
 	"os/signal"
@@ -24,6 +25,7 @@ import (
 	"github.com/neuvector/neuvector/controller/rest"
 	"github.com/neuvector/neuvector/controller/ruleid"
 	"github.com/neuvector/neuvector/controller/scan"
+	"github.com/neuvector/neuvector/db"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/cluster"
 	"github.com/neuvector/neuvector/share/container"
@@ -37,15 +39,23 @@ import (
 var Host share.CLUSHost = share.CLUSHost{
 	Platform: share.PlatformDocker,
 }
+
+// When accessing global Ctrler, Ctrler.OrchConnStatus and Ctrler.OrchConnLastError will be empty all the time.
+// Use GetOrchConnStatus() instead.
 var Ctrler, parentCtrler share.CLUSController
 
 type ctrlEnvInfo struct {
-	startsAt       time.Time
-	procDir        string
-	cgroupMemory   string
-	cgroupCPUAcct  string
-	runInContainer bool
-	debugCPath     bool
+	startsAt          time.Time
+	procDir           string
+	cgroupMemory      string
+	cgroupCPUAcct     string
+	runInContainer    bool
+	debugCPath        bool
+	customBenchmark   bool
+	autoProfieCapture uint64
+	memoryLimit       uint64
+	peakMemoryUsage   uint64
+	snapshotMemStep   uint64
 }
 
 var ctrlEnv ctrlEnvInfo
@@ -58,12 +68,13 @@ var cacher cache.CacheInterface
 var scanner scan.ScanInterface
 var orchConnector orchConnInterface
 var timerWheel *utils.TimerWheel
+var k8sResLog *log.Logger
 
 const statsInterval uint32 = 5
 const controllerStartGapThreshold = time.Duration(time.Minute * 2)
 const memoryRecyclePeriod uint32 = 10                      // minutes
-const memControllerTopPeak uint64 = 4 * 1024 * 1024 * 1024 // 4 GB (inc. allinone case)
-const memSafeGap uint64 = 64 * 1024 * 1024                 // 64 MB
+const memoryCheckPeriod uint32 = 5                         // minutes
+const memControllerTopPeak uint64 = 6 * 1024 * 1024 * 1024 // 6 GB (inc. allinone case)
 
 // Unlike in enforcer, only read host IPs in host mode, so no need to enter host network namespace
 func getHostModeHostIPs() {
@@ -164,7 +175,6 @@ func flushEventQueue() {
 	cacher.FlushAdmCtrlStats()
 }
 
-///
 type localSystemInfo struct {
 	mutex sync.Mutex
 	stats share.ContainerStats
@@ -214,6 +224,11 @@ func main() {
 	mutexLog.Level = log.InfoLevel
 	mutexLog.Formatter = &utils.LogFormatter{Module: "CTL"}
 
+	k8sResLog = log.New()
+	k8sResLog.Out = os.Stdout
+	k8sResLog.Level = log.InfoLevel
+	k8sResLog.Formatter = &utils.LogFormatter{Module: "CTL"}
+
 	log.WithFields(log.Fields{"version": Version}).Info("START")
 
 	// bootstrap := flag.Bool("b", false, "Bootstrap cluster")
@@ -241,11 +256,15 @@ func main() {
 	cspEnv := flag.String("csp_env", "", "")                                           // "" or "aws"
 	cspPauseInterval := flag.Uint("csp_pause_interval", 240, "")                       // in minutes, for testing only
 	noRmNsGrps := flag.Bool("no_rm_nsgroups", false, "Not to remove groups when namespace was deleted")
+	en_icmp_pol := flag.Bool("en_icmp_policy", false, "Enable icmp policy learning")
+	autoProfile := flag.Int("apc", 1, "Enable auto profile collection")
+	custom_check_control := flag.String("cbench", share.CustomCheckControl_Disable, "Custom check control")
 	flag.Parse()
 
 	if *debug {
 		log.SetLevel(log.DebugLevel)
 		scanLog.SetLevel(log.DebugLevel)
+		k8sResLog.SetLevel(log.DebugLevel)
 		ctrlEnv.debugCPath = true
 	}
 	if *join != "" {
@@ -272,6 +291,22 @@ func main() {
 		log.Error("Invalid port value. Exit!")
 		os.Exit(-2)
 	}
+	ctrlEnv.autoProfieCapture = 1 // default
+	if *autoProfile != 1 {
+		if *autoProfile < 0 {
+			ctrlEnv.autoProfieCapture = 0 // no auto profile
+			log.WithFields(log.Fields{"auto-profile": *autoProfile}).Error("Invalid value, disable auto-profile")
+		} else {
+			ctrlEnv.autoProfieCapture = (uint64)(*autoProfile)
+		}
+		log.WithFields(log.Fields{"auto-profile": ctrlEnv.autoProfieCapture}).Info()
+	}
+	if *custom_check_control == share.CustomCheckControl_Loose || *custom_check_control == share.CustomCheckControl_Strict {
+		ctrlEnv.customBenchmark = true
+		log.WithFields(log.Fields{"custom_check_control": *custom_check_control}).Info("Enable custom benchmark")
+	} else if *custom_check_control != share.CustomCheckControl_Disable {
+		*custom_check_control = share.CustomCheckControl_Disable
+	}
 
 	// Set global objects at the very first
 	platform, flavor, network, containers, err := global.SetGlobalObjects(*rtSock, resource.Register)
@@ -287,6 +322,7 @@ func main() {
 
 	ocImageRegistered := false
 	enableRmNsGrps := true
+	log.WithFields(log.Fields{"cgroups": global.SYS.GetCgroupsVersion()}).Info()
 	log.WithFields(log.Fields{"endpoint": *rtSock, "runtime": global.RT.String()}).Info("Container socket connected")
 	if platform == share.PlatformKubernetes {
 		k8sVer, ocVer := global.ORCH.GetVersion(false, false)
@@ -309,6 +345,12 @@ func main() {
 		}
 	}
 
+	enableIcmpPolicy := false
+	if *en_icmp_pol {
+		log.Info("Enable icmp policy learning")
+		enableIcmpPolicy = true
+	}
+
 	if _, err = global.ORCH.GetOEMVersion(); err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("Unsupported OEM platform. Exit!")
 		os.Exit(-2)
@@ -318,7 +360,7 @@ func main() {
 
 	ctrlEnv.runInContainer = global.SYS.IsRunningInContainer()
 	if ctrlEnv.runInContainer {
-		selfID, _, err = global.SYS.GetSelfContainerID()
+		selfID = global.RT.GetSelfID()
 		if selfID == "" {
 			log.WithFields(log.Fields{"error": err}).Error("Unsupported system. Exit!")
 			os.Exit(-2)
@@ -327,7 +369,7 @@ func main() {
 		log.Info("Not running in container.")
 	}
 
-	if platform == share.PlatformKubernetes {
+	if platform == share.PlatformKubernetes && global.RT.String() != container.StubRtName {
 		if selfID, err = global.IdentifyK8sContainerID(selfID); err != nil {
 			log.WithFields(log.Fields{"selfID": selfID, "error": err}).Error("lookup")
 		}
@@ -356,6 +398,18 @@ func main() {
 		time.Sleep(time.Second * 4)
 	}
 
+	if platform == share.PlatformKubernetes {
+		if global.RT.String() == container.StubRtName {
+			if err := amendStubRtInfo(); err != nil {
+				log.WithFields(log.Fields{"error": err, "Ctrler": Ctrler}).Error("Failed to get local device information")
+			}
+		} else if Ctrler.HostName == "" { // non-privileged mode
+			if err := amendNotPrivilegedMode(); err != nil {
+				log.WithFields(log.Fields{"error": err, "Ctrler": Ctrler}).Error("Failed to get not-privileged information")
+			}
+		}
+	}
+
 	Host.Platform = platform
 	Host.Flavor = flavor
 	Host.Network = network
@@ -366,7 +420,7 @@ func main() {
 	resource.NvAdmSvcNamespace = Ctrler.Domain
 
 	cspType, _ := common.GetMappedCspType(cspEnv, nil)
-	if cspType != share.CSP_NONE && cspType != share.CSP_EKS {
+	if cspType != share.CSP_NONE && cspType != share.CSP_EKS && cspType != share.CSP_AKS && cspType != share.CSP_GCP {
 		cspType = share.CSP_NONE
 	}
 	if *cspPauseInterval == 0 {
@@ -374,7 +428,7 @@ func main() {
 	}
 
 	if platform == share.PlatformKubernetes {
-		resource.AdjustAdmWebhookName(nvcrd.Init, cache.QueryK8sVersion, admission.VerifyK8sNs, cspType)
+		resource.AdjustAdmWebhookName(cache.QueryK8sVersion, admission.VerifyK8sNs, cspType)
 	}
 
 	// Assign controller interface/IP scope
@@ -411,6 +465,8 @@ func main() {
 	auditLogKey := share.CLUSAuditLogKey(Host.ID, Ctrler.ID)
 	auditQueue = cluster.NewObjectQueue(auditLogKey, 128)
 	messenger = cluster.NewMessenger(Host.ID, Ctrler.ID)
+
+	db.CreateVulAssetDb(false)
 
 	kv.Init(Ctrler.ID, dev.Ctrler.Ver, Host.Platform, Host.Flavor, *persistConfig, isGroupMember, getConfigKvData)
 	ruleid.Init()
@@ -478,13 +534,19 @@ func main() {
 
 	restoredFedRole := ""
 	purgeFedRulesOnJoint := false
+
+	// Initialize installation ID.  Ignore if ID is already set.
+	clusHelper := kv.GetClusterHelper()
+	if _, err := clusHelper.GetInstallationID(); err != nil {
+		log.WithError(err).Warn("installation id is not readable. Will retry later.")
+	}
+
 	if Ctrler.Leader {
 		// See [NVSHAS-5490]:
 		// clusterHelper.AcquireLock() may fail with error "failed to create session: Unexpected response code: 500 (Missing node registration)".
 		// It indicates that the node is not yet registered in the catalog.
 		// It's possibly because controller attempts to create a session immediately after starting Consul but actually Consul is not ready yet.
 		// Even it's rare, we might need to allow Consul some time to initialize and sync the node registration to the catalog.
-		clusHelper := kv.GetClusterHelper()
 		for i := 0; i < 6; i++ {
 			lock, err := clusHelper.AcquireLock(share.CLUSLockUpgradeKey, time.Duration(time.Second))
 			if err != nil {
@@ -495,9 +557,6 @@ func main() {
 			clusHelper.ReleaseLock(lock)
 			break
 		}
-
-		// Initiate installation ID if the controller is the first, ignore if ID is already set.
-		clusHelper.PutInstallationID()
 
 		// Restore persistent config.
 		// Calling restore is unnecessary if this is not a new cluster installation, but not a big issue,
@@ -530,15 +589,29 @@ func main() {
 	// So, for the new cluster, we only want the lead to upgrade the KV. In the rolling
 	// upgrade case, (not new cluster), the new controller (not a lead) should upgrade
 	// the KV so it can behave correctly. The old lead won't be affected, in theory.
+	crossCheckCRD := false
 	if Ctrler.Leader || !isNewCluster {
-		kv.GetClusterHelper().UpgradeClusterKV()
-		kv.GetClusterHelper().FixMissingClusterKV()
+		nvImageVersion := Version
+		if strings.HasPrefix(nvImageVersion, "interim/") {
+			// it's daily dev build image
+			if *teleCurrentVer != "" {
+				nvImageVersion = *teleCurrentVer
+			}
+		}
+		verUpdated := clusHelper.UpgradeClusterKV(nvImageVersion)
+		if Ctrler.Leader || verUpdated {
+			// corss-check existing CRs in k9s in situations:
+			// 1. the 1st lead controller in fresh deployment
+			// 2. the 1st new-version controller in rolling upgrade
+			crossCheckCRD = true
+		}
+		clusHelper.FixMissingClusterKV()
 	}
 
 	if Ctrler.Leader {
 		kv.ValidateWebhookCert()
 		if isNewCluster && *noDefAdmin {
-			kv.GetClusterHelper().DeleteUser(common.DefaultAdminUser)
+			clusHelper.DeleteUser(common.DefaultAdminUser)
 		}
 		setConfigLoaded()
 	} else {
@@ -548,18 +621,54 @@ func main() {
 		kv.ValidateWebhookCert()
 	}
 
+	var nvAppFullVersion string  // in the format  {major}.{minor}.{patch}[-s{#}]
+	var nvSemanticVersion string // in the format v{major}.{minor}.{patch}
+	{
+		if value, _ := cluster.Get(share.CLUSCtrlVerKey); value != nil {
+			// ver.CtrlVersion   : in the format v{major}.{minor}.{patch}[-s{#}] or interim/master.xxxx
+			// nvAppFullVersion  : in the format  {major}.{minor}.{patch}[-s{#}]
+			// nvSemanticVersion : in the format v{major}.{minor}.{patch}
+			var ver share.CLUSCtrlVersion
+			json.Unmarshal(value, &ver)
+			if strings.HasPrefix(ver.CtrlVersion, "interim/") {
+				// it's daily dev build image
+				if *teleCurrentVer == "" {
+					nvAppFullVersion = "5.2.0"
+				} else {
+					nvAppFullVersion = *teleCurrentVer
+				}
+			} else {
+				// it's official release image
+				nvAppFullVersion = ver.CtrlVersion[1:]
+			}
+			if ss := strings.Split(nvAppFullVersion, "-"); len(ss) >= 1 {
+				nvSemanticVersion = "v" + ss[0]
+			}
+		}
+	}
+
 	checkDefAdminFreq := *pwdValidUnit // check default admin's password every 24 hours by default
 	if isNewCluster && *noDefAdmin {
 		checkDefAdminFreq = 0 // do not check default admin's password if it's disabled
 	}
 
 	// pre-build compliance map
-	scanUtils.GetComplianceMeta()
+	scanUtils.InitComplianceMeta(Host.Platform, Host.Flavor, true)
 
 	// start orchestration connection.
 	// orchConnector should be created before LeadChangeCb is registered.
 	orchObjChan := make(chan *resource.Event, 32)
 	orchScanChan := make(chan *resource.Event, 16)
+
+	if strings.HasSuffix(*teleNeuvectorEP, "apikeytest") {
+		rest.TESTApikeySpecifiedCretionTime = true
+		*teleNeuvectorEP = ""
+	}
+
+	if strings.HasSuffix(*teleNeuvectorEP, "dbperftest") {
+		rest.TESTDbPerf = true
+		*teleNeuvectorEP = ""
+	}
 
 	if value, _ := cluster.Get(share.CLUSCtrlVerKey); value != nil {
 		var ver share.CLUSCtrlVersion
@@ -591,20 +700,25 @@ func main() {
 		TimerWheel:               timerWheel,
 		DebugCPath:               ctrlEnv.debugCPath,
 		EnableRmNsGroups:         enableRmNsGrps,
+		EnableIcmpPolicy:         enableIcmpPolicy,
 		ConnLog:                  connLog,
 		MutexLog:                 mutexLog,
 		ScanLog:                  scanLog,
+		K8sResLog:                k8sResLog,
 		CspType:                  cspType,
 		CspPauseInterval:         *cspPauseInterval,
 		CtrlerVersion:            Version,
+		NvSemanticVersion:        nvSemanticVersion,
 		StartStopFedPingPollFunc: rest.StartStopFedPingPoll,
 		RestConfigFunc:           rest.RestConfig,
+		CreateQuerySessionFunc:   rest.CreateQuerySession,
+		DeleteQuerySessionFunc:   rest.DeleteQuerySession,
 	}
 	cacher = cache.Init(&cctx, Ctrler.Leader, lead, restoredFedRole)
 	cache.ScannerChangeNotify(Ctrler.Leader)
 
 	var fedRole string
-	if m := kv.GetClusterHelper().GetFedMembership(); m != nil {
+	if m := clusHelper.GetFedMembership(); m != nil {
 		fedRole = m.FedRole
 	}
 
@@ -637,14 +751,6 @@ func main() {
 	// start OPA server, should be started before RegisterStoreWatcher()
 	opa.InitOpaServer()
 
-	// Orch connector should be started after cacher so the listeners are ready
-	orchConnector = newOrchConnector(orchObjChan, orchScanChan, Ctrler.Leader)
-	orchConnector.Start(ocImageRegistered, cspType)
-
-	// GRPC should be started after cacher as the handler are cache functions
-	grpcServer, _ = startGRPCServer(uint16(*grpcPort))
-
-	// init rest server context before listening KV object store, as federation server can be started from there.
 	rctx := rest.Context{
 		LocalDev:           dev,
 		EvQueue:            evqueue,
@@ -657,11 +763,28 @@ func main() {
 		PwdValidUnit:       *pwdValidUnit,
 		TeleNeuvectorURL:   *teleNeuvectorEP,
 		TeleFreq:           *telemetryFreq,
-		TeleCurrentVer:     *teleCurrentVer,
+		NvAppFullVersion:   nvAppFullVersion,
+		NvSemanticVersion:  nvSemanticVersion,
 		CspType:            cspType,
 		CspPauseInterval:   *cspPauseInterval,
+		CustomCheckControl: *custom_check_control,
 		CheckCrdSchemaFunc: nvcrd.CheckCrdSchema,
 	}
+	// rest.PreInitContext() must be called before orch connector because existing CRD handling could happen right after orch connecter starts
+	rest.PreInitContext(&rctx)
+
+	// Orch connector should be started after cacher so the listeners are ready
+	orchConnector = newOrchConnector(orchObjChan, orchScanChan, Ctrler.Leader)
+	orchConnector.Start(ocImageRegistered, cspType)
+
+	if platform == share.PlatformKubernetes {
+		nvcrd.Init(Ctrler.Leader, crossCheckCRD, cspType)
+	}
+
+	// GRPC should be started after cacher as the handler are cache functions
+	grpcServer, _ = startGRPCServer(uint16(*grpcPort))
+
+	// init rest server context before listening KV object store, as federation server can be started from there.
 	rest.InitContext(&rctx)
 
 	// Registry cluster event handlers
@@ -682,13 +805,15 @@ func main() {
 	rest.LoadInitCfg(Ctrler.Leader, dev.Host.Platform) // Load config from ConfigMap
 
 	// To prevent crd webhookvalidating timeout need queue the crd and process later.
-	go rest.CrdQueueProc()
+	rest.CrdValidateReqManager()
 	go rest.StartRESTServer()
+
+	// go rest.StartLocalDevHttpServer() // for local dev only
 
 	if platform == share.PlatformKubernetes {
 		rest.LeadChangeNotify(Ctrler.Leader)
 		if Ctrler.Leader {
-			cacher.SyncAdmCtrlStateToK8s(resource.NvAdmSvcName, resource.NvAdmValidatingName)
+			cacher.SyncAdmCtrlStateToK8s(resource.NvAdmSvcName, resource.NvAdmValidatingName, false)
 		}
 		go rest.CleanupSessCfgCache()
 		go rest.AdmissionRestServer(*admctrlPort, false, *debug)
@@ -708,18 +833,30 @@ func main() {
 	cache.PopulateDefRiskyRules()
 
 	go func() {
-		var memStatsControllerResetMark uint64 = memControllerTopPeak - memSafeGap
-
 		ticker := time.Tick(time.Second * time.Duration(5))
 		memStatTicker := time.Tick(time.Minute * time.Duration(memoryRecyclePeriod))
+		memCheckTicker := time.NewTicker(time.Minute * time.Duration(memoryCheckPeriod))
 		statsTicker := time.Tick(time.Second * time.Duration(statsInterval))
 
-		if limit, err := global.SYS.GetContainerMemoryLimitUsage(ctrlEnv.cgroupMemory); err == nil {
-			if limit/2 > memSafeGap {
-				memStatsControllerResetMark = limit/2 - memSafeGap
-			}
-			log.WithFields(log.Fields{"Limit": limit, "Controlled_At": memStatsControllerResetMark}).Info("Memory Resource")
+		ctrlEnv.memoryLimit = memControllerTopPeak
+		if limit, err := global.SYS.GetContainerMemoryLimitUsage(ctrlEnv.cgroupMemory); err == nil && limit > 0 {
+			ctrlEnv.memoryLimit = limit
 		}
+		ctrlEnv.snapshotMemStep = ctrlEnv.memoryLimit / 10
+		memSnapshotMark := ctrlEnv.memoryLimit * 3 / 5             // 60% as starting point
+		memStatsControllerResetMark := ctrlEnv.memoryLimit * 3 / 4 // 75% as starting point
+		if ctrlEnv.autoProfieCapture > 1 {
+			var mark uint64 = (uint64)(ctrlEnv.autoProfieCapture * 1024 * 1024) // into mega bytes
+			memSnapshotMark = mark * 3 / 5
+			ctrlEnv.snapshotMemStep = mark / 10
+		}
+
+		if ctrlEnv.autoProfieCapture > 0 {
+			log.WithFields(log.Fields{"Step": ctrlEnv.snapshotMemStep, "Snapshot_At": memSnapshotMark}).Info("Memory Snapshots")
+		} else {
+			memCheckTicker.Stop()
+		}
+		log.WithFields(log.Fields{"Controlled_Limit": ctrlEnv.memoryLimit, "Controlled_At": memStatsControllerResetMark}).Info("Memory Resource")
 
 		// for allinone and controller
 		go global.SYS.MonitorMemoryPressureEvents(memStatsControllerResetMark, memoryPressureNotification)
@@ -733,7 +870,13 @@ func main() {
 			case <-statsTicker:
 				updateStats()
 			case <-memStatTicker:
-				global.SYS.ReCalculateMemoryMetrics(memStatsControllerResetMark)
+				if mStats, err := global.SYS.GetContainerMemoryStats(); err == nil && mStats.WorkingSet > memStatsControllerResetMark {
+					global.SYS.ReCalculateMemoryMetrics(memStatsControllerResetMark)
+				}
+			case <-memCheckTicker.C:
+				if mStats, err := global.SYS.GetContainerMemoryStats(); err == nil && mStats.WorkingSet > memSnapshotMark {
+					memorySnapshot(mStats.WorkingSet)
+				}
 			case <-c_sig:
 				logController(share.CLUSEvControllerStop)
 				flushEventQueue()
@@ -752,4 +895,69 @@ func main() {
 	ctrlDeleteLocalInfo()
 	cluster.LeaveCluster(true)
 	grpcServer.Stop()
+}
+
+func amendStubRtInfo() error {
+	podname := Ctrler.Name
+	objs, err := global.ORCH.ListResource(resource.RscTypeNamespace)
+	if err == nil {
+		for _, obj := range objs {
+			if domain := obj.(*resource.Namespace); domain != nil {
+				if o, err := global.ORCH.GetResource(resource.RscTypePod, domain.Name, podname); err == nil {
+					if pod := o.(*resource.Pod); pod != nil {
+						log.WithFields(log.Fields{"pod": pod}).Debug()
+						Ctrler.Domain = domain.Name
+						Ctrler.Labels = pod.Labels
+						if Ctrler.Labels != nil {
+							Ctrler.Labels["io.kubernetes.container.name"] = resource.NvDeploymentName
+							Ctrler.Labels["io.kubernetes.pod.name"] = podname
+							Ctrler.Labels["io.kubernetes.pod.namespace"] = Ctrler.Domain
+							Ctrler.Labels["io.kubernetes.pod.uid"] = pod.UID
+							Ctrler.Labels["name"] = share.NeuVectorRoleController
+							Ctrler.Labels["neuvector.role"] = share.NeuVectorRoleController
+							Ctrler.Labels["release"] = ""
+							Ctrler.Labels["vendor"] = "NeuVector Inc."
+							Ctrler.Labels["version"] = ""
+						}
+						if pod.HostNet {
+							Ctrler.NetworkMode = "host"
+						} else {
+							Ctrler.NetworkMode = "default"
+						}
+						Host.Name = pod.Node
+						Ctrler.HostName = Host.Name
+						if tokens := strings.Split(Ctrler.HostID, ":"); len(tokens) > 0 {
+							Host.ID = fmt.Sprintf("%s:%s", Host.Name, tokens[1])
+							Ctrler.HostID = Host.ID
+						}
+						Ctrler.Name = "k8s_" + Ctrler.Labels["io.kubernetes.container.name"] + "_" +
+							Ctrler.Labels["io.kubernetes.pod.name"] + "_" +
+							Ctrler.Labels["io.kubernetes.pod.namespace"] + "_" +
+							Ctrler.Labels["io.kubernetes.pod.uid"] + "_0"
+						return nil
+					}
+				}
+			}
+		}
+	}
+	return fmt.Errorf("can not found: err = %v", err)
+}
+
+func amendNotPrivilegedMode() error {
+	podname, _ := Ctrler.Labels["io.kubernetes.pod.name"]
+	domain, _ := Ctrler.Labels["io.kubernetes.pod.namespace"]
+	if o, err := global.ORCH.GetResource(resource.RscTypePod, domain, podname); err != nil {
+		return fmt.Errorf("can not found: err = %v, %v, %v", domain, podname, err)
+	} else {
+		if pod := o.(*resource.Pod); pod != nil {
+			log.WithFields(log.Fields{"pod": pod}).Debug()
+			Host.Name = pod.Node
+			Ctrler.HostName = Host.Name
+			if tokens := strings.Split(Ctrler.HostID, ":"); len(tokens) > 0 {
+				Host.ID = fmt.Sprintf("%s:%s", Host.Name, tokens[1])
+				Ctrler.HostID = Host.ID
+			}
+		}
+	}
+	return nil
 }

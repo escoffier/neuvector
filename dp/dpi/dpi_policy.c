@@ -32,6 +32,8 @@ static void _dpi_policy_chk_unknown_ip(dpi_policy_hdl_t *hdl, uint32_t sip, uint
 #define UNKNOWN_IP_CACHE_TIMEOUT 600 //sec
 #define POLICY_DESC_VER_CHG_MAX 60 //sec
 #define UNKNOWN_IP_TRY_COUNT 10 //10 times
+#define HOST_IP_TRY_COUNT 3 //3 times
+#define EXT_IP_TRY_COUNT 2 //2 times
 typedef struct dpi_unknown_ip_desc_ {
     uint32_t sip;
     uint32_t dip;
@@ -75,14 +77,21 @@ void dpi_unknown_ip_init(void)
     rcu_map_init(&th_unknown_ip_map, 64, offsetof(dpi_unknown_ip_cache_t, node), unknown_ip_match, unknown_ip_hash);
 }
 
-static void add_unknown_ip_cache(dpi_unknown_ip_desc_t *desc, dpi_unknown_ip_desc_t *key)
+static void add_unknown_ip_cache(dpi_unknown_ip_desc_t *desc, dpi_unknown_ip_desc_t *key, uint8_t iptype, bool ext)
 {
     dpi_unknown_ip_cache_t *cache = calloc(1, sizeof(*cache));
     if (cache != NULL) {
         memcpy(&cache->desc, desc, sizeof(*desc));
         cache->start_hit = th_snap.tick;
         cache->last_hit = th_snap.tick;
-        cache->try_cnt = UNKNOWN_IP_TRY_COUNT;
+        if (iptype == DP_IPTYPE_HOSTIP || iptype == DP_IPTYPE_TUNNELIP) {
+            cache->try_cnt = HOST_IP_TRY_COUNT;
+        } else {
+            cache->try_cnt = UNKNOWN_IP_TRY_COUNT;
+            if (ext) {
+                cache->try_cnt = EXT_IP_TRY_COUNT;
+            }
+        }
         rcu_map_add(&th_unknown_ip_map, cache, key);
 
         timer_wheel_entry_init(&cache->ts_entry);
@@ -519,6 +528,16 @@ int dpi_rule_add(dpi_policy_hdl_t *hdl, dpi_rule_key_t *key_l, dpi_rule_key_t *k
             app_rule.rule_id = desc->id;
             ret = dpi_add_app_rule(hdl, key_l, key_h, &app_rule, dir, desc, &exist_desc);
         }
+    } else if (ret > 0) {
+        //newly added rule match any application
+        if (desc->id > 0 && desc->action != DP_POLICY_ACTION_CHECK_APP) {
+            // install an app any rule
+            dpi_policy_app_rule_t app_rule;
+            app_rule.app = 0;
+            app_rule.action = desc->action;
+            app_rule.rule_id = desc->id;
+            ret = dpi_add_app_rule(hdl, key_l, key_h, &app_rule, dir, desc, &exist_desc);
+        }
     }
 
     if (app_num > 0) {
@@ -632,16 +651,47 @@ int dpi_policy_lookup(dpi_packet_t *p, dpi_policy_hdl_t *hdl, uint32_t app,
                  hdl, proto, DBG_IPV4_TUPLE(sip), DBG_IPV4_TUPLE(dip), dport, app, is_ingress, to_server);
     dpi_policy_lookup_by_key(hdl, sip, dip, dport, proto, app, is_ingress, desc, p);
 
-    if ((desc->flags & POLICY_DESC_INTERNAL) && _dpi_policy_implicit_default(hdl, desc)) {
+    if ((desc->flags & POLICY_DESC_INTERNAL)) {
         if (is_ingress) {
             iptype = dpi_ip4_iptype(sip);
-            inPolicyAddr = dpi_is_policy_addr(sip);
         } else {
             iptype = dpi_ip4_iptype(dip);
-            inPolicyAddr = dpi_is_policy_addr(dip);
         }
-        if (!inPolicyAddr) {
-            _dpi_policy_chk_unknown_ip(hdl, sip, dip, iptype, &desc);
+        if (_dpi_policy_implicit_default(hdl, desc)) {
+            if (is_ingress) {
+                if (iptype == DP_IPTYPE_HOSTIP || iptype == DP_IPTYPE_TUNNELIP) {
+                    inPolicyAddr = dpi_is_policy_addr(dip);
+                } else {
+                    inPolicyAddr = dpi_is_policy_addr(sip);
+                }
+            } else {
+                if (iptype == DP_IPTYPE_HOSTIP || iptype == DP_IPTYPE_TUNNELIP) {
+                    inPolicyAddr = dpi_is_policy_addr(sip);
+                } else {
+                    inPolicyAddr = dpi_is_policy_addr(dip);
+                }
+            }
+            if (!inPolicyAddr) {
+                _dpi_policy_chk_unknown_ip(hdl, sip, dip, iptype, &desc);
+            }
+        }
+        if (iptype == DP_IPTYPE_UWLIP) {
+            desc->flags |= POLICY_DESC_UWLIP;
+        }
+    } else {
+        if (_dpi_policy_implicit_default(hdl, desc)) {
+            if (is_ingress) {
+                inPolicyAddr = dpi_is_policy_addr(dip);
+            } else {
+                inPolicyAddr = dpi_is_policy_addr(sip);
+            }
+            if (!inPolicyAddr) {
+                if (is_ingress) {
+                    _dpi_policy_chk_unknown_ip(hdl, 0, dip, DP_IPTYPE_NONE, &desc);
+                } else {
+                    _dpi_policy_chk_unknown_ip(hdl, sip, 0, DP_IPTYPE_NONE, &desc);
+                }
+            }
         }
     }
 
@@ -680,6 +730,11 @@ static void _dpi_policy_chk_unknown_ip(dpi_policy_hdl_t *hdl, uint32_t sip, uint
 
     dpi_policy_desc_t *desc = *pol_desc;
     dpi_unknown_ip_desc_t uip_desc;
+    bool is_external = false;
+    if (desc->flags & POLICY_DESC_EXTERNAL) {
+        is_external = true;
+    }
+
     //unknown ip desc
     memset(&uip_desc, 0, sizeof(uip_desc));
     uip_desc.sip = sip;
@@ -691,17 +746,6 @@ static void _dpi_policy_chk_unknown_ip(dpi_policy_hdl_t *hdl, uint32_t sip, uint
         uint16_t thdl_ver = hdl?hdl->ver:0;
         dpi_unknown_ip_cache_t *uip_cache = rcu_map_lookup(&th_unknown_ip_map, &uip_desc);
         if (uip_cache != NULL) {
-            /*
-             * existing unknown_ip_cache found
-             * 1. policy handle version is still same and lapse time for handle
-             *    version change is less than POLICY_DESC_VER_CHG_MAX seconds 
-             *    so we keep action as OPEN
-             * 2. handle version changes, but policy matches implicit default
-             *    action which means unmanaged wl/host ip, keep default action
-             * 3. handle version does not change, but 60s has passed,
-             *    this means there is no new policy push from controller/enforcer
-             *    to dp, which means unmanaged wl/host ip, keep default action
-             */
             if (thdl_ver == uip_cache->desc.hdl_ver &&
                 th_snap.tick - uip_cache->start_hit < POLICY_DESC_VER_CHG_MAX) {
                 desc->flags &= ~(POLICY_DESC_CHECK_VER);
@@ -722,17 +766,8 @@ static void _dpi_policy_chk_unknown_ip(dpi_policy_hdl_t *hdl, uint32_t sip, uint
                 }
             }
         } else {
-            /*
-             * existing unknown_ip_cache not found, traffic is internal,
-             * but no explicit policy is found thus default action is taken.
-             * 1. some workload send traffic immediately when it comes up,
-             *    dp see packet faster than it receives rules from controller,
-             *    change action to open and reevaluate after receive rules
-             *    from controller.
-             * 2. it can also be traffic sent from/to unmanaged wl/host ip
-             */
             uip_desc.hdl_ver = thdl_ver;
-            add_unknown_ip_cache(&uip_desc, &uip_desc);
+            add_unknown_ip_cache(&uip_desc, &uip_desc, iptype, is_external);
             desc->flags &= ~(POLICY_DESC_CHECK_VER);
             desc->flags |= POLICY_DESC_UNKNOWN_IP;
             desc->flags |= POLICY_DESC_TMP_OPEN;
@@ -1363,6 +1398,12 @@ int dpi_policy_cfg(int cmd, dpi_policy_t *p, int flag)
                     dpi_rule_add(hdl, &key, &key_r,
                                  p->rule_list[i].num_apps,p->rule_list[i].app_rules,
                                  dir, &desc);
+                    if (g_enable_icmp_policy) {
+                        key.proto = key_r.proto = IPPROTO_ICMP;
+                        dpi_rule_add(hdl, &key, &key_r,
+                                    p->rule_list[i].num_apps,p->rule_list[i].app_rules,
+                                    dir, &desc);
+                    }
                 }
             } else {
                 if (key.proto > 0) {
@@ -1378,11 +1419,19 @@ int dpi_policy_cfg(int cmd, dpi_policy_t *p, int flag)
                     dpi_rule_add(hdl, &key, NULL,
                                  p->rule_list[i].num_apps,p->rule_list[i].app_rules,
                                  dir, &desc);
+                    if (g_enable_icmp_policy) {
+                        key.proto = IPPROTO_ICMP;
+                        dpi_rule_add(hdl, &key, NULL,
+                                    p->rule_list[i].num_apps,p->rule_list[i].app_rules,
+                                    dir, &desc);
+                    }
                 }
             }
         }
         if (flag & MSG_END) {
-            dpi_add_default_policy(hdl);
+            if (!g_enable_icmp_policy) {
+                dpi_add_default_policy(hdl);
+            }
         }
     } else {
         if (hdl != NULL) {
@@ -2003,6 +2052,93 @@ int dpi_policy_init() {
     if (g_fqdn_hdl == NULL) {
         DEBUG_ERROR(DBG_POLICY, "Fail to init fqdn hdl!!!\n");
         return -1;
+    }
+    return 0;
+}
+
+/*
+ * -----------------------------------------
+ * --- ip-fqdn storage definition ----------
+ * -----------------------------------------
+ */
+static int ip_fqdn_storage_match(struct cds_lfht_node *ht_node, const void *key)
+{
+    dpi_ip_fqdn_storage_entry_t *s = STRUCT_OF(ht_node, dpi_ip_fqdn_storage_entry_t, node);
+    const uint32_t *k = key;
+    return (s->r->ip == *k);
+}
+
+static uint32_t ip_fqdn_storage_hash(const void *key)
+{
+    const uint32_t *k = key;
+    return sdbm_hash((uint8_t *)k, sizeof(uint32_t));
+}
+
+static void ip_fqdn_storage_release(timer_entry_t *entry)
+{
+    dpi_ip_fqdn_storage_entry_t *c = STRUCT_OF(entry, dpi_ip_fqdn_storage_entry_t, ts_entry);
+    rcu_map_del(&th_ip_fqdn_storage_map, c);    
+    dp_ctrl_release_ip_fqdn_storage(c);
+    free(c);
+}
+
+void dpi_ip_fqdn_storage_init(void)
+{
+    rcu_map_init(&th_ip_fqdn_storage_map, 64, offsetof(dpi_ip_fqdn_storage_entry_t, node), ip_fqdn_storage_match, ip_fqdn_storage_hash);
+}
+
+static void add_ip_fqdn_storage_entry(char *name, uint32_t ip)
+{
+    dpi_ip_fqdn_storage_entry_t *entry = calloc(1, sizeof(*entry));
+    if (!entry) {
+        DEBUG_ERROR(DBG_POLICY, "OOM!!!\n");
+        return;
+    }
+
+    dpi_ip_fqdn_storage_record_t *r = calloc(1, sizeof(*r));
+    if (!r) {
+        DEBUG_ERROR(DBG_POLICY, "OOM!!!\n");
+        free(entry);
+        return;
+    }
+    r->ip = ip;
+    strlcpy(r->name, name, MAX_FQDN_LEN);
+    uatomic_set(&r->record_updated, 1);
+    entry->r = r;
+    rcu_map_add(&th_ip_fqdn_storage_map, entry, &ip);
+
+    timer_wheel_entry_init(&entry->ts_entry);
+    timer_wheel_entry_start(&th_timer, &entry->ts_entry,
+                            ip_fqdn_storage_release, IP_FQDN_STORAGE_ENTRY_TIMEOUT, th_snap.tick);
+}
+
+static void update_ip_fqdn_storage_entry(dpi_ip_fqdn_storage_entry_t *entry, char *name)
+{
+    strlcpy(entry->r->name, name, MAX_FQDN_LEN);
+    uatomic_set(&entry->r->record_updated, 1);
+
+    timer_wheel_entry_refresh(&th_timer, &entry->ts_entry, th_snap.tick);
+}
+
+// Called from parser, make sure ip not NULL
+int sniff_ip_fqdn_storage(char *name, uint32_t *ip, int cnt)
+{
+    DEBUG_POLICY("name: (%s), ip cnt: (%d)\n", name, cnt);
+
+    int i;
+    for (i = 0; i < cnt; i++)
+    {
+        if (!dpi_is_ip4_internal(ip[i])) {
+            dpi_ip_fqdn_storage_entry_t *ip_fqdn_storage_entry = rcu_map_lookup(&th_ip_fqdn_storage_map, &ip[i]);
+            if (!ip_fqdn_storage_entry) {
+                add_ip_fqdn_storage_entry(name, ip[i]);
+            }
+            else {
+                if (strcmp(ip_fqdn_storage_entry->r->name, name) != 0) {
+                    update_ip_fqdn_storage_entry(ip_fqdn_storage_entry, name);
+                }
+            }
+        }
     }
     return 0;
 }

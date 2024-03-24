@@ -400,9 +400,6 @@ func (p *Probe) processContainerChanges(pidSetNew utils.Set) {
 
 func (p *Probe) monitorProcessChanges() {
 	// netlink proc: avoid deadlocks
-	p.processContainerNewChanges()
-	p.processContainerStopChanges()
-
 	// keep an eye on the launched applications
 	p.inspectNewProcesses(false) // Evaluations
 	// p.processContainerAppPortChanges()
@@ -541,7 +538,7 @@ func New(pc *ProbeConfig) (*Probe, error) {
 		}
 	}
 
-	p.selfID, _, _ = global.SYS.GetSelfContainerID()
+	p.selfID = global.RT.GetSelfID()
 	p.agentSessionID = osutil.GetSessionId(p.agentPid)
 	//log.WithFields(log.Fields{"sessionID": p.agentSessionID, "container ID": p.selfID}).Info("PROC: ")
 
@@ -736,15 +733,22 @@ func (p *Probe) addContainerFAccessBlackList(id string, list []string) {
 	}
 }
 
-func (p *Probe) FsnExecFileChanged(id, file string, bNewFile bool, finfo fileInfo) {
-	if bNewFile {
-		if finfo.bExec {
-			mLog.WithFields(log.Fields{"file": file, "id": id, "finfo": finfo}).Debug("FSN: new file")
+const skipJarEventPeriod = time.Duration(time.Second * 30)
+func (p *Probe) ProcessFsnEvent(id string, files []string, finfo fileInfo) {
+	if finfo.bExec || finfo.bJavaPkg {
+		mLog.WithFields(log.Fields{"id": id, "files": files, "finfo": finfo}).Debug("FSN:")
+		p.lockProcMux()
+		c, ok := p.containerMap[id]
+		p.unlockProcMux()
+		if ok {
+			if time.Since(c.startAt) < skipJarEventPeriod {
+				mLog.WithFields(log.Fields{"start": c.startAt}).Debug("FSN: Skip jar")
+				return
+			}
 		}
-	} else {
-		// TODO: file changed
-		if finfo.bExec {
-			mLog.WithFields(log.Fields{"file": file, "id": id, "finfo": finfo}).Debug("FSN: file changed")
+
+		if finfo.bJavaPkg && (finfo.fileType == file_added || finfo.fileType == file_deleted) {
+			p.sendFsnJavaPkgReport(id, files, finfo.fileType == file_added)
 		}
 	}
 }

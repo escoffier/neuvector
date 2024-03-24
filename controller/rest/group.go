@@ -21,6 +21,7 @@ import (
 	"github.com/neuvector/neuvector/controller/common"
 	"github.com/neuvector/neuvector/controller/kv"
 	"github.com/neuvector/neuvector/controller/resource"
+	"github.com/neuvector/neuvector/controller/rpc"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/cluster"
 	"github.com/neuvector/neuvector/share/utils"
@@ -383,26 +384,27 @@ func validateLearnGroupConfig(rg *api.RESTGroupConfig) (int, string) {
 					e = "Learned ip service group does not allow service criteria"
 				} else {
 					if serviceFind {
-						e = "Learned group only allow one service criteria"
+						e = "Learned group only allows one service criteria"
 					} else {
 						serviceFind = true
 						if serviceName != utils.NormalizeForURL(ct.Value) {
-							e = "Learned group service not match between value and name (urlNormalized value replace [/?%& ] to :, without NonPrintable) "
+							e = fmt.Sprintf("Learned group service does not match between name and criteria(key: %s, value: %s). For value, replace [/?%%& ] to :, without NonPrintable.",
+								ct.Key, ct.Value)
 						}
 					}
 				}
 			} else if ct.Key == share.CriteriaKeyDomain {
 				if domainFind {
-					e = "Learned group only allow one domain criteria"
+					e = "Learned group only allows one domain criteria"
 				} else {
 					domainFind = true
 					if len(tokens) < 3 || tokens[len(tokens)-1] != ct.Value { // we can only assume the last token in rg.Name is the domain
-						e = "Learned group domain not match between value and name"
+						e = fmt.Sprintf("Learned group domain does not match between name and criteria(key: %s, value: %s)", ct.Key, ct.Value)
 					}
 				}
 			} else {
 				if isNvIpGroup {
-					// only domain criterion(if exists) will be kept. All other criteria will br dropped for crd nv.ip.xxx groups
+					// only domain criterion(if exists) will be kept. All other criteria will be dropped for crd nv.ip.xxx groups
 				} else {
 					e = "Learned group can only have key as service and domain"
 				}
@@ -457,27 +459,28 @@ func validateGroupConfigCriteria(rg *api.RESTGroupConfig, acc *access.AccessCont
 		}
 
 		if ct.Op != share.CriteriaOpEqual && ct.Op != share.CriteriaOpNotEqual && ct.Value == "" {
-			e := "Empty criteria value is only allowed for exact match"
+			e := fmt.Sprintf("Empty criteria value is only allowed for exact match (key: %s)", ct.Key)
 			log.WithFields(log.Fields{"key": ct.Key, "value": ct.Value}).Error(e)
 			return api.RESTErrInvalidRequest, e, hasAddrCT
 		}
 
 		if !isNamePathValid(ct.Key) {
-			e := "Invalid characters in criteria key"
+			e := fmt.Sprintf("Invalid characters in criteria key %s", ct.Key)
 			log.WithFields(log.Fields{"key": ct.Key}).Error(e)
 			return api.RESTErrInvalidRequest, e, hasAddrCT
 		}
 		if ct.Op != share.CriteriaOpEqual && ct.Op != share.CriteriaOpContains &&
 			ct.Op != share.CriteriaOpPrefix && ct.Op != share.CriteriaOpRegex &&
 			ct.Op != share.CriteriaOpNotEqual && ct.Op != share.CriteriaOpNotRegex {
-			e := "Invalid operation in criteria"
+			e := fmt.Sprintf("Invalid operation in criteria (key: %s, op: %s)", ct.Key, ct.Op)
 			log.WithFields(log.Fields{"key": ct.Key}).Error(e)
 			return api.RESTErrInvalidRequest, e, hasAddrCT
 		}
 
+		kovStr := fmt.Sprintf("(key: %s, op: %s, value: %s)", ct.Key, ct.Op, ct.Value)
 		if ct.Op == share.CriteriaOpRegex || ct.Op == share.CriteriaOpNotRegex {
 			if _, err := regexp.Compile(ct.Value); err != nil {
-				e := "Invalid regex in criteria"
+				e := fmt.Sprintf("Invalid regex value in criteria %s", kovStr)
 				log.WithFields(log.Fields{"error": err}).Error(e)
 				return api.RESTErrInvalidRequest, e, hasAddrCT
 			}
@@ -486,7 +489,7 @@ func validateGroupConfigCriteria(rg *api.RESTGroupConfig, acc *access.AccessCont
 			if strings.ContainsAny(ct.Value, "?*") {
 				// Check simplified regex
 				if strings.ContainsAny(ct.Value, "^$") {
-					e := "Invalid simple regex in criteria"
+					e := fmt.Sprintf("Invalid simple regex value in criteria %s", kovStr)
 					log.WithFields(log.Fields{"value": ct.Value}).Error(e)
 					return api.RESTErrInvalidRequest, e, hasAddrCT
 				}
@@ -502,7 +505,7 @@ func validateGroupConfigCriteria(rg *api.RESTGroupConfig, acc *access.AccessCont
 				grp = &share.CLUSGroup{CfgType: cfgType, CreaterDomains: []string{ct.Value}}
 			}
 			if !acc.Authorize(grp, nil) {
-				e := "No permission on the specified namespace/domain criteria"
+				e := fmt.Sprintf("No permission on the specified namespace/domain criteria %s", kovStr)
 				log.WithFields(log.Fields{"value": ct.Value}).Error(e)
 				return api.RESTErrInvalidRequest, e, hasAddrCT
 			}
@@ -510,26 +513,27 @@ func validateGroupConfigCriteria(rg *api.RESTGroupConfig, acc *access.AccessCont
 
 		if ct.Key == share.CriteriaKeyAddress {
 			if ct.Op != share.CriteriaOpEqual {
-				e := "Only exact match is supported for address criteria"
+				e := fmt.Sprintf("Only exact match is supported for address criteria %s", kovStr)
 				log.Error(e)
 				return api.RESTErrInvalidRequest, e, hasAddrCT
 			}
 
 			if hasObjCT {
-				e := "Cannot mix address and other criteria in a group"
+				e := fmt.Sprintf("Cannot mix address and other criteria in a group %s", kovStr)
 				log.Error(e)
 				return api.RESTErrInvalidRequest, e, hasAddrCT
 			}
 			if err := validateAddressRange(ct.Value); err != nil {
 				if validateDomainName(ct.Value) == false {
-					log.WithFields(log.Fields{"address": ct.Value}).Error("invalid address")
-					return api.RESTErrInvalidRequest, "Invalid address", hasAddrCT
+					e := fmt.Sprintf("Invalid address criteria %s", kovStr)
+					log.WithFields(log.Fields{"address": ct.Value}).Error(e)
+					return api.RESTErrInvalidRequest, e, hasAddrCT
 				}
 			}
 			hasAddrCT = true
 		} else {
 			if hasAddrCT {
-				e := "Cannot mix address and other criteria in a group"
+				e := fmt.Sprintf("Cannot mix address and other criteria in a group %s", kovStr)
 				log.Error(e)
 				return api.RESTErrInvalidRequest, e, hasAddrCT
 			}
@@ -956,18 +960,22 @@ func handlerServiceCreate(w http.ResponseWriter, r *http.Request, ps httprouter.
 
 func configPolicyMode(grp *share.CLUSGroup) error {
 	if pp := clusHelper.GetProcessProfile(grp.Name); pp != nil {
-		pp.Mode = grp.ProfileMode
-		pp.Baseline = grp.BaselineProfile
-		if err := clusHelper.PutProcessProfile(grp.Name, pp); err != nil {
-			log.WithFields(log.Fields{"error": err}).Error()
-			return err
+		if pp.Mode != grp.ProfileMode || pp.Baseline != grp.BaselineProfile {
+			pp.Mode = grp.ProfileMode
+			pp.Baseline = grp.BaselineProfile
+			if err := clusHelper.PutProcessProfile(grp.Name, pp); err != nil {
+				log.WithFields(log.Fields{"error": err}).Error()
+				return err
+			}
 		}
 	}
 	if pp, rev := clusHelper.GetFileMonitorProfile(grp.Name); pp != nil {
-		pp.Mode = grp.ProfileMode
-		if err := clusHelper.PutFileMonitorProfile(grp.Name, pp, rev); err != nil {
-			log.WithFields(log.Fields{"error": err}).Error()
-			return err
+		if pp.Mode != grp.ProfileMode {
+			pp.Mode = grp.ProfileMode
+			if err := clusHelper.PutFileMonitorProfile(grp.Name, pp, rev); err != nil {
+				log.WithFields(log.Fields{"error": err}).Error()
+				return err
+			}
 		}
 	}
 	return nil
@@ -1763,7 +1771,7 @@ func importGroupPolicy(scope string, loginDomainRoles access.DomainRole, importT
 			if secRule == nil || (secRule.Kind == nil || secRule.ApiVersion == nil || secRule.Metadata == nil) {
 				continue
 			}
-			if grpCfgRet, errCount, errMsg, _ := crdHandler.parseCurCrdContent(secRule, share.ReviewTypeImportGroup, share.ReviewTypeDisplayGroup); errCount > 0 {
+			if grpCfgRet, errCount, errMsg, _ := crdHandler.parseCurCrdGfwContent(secRule, nil, share.ReviewTypeImportGroup, share.ReviewTypeDisplayGroup); errCount > 0 {
 				err = fmt.Errorf(errMsg)
 				break
 			} else {
@@ -1810,28 +1818,35 @@ func importGroupPolicy(scope string, loginDomainRoles access.DomainRole, importT
 				// [4]: import network policy rules/process profile/file access rules/group policy mode
 				for i, grpCfgRet := range parsedGrpCfg {
 					var crdRecord share.CLUSCrdSecurityRule // leverage CLUSCrdSecurityRule but we don't save it in kv
-					var profile_mode string
+					var policyMode string
+					var profileMode string
 					var baseline string
+					if grpCfgRet.PolicyModeCfg != nil && grpCfgRet.PolicyModeCfg.PolicyMode != nil {
+						policyMode = *grpCfgRet.PolicyModeCfg.PolicyMode
+						crdRecord.PolicyMode = policyMode
+					}
 					if grpCfgRet.ProcessProfileCfg != nil {
 						// nodes, containers, service or user-defined groups
-						profile_mode = grpCfgRet.ProcessProfileCfg.Mode
+						profileMode = grpCfgRet.ProcessProfileCfg.Mode
 						crdRecord = share.CLUSCrdSecurityRule{
 							ProfileName:    grpCfgRet.TargetName,
-							ProfileMode:    profile_mode,
-							ProcessProfile: share.CLUSCrdProcessProfile{Baseline: grpCfgRet.ProcessProfileCfg.Baseline},
+							ProfileMode:    profileMode,
+							ProcessProfile: &share.CLUSCrdProcessProfile{Baseline: grpCfgRet.ProcessProfileCfg.Baseline},
 							ProcessRules:   crdHandler.crdGetProcessRules(grpCfgRet.ProcessProfileCfg),
 							FileRules:      crdHandler.crdGetFileRules(grpCfgRet.FileProfileCfg),
 						}
 					}
 
-					//  do same job as crdHandleRules(crdCfgRet.RuleCfgs, crdRecord)
+					//  do same job as crdHandleNetworkRules(crdCfgRet.RuleCfgs, crdRecord)
 					importGroupNetworkRules(grpCfgRet.RuleCfgs)
 
-					if crdRecord.ProfileName != "" {
+					if crdRecord.ProfileName != "" && utils.HasGroupProfiles(crdRecord.ProfileName) {
 						secRuleName := fmt.Sprintf("group-import-%d", i)
-						profile_mode, baseline = crdHandler.crdRebuildGroupProfiles(crdRecord.ProfileName, map[string]*share.CLUSCrdSecurityRule{secRuleName: &crdRecord}, share.ReviewTypeImportGroup)
+						profileMode, baseline = crdHandler.crdRebuildGroupProfiles(crdRecord.ProfileName,
+							map[string]*share.CLUSCrdSecurityRule{secRuleName: &crdRecord}, share.ReviewTypeImportGroup)
 					}
-					crdHandler.crdHandlePolicyMode(grpCfgRet.PolicyModeCfg, profile_mode, baseline)
+					//policyMode = h.crdGetProfileSecurityLevel(profileName, "policyMode", recordList)
+					crdHandler.crdHandlePolicyMode(grpCfgRet.TargetName, policyMode, profileMode, baseline)
 
 					if hasDlpWafSetting, ok := targetGroupDlpWAF[grpCfgRet.TargetName]; ok && hasDlpWafSetting {
 						if grpCfgRet.DlpGroupCfg == nil {
@@ -1840,10 +1855,14 @@ func importGroupPolicy(scope string, loginDomainRoles access.DomainRole, importT
 						if grpCfgRet.WafGroupCfg == nil {
 							grpCfgRet.WafGroupCfg = &api.RESTCrdWafGroupConfig{RepSensors: make([]api.RESTCrdWafGroupSetting, 0)}
 						}
+
+						txn := cluster.Transact()
 						// [4]: import dlp group data
-						crdHandler.crdHandleDlpGroup(grpCfgRet.TargetName, grpCfgRet.DlpGroupCfg, share.UserCreated)
+						crdHandler.crdHandleDlpGroup(txn, grpCfgRet.TargetName, grpCfgRet.DlpGroupCfg, share.UserCreated)
 						// [5]: import waf group data
-						crdHandler.crdHandleWafGroup(grpCfgRet.TargetName, grpCfgRet.WafGroupCfg, share.UserCreated)
+						crdHandler.crdHandleWafGroup(txn, grpCfgRet.TargetName, grpCfgRet.WafGroupCfg, share.UserCreated)
+						txn.Apply()
+						txn.Close()
 					}
 
 					progress += inc
@@ -2034,4 +2053,138 @@ func importGroupNetworkRules(rulesCfg []api.RESTPolicyRuleConfig) {
 	if ok, err := txn.Apply(); err != nil || !ok {
 		log.WithFields(log.Fields{"error": err, "ok": ok}).Error("Atomic write failed")
 	}
+}
+
+func updateGroupStats(final *api.RESTStats, data *share.CLUSStats) {
+	final.Interval = data.Interval
+	final.Total.SessionIn += data.Total.SessionIn
+	final.Total.SessionOut += data.Total.SessionOut
+	final.Total.SessionCurIn += data.Total.SessionCurIn
+	final.Total.SessionCurOut += data.Total.SessionCurOut
+	final.Total.PacketIn += data.Total.PacketIn
+	final.Total.PacketOut += data.Total.PacketOut
+	final.Total.ByteIn += data.Total.ByteIn
+	final.Total.ByteOut += data.Total.ByteOut
+
+	final.Span1.CPU += data.Span1.CPU
+	final.Span1.Memory += data.Span1.Memory
+	final.Span1.SessionIn += data.Span1.SessionIn
+	final.Span1.SessionOut += data.Span1.SessionOut
+	final.Span1.PacketIn += data.Span1.PacketIn
+	final.Span1.PacketOut += data.Span1.PacketOut
+	final.Span1.ByteIn += data.Span1.ByteIn
+	final.Span1.ByteOut += data.Span1.ByteOut
+
+	final.Span12.CPU += data.Span12.CPU
+	final.Span12.Memory += data.Span12.Memory
+	final.Span12.SessionIn += data.Span12.SessionIn
+	final.Span12.SessionOut += data.Span12.SessionOut
+	final.Span12.PacketIn += data.Span12.PacketIn
+	final.Span12.PacketOut += data.Span12.PacketOut
+	final.Span12.ByteIn += data.Span12.ByteIn
+	final.Span12.ByteOut += data.Span12.ByteOut
+
+	final.Span60.CPU += data.Span60.CPU
+	final.Span60.Memory += data.Span60.Memory
+	final.Span60.SessionIn += data.Span60.SessionIn
+	final.Span60.SessionOut += data.Span60.SessionOut
+	final.Span60.PacketIn += data.Span60.PacketIn
+	final.Span60.PacketOut += data.Span60.PacketOut
+	final.Span60.ByteIn += data.Span60.ByteIn
+	final.Span60.ByteOut += data.Span60.ByteOut
+}
+
+func handlerGroupStats(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug("")
+	defer r.Body.Close()
+
+	acc, login := getAccessControl(w, r, "")
+	if acc == nil {
+		return
+	}
+
+	groupname := ps.ByName("name")
+	if groupname == "" {
+		log.Debug("Empty group name")
+		return
+	}
+
+	if exist, err := cacher.DoesGroupExist(groupname, acc); !exist {
+		restRespNotFoundLogAccessDenied(w, login, err)
+		return
+	}
+
+	resp := api.RESTGroupStatsData{
+		Name:   groupname,
+		ReadAt: api.RESTTimeString(time.Now()),
+		Stats: &api.RESTStats{
+			Interval: 0,
+			Total:    api.RESTMetry{},
+			Span1:    api.RESTMetry{},
+			Span12:   api.RESTMetry{},
+			Span60:   api.RESTMetry{},
+		},
+	}
+
+	host_wl_map := make(map[string]utils.Set)
+	gr, _ := cacher.GetGroup(groupname, "", false, acc)
+	if gr != nil && len(gr.Members) > 0 {
+		for _, wl := range gr.Members {
+			if wl.HasDatapath {
+				if host_wl_map[wl.HostID] == nil {
+					host_wl_map[wl.HostID] = utils.NewSet()
+				}
+				host_wl_map[wl.HostID].Add(wl.ID)
+			}
+		}
+	} else {
+		restRespSuccess(w, r, &resp, acc, login, nil, "Get group network session counter")
+		return
+	}
+
+	agent_wl_map := make(map[string]utils.Set)
+	for _, wls := range host_wl_map {
+		agtid := ""
+		if wls != nil {
+			for wl := range wls.Iter() {
+				wlid := wl.(string)
+				if agtid == "" {
+					agentID, err := cacher.GetAgentbyWorkload(wlid, acc)
+					if err != nil || agentID == "" {
+						//try other workloads in group
+						continue
+					}
+					agtid = agentID
+				}
+				if agtid != "" {
+					if agent_wl_map[agtid] == nil {
+						agent_wl_map[agtid] = utils.NewSet()
+					}
+					agent_wl_map[agtid].Add(wlid)
+				}
+			}
+		}
+	}
+	//log.WithFields(log.Fields{"agent_wl_map": agent_wl_map}).Debug("")
+
+	for agid, wlids := range agent_wl_map {
+		var wla share.CLUSWlIDArray
+		wla.WlID = make([]string, 0)
+		if wlids != nil {
+			for wl := range wlids.Iter() {
+				wlid := wl.(string)
+				wla.WlID = append(wla.WlID, wlid)
+			}
+		}
+		stats, err := rpc.GetGroupStats(agid, &wla)
+		if err != nil {
+			log.WithFields(log.Fields{"error": err}).Error("Fail to make RPC call")
+			restRespError(w, http.StatusInternalServerError, api.RESTErrClusterRPCError)
+			return
+		}
+		updateGroupStats(resp.Stats, stats)
+	}
+	resp.ReadAt = api.RESTTimeString(time.Now())
+
+	restRespSuccess(w, r, &resp, acc, login, nil, "Get group network session counter")
 }

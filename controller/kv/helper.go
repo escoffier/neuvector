@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -17,12 +18,16 @@ import (
 	"github.com/neuvector/neuvector/controller/access"
 	"github.com/neuvector/neuvector/controller/api"
 	"github.com/neuvector/neuvector/controller/common"
-	"github.com/neuvector/neuvector/controller/nvk8sapi/nvvalidatewebhookcfg"
+	admission "github.com/neuvector/neuvector/controller/nvk8sapi/nvvalidatewebhookcfg"
 	"github.com/neuvector/neuvector/controller/resource"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/cluster"
 	"github.com/neuvector/neuvector/share/container"
 	"github.com/neuvector/neuvector/share/utils"
+)
+
+const (
+	InstallationCacheTTL = time.Minute * 30
 )
 
 type MockKvConfigUpdateFunc func(nType cluster.ClusterNotifyType, key string, value []byte)
@@ -33,11 +38,10 @@ type ClusterHelper interface {
 	AcquireLock(key string, wait time.Duration) (cluster.LockInterface, error)
 	ReleaseLock(cluster.LockInterface) error
 
-	UpgradeClusterKV()
+	UpgradeClusterKV(version string) (verUpdated bool)
 	UpgradeClusterImport(ver *share.CLUSCtrlVersion)
 	FixMissingClusterKV()
 
-	PutInstallationID() (string, error)
 	GetInstallationID() (string, error)
 
 	GetAllControllers() []*share.CLUSController
@@ -54,7 +58,7 @@ type ClusterHelper interface {
 	PutFedSystemConfigRev(conf *share.CLUSSystemConfig, rev uint64) error
 
 	GetDomain(name string, acc *access.AccessControl) (*share.CLUSDomain, uint64, error)
-	PutDomain(cd *share.CLUSDomain, rev uint64) error
+	PutDomain(cd *share.CLUSDomain, rev *uint64) error
 	PutDomainIfNotExist(cd *share.CLUSDomain) error
 	DeleteDomain(name string) error
 
@@ -79,6 +83,7 @@ type ClusterHelper interface {
 	DeletePolicyRule(id uint32) error
 	DeletePolicyRuleTxn(txn *cluster.ClusterTransact, id uint32) error
 	PutPolicyVer(s *share.CLUSGroupIPPolicyVer) error
+	PutPolicyVerNode(s *share.CLUSGroupIPPolicyVer) error
 	PutDlpVer(s *share.CLUSDlpRuleVer) error
 
 	GetResponseRuleList(policyName string) []*share.CLUSRuleHead
@@ -114,7 +119,6 @@ type ClusterHelper interface {
 	PutProcessProfile(group string, pg *share.CLUSProcessProfile) error
 	PutProcessProfileTxn(txn *cluster.ClusterTransact, group string, pg *share.CLUSProcessProfile) error
 	PutProcessProfileIfNotExist(group string, pg *share.CLUSProcessProfile) error
-	DeleteProcessProfile(group string) error
 	DeleteProcessProfileTxn(txn *cluster.ClusterTransact, group string) error
 	GetAllProcessProfileSubKeys(scope string) utils.Set
 
@@ -132,12 +136,12 @@ type ClusterHelper interface {
 
 	GetAllComplianceProfiles(acc *access.AccessControl) []*share.CLUSComplianceProfile
 	GetComplianceProfile(name string, acc *access.AccessControl) (*share.CLUSComplianceProfile, uint64, error)
-	PutComplianceProfile(cp *share.CLUSComplianceProfile, rev uint64) error
+	PutComplianceProfile(cp *share.CLUSComplianceProfile, rev *uint64) error
 	PutComplianceProfileIfNotExist(cp *share.CLUSComplianceProfile) error
 
 	GetAllVulnerabilityProfiles(acc *access.AccessControl) []*share.CLUSVulnerabilityProfile
 	GetVulnerabilityProfile(name string, acc *access.AccessControl) (*share.CLUSVulnerabilityProfile, uint64, error)
-	PutVulnerabilityProfile(cp *share.CLUSVulnerabilityProfile, rev uint64) error
+	PutVulnerabilityProfile(cp *share.CLUSVulnerabilityProfile, rev *uint64) error
 	PutVulnerabilityProfileIfNotExist(cp *share.CLUSVulnerabilityProfile) error
 
 	GetRegistry(name string, acc *access.AccessControl) (*share.CLUSRegistryConfig, uint64, error)
@@ -162,12 +166,12 @@ type ClusterHelper interface {
 	PutFileMonitorProfile(name string, conf *share.CLUSFileMonitorProfile, rev uint64) error
 	PutFileMonitorProfileIfNotExist(name string, conf *share.CLUSFileMonitorProfile) error
 	PutFileMonitorProfileTxn(txn *cluster.ClusterTransact, name string, conf *share.CLUSFileMonitorProfile) error
-	DeleteFileMonitor(name string) error
 	DeleteFileMonitorTxn(txn *cluster.ClusterTransact, name string) error
 
 	GetAdmissionCertRev(svcName string) (*share.CLUSAdmissionCertCloaked, uint64) // obsolete
 	GetObjectCertRev(cn string) (*share.CLUSX509Cert, uint64, error)
 	PutObjectCert(cn, keyPath, certPath string, cert *share.CLUSX509Cert) error
+	PutObjectCertMemory(cn string, in *share.CLUSX509Cert, out *share.CLUSX509Cert, index uint64) error
 	GetAdmissionStateRev(svcName string) (*share.CLUSAdmissionState, uint64)
 	PutAdmissionRule(admType, ruleType string, rule *share.CLUSAdmissionRule) error
 	PutAdmissionStateRev(svcName string, state *share.CLUSAdmissionState, rev uint64) error
@@ -190,7 +194,7 @@ type ClusterHelper interface {
 	DeleteFileAccessRuleTxn(txn *cluster.ClusterTransact, name string) error
 	GetAllFileAccessRuleSubKeys(scope string) utils.Set
 	GetCrdSecurityRuleRecord(crdKind, crdName string) *share.CLUSCrdSecurityRule
-	PutCrdSecurityRuleRecord(crdKind, crdName string, rules *share.CLUSCrdSecurityRule) error
+	PutCrdSecurityRuleRecord(crdKind, crdName string, rule *share.CLUSCrdSecurityRule) error
 	DeleteCrdSecurityRuleRecord(crdKind, crdName string) error
 	GetCrdSecurityRuleRecordList(crdKind string) map[string]*share.CLUSCrdSecurityRule
 
@@ -221,7 +225,7 @@ type ClusterHelper interface {
 	GetDlpGroup(group string) *share.CLUSDlpGroup
 	PutDlpGroup(group *share.CLUSDlpGroup, create bool) error
 	PutDlpGroupTxn(txn *cluster.ClusterTransact, group *share.CLUSDlpGroup) error
-	DeleteDlpGroup(group string) error
+	DeleteDlpGroup(txn *cluster.ClusterTransact, group string) error
 
 	GetWafSensor(name string) *share.CLUSWafSensor
 	GetAllWafSensors() []*share.CLUSWafSensor
@@ -232,18 +236,19 @@ type ClusterHelper interface {
 	GetWafGroup(group string) *share.CLUSWafGroup
 	PutWafGroup(group *share.CLUSWafGroup, create bool) error
 	PutWafGroupTxn(txn *cluster.ClusterTransact, group *share.CLUSWafGroup) error
-	DeleteWafGroup(group string) error
+	DeleteWafGroup(txn *cluster.ClusterTransact, group string) error
 
 	GetCustomCheckConfig(name string) (*share.CLUSCustomCheckGroup, uint64)
 	GetAllCustomCheckConfig() map[string]*share.CLUSCustomCheckGroup
 	PutCustomCheckConfig(name string, conf *share.CLUSCustomCheckGroup, rev uint64) error
-	DeleteCustomCheckConfig(name string) error
+	DeleteCustomCheckConfig(txn *cluster.ClusterTransact, name string) error
 
-	GetCrdRecord(string) *share.CLUSCrdRecord
-	PutCrdRecord(*share.CLUSCrdRecord, string) error
+	GetCrdRecord(name string) *share.CLUSCrdRecord
+	PutCrdRecord(record *share.CLUSCrdRecord, name string) error
 	DeleteCrdRecord(string) error
 	GetCrdEventQueue() *share.CLUSCrdEventRecord
-	PutCrdEventQueue(*share.CLUSCrdEventRecord) error
+	PutCrdEventQueue(record *share.CLUSCrdEventRecord) error
+	GetCrdEventQueueCount() int
 
 	GetAwsCloudResource(projectName string) (*share.CLUSAwsResource, error)
 	PutAwsCloudResource(project *share.CLUSAwsResource) error
@@ -279,9 +284,31 @@ type ClusterHelper interface {
 	GetImportTask() (share.CLUSImportTask, error)
 	PutImportTask(importTask *share.CLUSImportTask) error
 
+	// sigstore verification
+	CreateSigstoreRootOfTrust(rootOfTrust *share.CLUSSigstoreRootOfTrust, txn *cluster.ClusterTransact) error
+	UpdateSigstoreRootOfTrust(rootOfTrust *share.CLUSSigstoreRootOfTrust, txn *cluster.ClusterTransact, rev *uint64) error
+	GetSigstoreRootOfTrust(rootName string) (*share.CLUSSigstoreRootOfTrust, *uint64, error)
+	DeleteSigstoreRootOfTrust(rootName string) error
+	GetAllSigstoreRootsOfTrust() (rootOfTrust []*share.CLUSSigstoreRootOfTrust, err error)
+	CreateSigstoreVerifier(rootName string, verifier *share.CLUSSigstoreVerifier, txn *cluster.ClusterTransact) error
+	UpdateSigstoreVerifier(rootName string, verifier *share.CLUSSigstoreVerifier, txn *cluster.ClusterTransact, rev *uint64) error
+	GetSigstoreVerifier(rootName string, verifierName string) (*share.CLUSSigstoreVerifier, *uint64, error)
+	DeleteSigstoreVerifier(rootName string, verifierName string) error
+	GetAllSigstoreVerifiersForRoot(rootName string) ([]*share.CLUSSigstoreVerifier, error)
+	PutSigstoreTimestamp(txn *cluster.ClusterTransact, rev *uint64) error
+	GetSigstoreTimestamp() (string, *uint64, error)
+	CreateQuerySessionRequest(qsr *api.QuerySessionRequest) error
+	DeleteQuerySessionRequest(queryToken string)
+
 	// mock for unittest
 	SetCacheMockCallback(keyStore string, mockFunc MockKvConfigUpdateFunc)
 }
+
+var (
+	installationID           string
+	installationIDLastUpdate time.Time
+	installationIDLock       sync.RWMutex
+)
 
 type clusterHelper struct {
 	id      string
@@ -406,7 +433,7 @@ func (m clusterHelper) get(key string) ([]byte, uint64, error) {
 	}
 }
 
-func (m clusterHelper) putSizeAware(key string, value []byte) error {
+func (m clusterHelper) putSizeAware(txn *cluster.ClusterTransact, key string, value []byte) error {
 	if len(value) >= cluster.KVValueSizeMax { // 512 * 1024
 		zb := utils.GzipBytes(value)
 		if len(zb) >= cluster.KVValueSizeMax { // 512 * 1024
@@ -414,71 +441,126 @@ func (m clusterHelper) putSizeAware(key string, value []byte) error {
 			log.WithFields(log.Fields{"key": key}).Error(err)
 			return err
 		}
-		return cluster.PutBinary(key, zb)
+		if txn != nil {
+			txn.PutBinary(key, zb)
+			return nil
+		} else {
+			return cluster.PutBinary(key, zb)
+		}
 	} else {
-		return cluster.Put(key, value)
+		if txn != nil {
+			txn.Put(key, value)
+			return nil
+		} else {
+			return cluster.Put(key, value)
+		}
 	}
 }
 
 /*
-func (m clusterHelper) putSizeAwareRev(key string, value []byte, rev uint64) error {
-	if len(value) >= cluster.KVValueSizeMax { // 512 * 1024
-		zb := utils.GzipBytes(value)
-		if len(zb) >= cluster.KVValueSizeMax { // 512 * 1024
-			err := fmt.Errorf("zip data(%d) too big", len(zb))
-			log.WithFields(log.Fields{"key": key}).Error(err)
-			return err
+	func (m clusterHelper) putSizeAwareRev(key string, value []byte, rev uint64) error {
+		if len(value) >= cluster.KVValueSizeMax { // 512 * 1024
+			zb := utils.GzipBytes(value)
+			if len(zb) >= cluster.KVValueSizeMax { // 512 * 1024
+				err := fmt.Errorf("zip data(%d) too big", len(zb))
+				log.WithFields(log.Fields{"key": key}).Error(err)
+				return err
+			}
+			return cluster.PutBinaryRev(key, zb, rev)
+		} else {
+			return cluster.PutRev(key, value, rev)
 		}
-		return cluster.PutBinaryRev(key, zb, rev)
-	} else {
-		return cluster.PutRev(key, value, rev)
 	}
-}
 
 // do not consider UpgradeAndConvert yet. if need to do UpgradeAndConvert, value size needs to be considered in UpgradeAndConvert()
-func (m clusterHelper) getGzipAware(key string) ([]byte, uint64, error) {
-	value, rev, err := cluster.GetRev(key)
-	if err != nil || value == nil {
-		return nil, rev, err
-	} else {
-		// [31, 139] is the first 2 bytes of gzip-format data
-		if len(value) >= 2 && value[0] == 31 && value[1] == 139 {
-			value = utils.GunzipBytes(value)
-			if value == nil {
-				err = fmt.Errorf("Failed to unzip data")
+
+	func (m clusterHelper) getGzipAware(key string) ([]byte, uint64, error) {
+		value, rev, err := cluster.GetRev(key)
+		if err != nil || value == nil {
+			return nil, rev, err
+		} else {
+			// [31, 139] is the first 2 bytes of gzip-format data
+			if len(value) >= 2 && value[0] == 31 && value[1] == 139 {
+				value = utils.GunzipBytes(value)
+				if value == nil {
+					err = fmt.Errorf("Failed to unzip data")
+				}
 			}
+			return value, rev, err
 		}
-		return value, rev, err
 	}
+*/
+
+// This function tries to get installation ID from consul in a concurrency safe way.
+//  1. Try to get installation ID.
+//     a. If it exists, someone has set it up.  Just return the ID.
+//     b. If not, we have to create one.
+//  2. Generate installation and save it to consul using PutRev.
+//  3. If we receive CASError, that means conflict happens.  Retry so we get the consistent result.
+//
+// TODO: We can wrap those code, so certmanager.checkAndRotateCert() and this function can share most of codes.
+func (m clusterHelper) GetOrCreateInstallationID() (string, error) {
+	var id string
+	if err := RetryOnCASError(DefaultRetryNumber, func() error {
+		var index uint64
+		var value []byte
+		var err error
+
+		key := share.CLUSCtrlInstallationKey
+		value, index, err = m.get(key)
+		if err != nil && err != cluster.ErrKeyNotFound {
+			return err
+		}
+		id = string(value)
+		if id != "" {
+			// Already have an installation ID stored in "id". Do nothing
+			return nil
+		}
+
+		// Now installation id is either absent or invalid.  We need to generate a new ID.
+
+		id, err = utils.GetGuid()
+		if err != nil {
+			return err
+		}
+
+		if err = cluster.PutRev(key, []byte(id), index); err != nil {
+			// Return the error. CASError will be automatically retried.
+			return err
+		}
+		return nil
+	}); err != nil {
+		return "", err
+	}
+
+	return id, nil
 }
 
-*/
-func (m clusterHelper) PutInstallationID() (string, error) {
-	if id, _ := m.GetInstallationID(); id != "" {
-		return id, nil
+// Installation ID will be cached for the given TTL.
+// This is to correct data inconsistency that could happen during fresh install.
+func (m *clusterHelper) GetInstallationID() (string, error) {
+	// Get from cache if it exists and does not expire.
+	installationIDLock.RLock()
+	if installationID != "" && time.Now().Before(installationIDLastUpdate.Add(InstallationCacheTTL)) {
+		installationIDLock.RUnlock()
+		return installationID, nil
 	}
+	installationIDLock.RUnlock()
 
-	id, err := utils.GetGuid()
+	installationIDLock.Lock()
+	defer installationIDLock.Unlock()
+
+	// Otherwise try to get/create one.
+	id, err := m.GetOrCreateInstallationID()
 	if err != nil {
 		return "", err
 	}
-
-	key := share.CLUSCtrlInstallationKey
-	if err = cluster.Put(key, []byte(id)); err != nil {
-		return "", err
-	} else {
-		return id, nil
+	if installationID != id {
+		log.WithFields(log.Fields{"id": id}).Info("installation ID is updated")
+		installationID = id
 	}
-}
-
-func (m clusterHelper) GetInstallationID() (string, error) {
-	key := share.CLUSCtrlInstallationKey
-	value, _, err := m.get(key)
-	if value != nil {
-		return string(value[:]), nil
-	} else {
-		return "", err
-	}
+	installationIDLastUpdate = time.Now()
+	return id, err
 }
 
 func (m clusterHelper) GetAllEnforcers() []*share.CLUSAgent {
@@ -632,10 +714,14 @@ func (m clusterHelper) PutDomainIfNotExist(domain *share.CLUSDomain) error {
 	return cluster.PutIfNotExist(key, value, true)
 }
 
-func (m clusterHelper) PutDomain(domain *share.CLUSDomain, rev uint64) error {
+func (m clusterHelper) PutDomain(domain *share.CLUSDomain, rev *uint64) error {
 	key := share.CLUSDomainKey(domain.Name)
 	value, _ := enc.Marshal(domain)
-	return cluster.PutRev(key, value, rev)
+	if rev == nil {
+		return cluster.Put(key, value)
+	} else {
+		return cluster.PutRev(key, value, *rev)
+	}
 }
 
 func (m clusterHelper) DeleteDomain(name string) error {
@@ -880,11 +966,18 @@ func (m clusterHelper) PutPolicyVer(s *share.CLUSGroupIPPolicyVer) error {
 	return cluster.Put(key, value)
 }
 
+func (m clusterHelper) PutPolicyVerNode(s *share.CLUSGroupIPPolicyVer) error {
+	key := share.CLUSPolicyIPRulesKeyNode(s.Key, s.NodeId)
+	value, _ := enc.Marshal(s)
+	return cluster.Put(key, value)
+}
+
 func (m clusterHelper) PutDlpVer(s *share.CLUSDlpRuleVer) error {
 	key := share.CLUSDlpWorkloadRulesKey(s.Key)
 	value, _ := enc.Marshal(s)
 	return cluster.Put(key, value)
 }
+
 // event policy
 
 func (m clusterHelper) GetResponseRuleList(policyName string) []*share.CLUSRuleHead {
@@ -1129,15 +1222,17 @@ func (m clusterHelper) PutProcessProfileIfNotExist(group string, pg *share.CLUSP
 	return cluster.PutIfNotExist(key, value, true)
 }
 
-func (m clusterHelper) DeleteProcessProfile(group string) error {
-	cluster.Delete(share.CLUSProfileConfigKey(group))
-	return cluster.Delete(share.CLUSProfileKey(group))
-}
-
 func (m clusterHelper) DeleteProcessProfileTxn(txn *cluster.ClusterTransact, group string) error {
-	txn.Delete(share.CLUSProfileConfigKey(group))
-	txn.Delete(share.CLUSProfileKey(group))
-	return nil
+	key1 := share.CLUSProfileConfigKey(group)
+	key2 := share.CLUSProfileKey(group)
+	if txn == nil {
+		cluster.Delete(key1)
+		return cluster.Delete(key2)
+	} else {
+		txn.Delete(key1)
+		txn.Delete(key2)
+		return nil
+	}
 }
 
 func (m clusterHelper) GetAllProcessProfileSubKeys(scope string) utils.Set {
@@ -1328,10 +1423,14 @@ func (m clusterHelper) GetComplianceProfile(name string, acc *access.AccessContr
 	return nil, 0, common.ErrObjectNotFound
 }
 
-func (m clusterHelper) PutComplianceProfile(cp *share.CLUSComplianceProfile, rev uint64) error {
+func (m clusterHelper) PutComplianceProfile(cp *share.CLUSComplianceProfile, rev *uint64) error {
 	key := share.CLUSComplianceProfileKey(cp.Name)
 	value, _ := json.Marshal(cp)
-	return cluster.PutRev(key, value, rev)
+	if rev == nil {
+		return cluster.Put(key, value)
+	} else {
+		return cluster.PutRev(key, value, *rev)
+	}
 }
 
 func (m clusterHelper) PutComplianceProfileIfNotExist(cp *share.CLUSComplianceProfile) error {
@@ -1377,10 +1476,14 @@ func (m clusterHelper) GetVulnerabilityProfile(name string, acc *access.AccessCo
 	return nil, 0, common.ErrObjectNotFound
 }
 
-func (m clusterHelper) PutVulnerabilityProfile(cp *share.CLUSVulnerabilityProfile, rev uint64) error {
+func (m clusterHelper) PutVulnerabilityProfile(cp *share.CLUSVulnerabilityProfile, rev *uint64) error {
 	key := share.CLUSVulnerabilityProfileKey(cp.Name)
 	value, _ := json.Marshal(cp)
-	return cluster.PutRev(key, value, rev)
+	if rev == nil {
+		return cluster.Put(key, value)
+	} else {
+		return cluster.PutRev(key, value, *rev)
+	}
 }
 
 func (m clusterHelper) PutVulnerabilityProfileIfNotExist(cp *share.CLUSVulnerabilityProfile) error {
@@ -1774,15 +1877,17 @@ func (m clusterHelper) PutFileMonitorProfileTxn(txn *cluster.ClusterTransact, na
 	return nil
 }
 
-func (m clusterHelper) DeleteFileMonitor(name string) error {
-	cluster.Delete(share.CLUSFileMonitorKey(name))
-	return cluster.Delete(share.CLUSFileMonitorNetworkKey(name))
-}
-
 func (m clusterHelper) DeleteFileMonitorTxn(txn *cluster.ClusterTransact, name string) error {
-	txn.Delete(share.CLUSFileMonitorKey(name))
-	txn.Delete(share.CLUSFileMonitorNetworkKey(name))
-	return nil
+	key1 := share.CLUSFileMonitorKey(name)
+	key2 := share.CLUSFileMonitorNetworkKey(name)
+	if txn == nil {
+		cluster.Delete(key1)
+		return cluster.Delete(key2)
+	} else {
+		txn.Delete(key1)
+		txn.Delete(key2)
+		return nil
+	}
 }
 
 func (m clusterHelper) GetFileAccessRule(name string) (*share.CLUSFileAccessRule, uint64) {
@@ -1918,6 +2023,27 @@ func (m clusterHelper) PutObjectCert(cn, keyPath, certPath string, cert *share.C
 	}
 
 	return err
+}
+
+// Store the key/cert into kv and return the result.
+// This function, unlike PutObjectCert(), doesn't overwrite the existing cert file.
+// If index == 0, it will not overwrite the data. (PutIfNotExist)
+func (m clusterHelper) PutObjectCertMemory(cn string, in *share.CLUSX509Cert, out *share.CLUSX509Cert, index uint64) error {
+	key := share.CLUSObjectCertKey(cn)
+	value, _ := enc.Marshal(in)
+	err := cluster.PutRev(key, value, index)
+	if err != nil {
+		return err
+	}
+
+	if certExisting, _, err := clusHelper.GetObjectCertRev(cn); !certExisting.IsEmpty() {
+		if out != nil {
+			*out = *certExisting
+		}
+		return nil
+	} else {
+		return fmt.Errorf("cert is not there after PutIfNotExist: %w", err)
+	}
 }
 
 func (m clusterHelper) GetAdmissionStateRev(svcName string) (*share.CLUSAdmissionState, uint64) {
@@ -2074,7 +2200,7 @@ func (m clusterHelper) DeleteAdmissionRuleTxn(txn *cluster.ClusterTransact, admT
 	return nil
 }
 
-//------
+// ------
 func (m clusterHelper) GetCrdSecurityRuleRecord(crdKind, crdName string) *share.CLUSCrdSecurityRule {
 	key := share.CLUSCrdKey(crdKind, crdName)
 	if value, _, _ := m.get(key); len(value) > 0 {
@@ -2085,10 +2211,11 @@ func (m clusterHelper) GetCrdSecurityRuleRecord(crdKind, crdName string) *share.
 	return nil
 }
 
-func (m clusterHelper) PutCrdSecurityRuleRecord(crdKind, crdName string, rules *share.CLUSCrdSecurityRule) error {
+func (m clusterHelper) PutCrdSecurityRuleRecord(crdKind, crdName string, rule *share.CLUSCrdSecurityRule) error {
 	key := share.CLUSCrdKey(crdKind, crdName)
-	value, _ := json.Marshal(rules)
-	return m.putSizeAware(key, value)
+	rule.UpdatedAt = time.Now().UTC()
+	value, _ := json.Marshal(rule)
+	return m.putSizeAware(nil, key, value)
 }
 
 func (m clusterHelper) DeleteCrdSecurityRuleRecord(crdKind, crdName string) error {
@@ -2098,18 +2225,19 @@ func (m clusterHelper) DeleteCrdSecurityRuleRecord(crdKind, crdName string) erro
 
 func (m clusterHelper) GetCrdSecurityRuleRecordList(crdKind string) map[string]*share.CLUSCrdSecurityRule {
 	records := make(map[string]*share.CLUSCrdSecurityRule, 0)
-	store := share.CLUSConfigCrdStore
-	keys, _ := cluster.GetStoreKeys(store)
-	for _, key := range keys {
-		id := share.CLUSKeyNthToken(key, 3)
-		if id == crdKind {
-			if value, _, _ := m.get(key); value != nil {
+	key := fmt.Sprintf("%s%s/", share.CLUSConfigCrdStore, crdKind)
+	if kvPairs, err := cluster.List(key); err == nil {
+		records = make(map[string]*share.CLUSCrdSecurityRule, len(kvPairs))
+		for _, kv := range kvPairs {
+			if kv != nil {
+				// kv.ModifyIndex is the rev returned from cluster.GetRev()
 				var secRule share.CLUSCrdSecurityRule
-				json.Unmarshal(value, &secRule)
+				json.Unmarshal(kv.Value, &secRule)
 				records[secRule.Name] = &secRule
 			}
 		}
 	}
+
 	return records
 }
 
@@ -2424,9 +2552,14 @@ func (m clusterHelper) PutDlpGroupTxn(txn *cluster.ClusterTransact, group *share
 	return nil
 }
 
-func (m clusterHelper) DeleteDlpGroup(group string) error {
+func (m clusterHelper) DeleteDlpGroup(txn *cluster.ClusterTransact, group string) error {
 	key := share.CLUSDlpGroupConfigKey(group)
-	return cluster.Delete(key)
+	if txn == nil {
+		return cluster.Delete(key)
+	} else {
+		txn.Delete(key)
+		return nil
+	}
 }
 
 // waf sensor
@@ -2509,9 +2642,14 @@ func (m clusterHelper) PutWafGroupTxn(txn *cluster.ClusterTransact, group *share
 	return nil
 }
 
-func (m clusterHelper) DeleteWafGroup(group string) error {
+func (m clusterHelper) DeleteWafGroup(txn *cluster.ClusterTransact, group string) error {
 	key := share.CLUSWafGroupConfigKey(group)
-	return cluster.Delete(key)
+	if txn == nil {
+		return cluster.Delete(key)
+	} else {
+		txn.Delete(key)
+		return nil
+	}
 }
 
 func (m clusterHelper) GetCustomCheckConfig(group string) (*share.CLUSCustomCheckGroup, uint64) {
@@ -2547,9 +2685,17 @@ func (m clusterHelper) PutCustomCheckConfig(group string, conf *share.CLUSCustom
 	return cluster.Put(key, value)
 }
 
-func (m clusterHelper) DeleteCustomCheckConfig(group string) error {
-	cluster.Delete(share.CLUSCustomCheckConfigKey(group))
-	return cluster.Delete(share.CLUSCustomCheckNetworkKey(group))
+func (m clusterHelper) DeleteCustomCheckConfig(txn *cluster.ClusterTransact, group string) error {
+	key1 := share.CLUSCustomCheckConfigKey(group)
+	key2 := share.CLUSCustomCheckNetworkKey(group)
+	if txn == nil {
+		cluster.Delete(key1)
+		return cluster.Delete(key2)
+	} else {
+		txn.Delete(key1)
+		txn.Delete(key2)
+		return nil
+	}
 }
 
 func (m clusterHelper) GetCrdRecord(name string) *share.CLUSCrdRecord {
@@ -2565,7 +2711,7 @@ func (m clusterHelper) GetCrdRecord(name string) *share.CLUSCrdRecord {
 func (m clusterHelper) PutCrdRecord(record *share.CLUSCrdRecord, name string) error {
 	key := share.CLUSCrdQueueKey(name)
 	value, _ := json.Marshal(record)
-	return m.putSizeAware(key, value)
+	return m.putSizeAware(nil, key, value)
 }
 
 func (m clusterHelper) DeleteCrdRecord(name string) error {
@@ -2574,9 +2720,9 @@ func (m clusterHelper) DeleteCrdRecord(name string) error {
 }
 
 func (m clusterHelper) GetCrdEventQueue() *share.CLUSCrdEventRecord {
-	var records share.CLUSCrdEventRecord
 	key := share.CLUSCrdProcStore
 	if value, _, _ := m.get(key); value != nil {
+		var records share.CLUSCrdEventRecord
 		json.Unmarshal(value, &records)
 		return &records
 	}
@@ -2584,9 +2730,34 @@ func (m clusterHelper) GetCrdEventQueue() *share.CLUSCrdEventRecord {
 }
 
 func (m clusterHelper) PutCrdEventQueue(record *share.CLUSCrdEventRecord) error {
+	txn := cluster.Transact()
+
 	key := share.CLUSCrdProcStore
 	value, _ := json.Marshal(record)
-	return m.putSizeAware(key, value)
+	if err := m.putSizeAware(txn, key, value); err != nil {
+		txn.Close()
+		return err
+	}
+
+	queueInfo := share.CLUSCrdEventQueueInfo{Count: len(record.CrdEventRecord)}
+	key = share.CLUSCrdContentCountKey()
+	value, _ = json.Marshal(&queueInfo)
+	txn.Put(key, value)
+
+	_, err := txn.Apply()
+	txn.Close()
+
+	return err
+}
+
+func (m clusterHelper) GetCrdEventQueueCount() int {
+	key := share.CLUSCrdContentCountKey()
+	if value, _ := cluster.Get(key); value != nil {
+		var queueInfo share.CLUSCrdEventQueueInfo
+		json.Unmarshal(value, &queueInfo)
+		return queueInfo.Count
+	}
+	return 0
 }
 
 func (m clusterHelper) DeleteAwsProjectCfg(projectName string) error {
@@ -2872,40 +3043,313 @@ func (m clusterHelper) PutImportTask(importTask *share.CLUSImportTask) error {
 }
 
 func (m clusterHelper) GetApikeyRev(name string, acc *access.AccessControl) (*share.CLUSApikey, uint64, error) {
-    key := share.CLUSApikeyKey(url.QueryEscape(name))
-    if value, rev, _ := m.get(key); value != nil {
-        var apikey share.CLUSApikey
-        json.Unmarshal(value, &apikey)
-        if !acc.Authorize(&apikey, nil) {    
-            return nil, 0, common.ErrObjectAccessDenied
-        }
-        return &apikey, rev, nil
-    }
-    return nil, 0, common.ErrObjectNotFound
+	key := share.CLUSApikeyKey(url.QueryEscape(name))
+	if value, rev, _ := m.get(key); value != nil {
+		var apikey share.CLUSApikey
+		json.Unmarshal(value, &apikey)
+		if !acc.Authorize(&apikey, nil) {
+			return nil, 0, common.ErrObjectAccessDenied
+		}
+		return &apikey, rev, nil
+	}
+	return nil, 0, common.ErrObjectNotFound
 }
 
 func (m clusterHelper) CreateApikey(apikey *share.CLUSApikey) error {
-    key := share.CLUSApikeyKey(url.QueryEscape(apikey.Name))
-    value, _ := json.Marshal(apikey)
-    // secret_key is already hashed
-    return cluster.PutIfNotExist(key, value, false)
+	key := share.CLUSApikeyKey(url.QueryEscape(apikey.Name))
+	value, _ := json.Marshal(apikey)
+	// secret_key is already hashed
+	return cluster.PutIfNotExist(key, value, false)
 }
 
 // caller needs to decide whether to authorize accessing each returned apikey object
 func (m clusterHelper) GetAllApikeysNoAuth() map[string]*share.CLUSApikey {
-    apikeys := make(map[string]*share.CLUSApikey)
-    keys, _ := cluster.GetStoreKeys(share.CLUSConfigApikeyStore)
-    for _, key := range keys {
-        if value, _, _ := m.get(key); value != nil {
-            var apikey share.CLUSApikey
-            json.Unmarshal(value, &apikey)
-            apikeys[apikey.Name] = &apikey
-        }
-    }
-    return apikeys
+	apikeys := make(map[string]*share.CLUSApikey)
+	keys, _ := cluster.GetStoreKeys(share.CLUSConfigApikeyStore)
+	for _, key := range keys {
+		if value, _, _ := m.get(key); value != nil {
+			var apikey share.CLUSApikey
+			json.Unmarshal(value, &apikey)
+			apikeys[apikey.Name] = &apikey
+		}
+	}
+	return apikeys
 }
 
 func (m clusterHelper) DeleteApikey(name string) error {
 	key := share.CLUSApikeyKey(url.QueryEscape(name))
 	return cluster.Delete(key)
+}
+
+// sigstore
+func (m clusterHelper) CreateSigstoreRootOfTrust(rootOfTrust *share.CLUSSigstoreRootOfTrust, txn *cluster.ClusterTransact) error {
+	rootKey := share.CLUSSigstoreRootOfTrustKey(rootOfTrust.Name)
+
+	if cluster.Exist(rootKey) {
+		return common.ErrObjectExists
+	}
+
+	value, err := json.Marshal(rootOfTrust)
+	if err != nil {
+		return err
+	}
+
+	if txn != nil {
+		txn.Put(rootKey, value)
+	} else {
+		cluster.Put(rootKey, value)
+	}
+
+	return nil
+}
+
+func (m clusterHelper) UpdateSigstoreRootOfTrust(rootOfTrust *share.CLUSSigstoreRootOfTrust, txn *cluster.ClusterTransact, rev *uint64) error {
+	rootKey := share.CLUSSigstoreRootOfTrustKey(rootOfTrust.Name)
+
+	if !cluster.Exist(rootKey) {
+		return common.ErrObjectNotFound
+	}
+
+	value, err := json.Marshal(rootOfTrust)
+	if err != nil {
+		return err
+	}
+
+	if txn != nil {
+		if rev != nil {
+			txn.PutRev(rootKey, value, *rev)
+		} else {
+			txn.Put(rootKey, value)
+		}
+	} else {
+		if rev != nil {
+			cluster.PutRev(rootKey, value, *rev)
+		} else {
+			cluster.Put(rootKey, value)
+		}
+	}
+
+	return nil
+}
+
+func (m clusterHelper) GetSigstoreRootOfTrust(rootName string) (*share.CLUSSigstoreRootOfTrust, *uint64, error) {
+	rootKey := share.CLUSSigstoreRootOfTrustKey(rootName)
+
+	if !cluster.Exist(rootKey) {
+		return nil, nil, common.ErrObjectNotFound
+	}
+
+	rootOfTrustData, rev, err := m.get(rootKey)
+	if err != nil || rootOfTrustData == nil {
+		return nil, nil, err
+	}
+
+	rootOfTrust := &share.CLUSSigstoreRootOfTrust{}
+	err = json.Unmarshal(rootOfTrustData, rootOfTrust)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return rootOfTrust, &rev, nil
+}
+
+func (m clusterHelper) DeleteSigstoreRootOfTrust(rootName string) error {
+	rootKey := share.CLUSSigstoreRootOfTrustKey(rootName)
+
+	if !cluster.Exist(rootKey) {
+		return common.ErrObjectNotFound
+	}
+
+	return cluster.DeleteTree(rootKey)
+}
+
+func (m clusterHelper) GetAllSigstoreRootsOfTrust() (rootOfTrust []*share.CLUSSigstoreRootOfTrust, err error) {
+	keys, err := cluster.GetStoreKeys(share.CLUSConfigSigstoreRootsOfTrust)
+	if err != nil && err.Error() != "Empty store" {
+		return nil, err
+	}
+	rootsOfTrust := []*share.CLUSSigstoreRootOfTrust{}
+	for _, key := range keys {
+		if ss := strings.Split(key, "/"); len(ss) != 4 {
+			continue
+		}
+		if value, _, err := m.get(key); value != nil {
+			if err != nil {
+				return nil, fmt.Errorf("could not retrieve all roots of trust, error retrieving \"%s\": %s", key, err.Error())
+			}
+			rootOfTrust := &share.CLUSSigstoreRootOfTrust{}
+			err = json.Unmarshal(value, rootOfTrust)
+			if err != nil {
+				return nil, err
+			}
+			rootsOfTrust = append(rootsOfTrust, rootOfTrust)
+		}
+	}
+	return rootsOfTrust, nil
+}
+
+func (m clusterHelper) CreateSigstoreVerifier(rootName string, verifier *share.CLUSSigstoreVerifier, txn *cluster.ClusterTransact) error {
+	rootKey := share.CLUSSigstoreRootOfTrustKey(rootName)
+	verifierKey := share.CLUSSigstoreVerifierKey(rootName, verifier.Name)
+
+	if !cluster.Exist(rootKey) {
+		return common.ErrObjectNotFound
+	}
+
+	if cluster.Exist(verifierKey) {
+		return common.ErrObjectNotFound
+	}
+
+	value, err := json.Marshal(verifier)
+	if err != nil {
+		return err
+	}
+
+	if txn != nil {
+		txn.Put(verifierKey, value)
+	} else {
+		cluster.Put(verifierKey, value)
+	}
+
+	return nil
+}
+
+func (m clusterHelper) UpdateSigstoreVerifier(rootName string, verifier *share.CLUSSigstoreVerifier, txn *cluster.ClusterTransact, rev *uint64) error {
+	verifierKey := share.CLUSSigstoreVerifierKey(rootName, verifier.Name)
+
+	if !cluster.Exist(verifierKey) {
+		return common.ErrObjectNotFound
+	}
+
+	value, err := json.Marshal(verifier)
+	if err != nil {
+		return err
+	}
+
+	if txn != nil {
+		if rev != nil {
+			txn.PutRev(verifierKey, value, *rev)
+		} else {
+			txn.Put(verifierKey, value)
+		}
+	} else {
+		if rev != nil {
+			cluster.PutRev(verifierKey, value, *rev)
+		} else {
+			cluster.Put(verifierKey, value)
+		}
+	}
+
+	return nil
+}
+
+func (m clusterHelper) GetSigstoreVerifier(rootName string, verifierName string) (*share.CLUSSigstoreVerifier, *uint64, error) {
+	verifierKey := share.CLUSSigstoreVerifierKey(rootName, verifierName)
+
+	if !cluster.Exist(verifierKey) {
+		return nil, nil, common.ErrObjectNotFound
+	}
+
+	verifierData, rev, err := m.get(verifierKey)
+	if err != nil || verifierData == nil {
+		return nil, nil, err
+	}
+
+	verifier := &share.CLUSSigstoreVerifier{}
+	err = json.Unmarshal(verifierData, verifier)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return verifier, &rev, nil
+}
+
+func (m clusterHelper) DeleteSigstoreVerifier(rootName string, verifierName string) error {
+	verifierKey := share.CLUSSigstoreVerifierKey(rootName, verifierName)
+
+	if !cluster.Exist(verifierKey) {
+		return common.ErrObjectNotFound
+	}
+
+	return cluster.Delete(verifierKey)
+}
+
+func (m clusterHelper) GetAllSigstoreVerifiersForRoot(rootName string) ([]*share.CLUSSigstoreVerifier, error) {
+	if !cluster.Exist(share.CLUSSigstoreRootOfTrustKey(rootName)) {
+		return nil, fmt.Errorf("root \"%s\" does not exist", rootName)
+	}
+	keys, err := cluster.GetStoreKeys(share.CLUSSigstoreRootOfTrustKey(rootName) + "/")
+	if err != nil && err.Error() != "Empty store" {
+		return nil, err
+	}
+	verifiers := []*share.CLUSSigstoreVerifier{}
+	for _, key := range keys {
+		if ss := strings.Split(key, "/"); len(ss) != 5 {
+			continue
+		}
+		if value, _, err := m.get(key); value != nil {
+			if err != nil {
+				return nil, fmt.Errorf("could not retrieve all verifiers, error retrieving \"%s\": %s", key, err.Error())
+			}
+			verifier := &share.CLUSSigstoreVerifier{}
+			err = json.Unmarshal(value, verifier)
+			if err != nil {
+				return nil, err
+			}
+			verifiers = append(verifiers, verifier)
+		}
+	}
+	return verifiers, nil
+}
+
+func (m clusterHelper) PutSigstoreTimestamp(txn *cluster.ClusterTransact, rev *uint64) error {
+	timestampKey := share.CLUSSigstoreTimestampKey()
+	timestamp := time.Now().Unix()
+
+	value, err := json.Marshal(timestamp)
+	if err != nil {
+		return err
+	}
+
+	if txn != nil {
+		if rev != nil {
+			txn.PutRev(timestampKey, value, *rev)
+		} else {
+			txn.Put(timestampKey, value)
+		}
+	} else {
+		if rev != nil {
+			cluster.PutRev(timestampKey, value, *rev)
+		} else {
+			cluster.Put(timestampKey, value)
+		}
+	}
+
+	return nil
+}
+
+func (m clusterHelper) GetSigstoreTimestamp() (string, *uint64, error) {
+	timestampKey := share.CLUSSigstoreTimestampKey()
+
+	if !cluster.Exist(timestampKey) {
+		return "", nil, common.ErrObjectNotFound
+	}
+
+	configData, rev, err := m.get(timestampKey)
+	if err != nil || configData == nil {
+		return "", nil, err
+	}
+
+	return string(configData), &rev, nil
+}
+
+func (m clusterHelper) CreateQuerySessionRequest(qsr *api.QuerySessionRequest) error {
+	key := share.CLUSQuerySessionKey(qsr.QueryToken)
+	value, _ := json.Marshal(qsr)
+	return cluster.PutIfNotExist(key, value, false)
+}
+
+func (m clusterHelper) DeleteQuerySessionRequest(queryToken string) {
+	key := share.CLUSQuerySessionKey(queryToken)
+	cluster.Delete(key)
 }

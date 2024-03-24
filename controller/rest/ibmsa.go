@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+
 	//"math/rand"
 	"mime"
 	"net/http"
@@ -325,7 +326,7 @@ func handlerGetIBMSAEpSetupToken(w http.ResponseWriter, r *http.Request, ps http
 			PasswordHash: utils.HashPassword(secret),
 			Domain:       "",
 			Role:         api.UserRoleIBMSA,
-			Timeout:      common.DefaultIdleTimeout,
+			Timeout:      common.DefIdleTimeoutInternal,
 			RoleDomains:  make(map[string][]string),
 			Locale:       common.OEMDefaultUserLocale,
 			PwdResetTime: time.Now().UTC(),
@@ -340,7 +341,7 @@ func handlerGetIBMSAEpSetupToken(w http.ResponseWriter, r *http.Request, ps http
 		if i := strings.Index(remote, ":"); i > 0 {
 			remote = remote[:i]
 		}
-		if s, rc := loginUser(user, nil, remote, _interactiveSessionID, "", api.FedRoleNone); rc == userOK {
+		if s, rc := loginUser(user, nil, remote, _interactiveSessionID, "", api.FedRoleNone, nil); rc == userOK {
 			resp := api.RESTIBMSASetupToken{
 				AccessToken: s.token,
 			}

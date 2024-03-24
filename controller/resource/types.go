@@ -34,7 +34,9 @@ const (
 	RscTypeCrdAdmCtrlSecurityRule         = "nvadmissioncontrolsecurityrules"
 	RscTypeCrdDlpSecurityRule             = "nvdlpsecurityrules"
 	RscTypeCrdWafSecurityRule             = "nvwafsecurityrules"
-	RscTypeCrdNvCspUsage                  = "neuvectorusagerecords" // case sensitive
+	RscTypeCrdNvCspUsage                  = "cspadapterusagerecords" // case sensitive
+	RscTypeCrdVulnProfile                 = "nvvulnerabilityprofiles"
+	RscTypeCrdCompProfile                 = "nvcomplianceprofiles"
 	RscTypeRbacRoles                      = "roles"
 	RscTypeRbacClusterRoles               = "clusterroles"
 	RscTypeRbacRolebindings               = "rolebindings"
@@ -42,6 +44,8 @@ const (
 	RscTypeDeployment                     = "deployment"
 	RscTypeCronJob                        = "cronjob"
 	RscTypeDaemonSet                      = "daemonset"
+	RscTypeReplicaSet                     = "replicaset"
+	RscTypeStatefulSet                    = "statefulset"
 )
 
 const (
@@ -66,6 +70,7 @@ var NvAdmMutatingName = "neuvector-mutating-admission-webhook"     // Validating
 var NvAdmValidatingName = "neuvector-validating-admission-webhook" // ValidatingWebhookConfiguration resource instance metadata name
 var NvCrdValidatingName = "neuvector-validating-crd-webhook"       // ValidatingWebhookConfiguration resource instance metadata name
 var nvStatusValidatingName = "neuvector-validating-status-webhook" // for composing webhook name only, not for ValidatingWebhookConfiguration resource instance metadata name
+var NvPruneValidatingName = "neuvector-prune-orphan-crd-groups"    // for manually pruning orphan crd groups only
 
 const (
 	WatchEventAdd    = "ResourceAdd"
@@ -136,6 +141,18 @@ type DaemonSet struct {
 	Name   string
 	Domain string
 	SA     string
+}
+
+type ReplicaSet struct {
+	UID    string
+	Name   string
+	Domain string
+}
+
+type StatefulSet struct {
+	UID    string
+	Name   string
+	Domain string
 }
 
 type CronJob struct {

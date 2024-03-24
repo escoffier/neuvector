@@ -2,9 +2,11 @@ package cache
 
 import (
 	"github.com/neuvector/neuvector/controller/api"
-	"github.com/neuvector/neuvector/controller/nvk8sapi/nvvalidatewebhookcfg/admission"
+	nvsysadmission "github.com/neuvector/neuvector/controller/nvk8sapi/nvvalidatewebhookcfg/admission"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/utils"
+
+	"github.com/stretchr/testify/assert"
 
 	"strings"
 	"testing"
@@ -672,6 +674,142 @@ func TestIsSetCriterionMet(t *testing.T) {
 			met, positive = isSetCriterionMet(crt, valueSet3)
 			if met != expected3[idx].met || positive != expected3[idx].positive {
 				t.Errorf("Unexpected isSetCriterionMet[2:%d] result(%s, %s, %s, %+v, %+v)\n", idx, crt.Name, crt.Op, crt.Value, met, positive)
+				break
+			}
+		}
+	}
+
+	postTest()
+}
+
+func TestIsSetCriterionMet2(t *testing.T) {
+	preTest()
+
+	type ret struct {
+		met      bool
+		positive bool
+	}
+
+	{
+		crit1 := &share.CLUSAdmRuleCriterion{
+			Name:  share.CriteriaKeyUser,
+			Op:    share.CriteriaOpRegexContainsAny,
+			Value: "^user-(1[0-9]|[2-9][0-9]|1[0-9]{2}|200)$, ^subject-(3[0-9]|4[0-9]|50)$",
+		} // any in user-10 ~ user-200, subject-30 ~ subject-50
+		crit2 := &share.CLUSAdmRuleCriterion{
+			Name:  share.CriteriaKeyUser,
+			Op:    share.CriteriaOpRegexNotContainsAny,
+			Value: "^user-(1[0-9]|[2-9][0-9]|1[0-9]{2}|200)$, ^subject-(3[0-9]|4[0-9]|50)$",
+		} // not any in user-10 ~ user-200, subject-30 ~ subject-50
+		crit1.ValueSlice = strings.Split(crit1.Value, setDelim)
+		for i, value := range crit1.ValueSlice {
+			crit1.ValueSlice[i] = strings.TrimSpace(value)
+		}
+		crit2.ValueSlice = strings.Split(crit2.Value, setDelim)
+		for i, value := range crit2.ValueSlice {
+			crit2.ValueSlice[i] = strings.TrimSpace(value)
+		}
+
+		userSet1 := utils.NewSet("user-10", "user-15", "user-116", "user-200", "subject-31", "subject-50") // any in user-10 ~ user-200, subject-30 ~ subject-50
+		userSet2 := utils.NewSet("User-11", "user-011", "user-0200", "", "subject3", "subject-300")        // not any in user-10 ~ user-200, subject-30 ~ subject-50
+
+		for user := range userSet1.Iter() {
+			met, positive := isStringCriterionMet(crit1, user.(string))
+			if met != true || positive != true {
+				t.Errorf("Unexpected isStringCriterionMet[1] result(value=%+v, crit=%+v, met=%+v, positive=%+v)\n", user, crit1, met, positive)
+				break
+			}
+		}
+
+		for user := range userSet2.Iter() {
+			met, positive := isStringCriterionMet(crit1, user.(string))
+			if met != false || positive != true {
+				t.Errorf("Unexpected isStringCriterionMet[2] result(value=%+v, crit=%+v, met=%+v, positive=%+v)\n", user, crit1, met, positive)
+				break
+			}
+		}
+
+		for user := range userSet1.Iter() {
+			met, positive := isStringCriterionMet(crit2, user.(string))
+			if met != false || positive != false {
+				t.Errorf("Unexpected isStringCriterionMet[3] result(value=%+v, crit=%+v, met=%+v, positive=%+v)\n", user, crit2, met, positive)
+				break
+			}
+		}
+
+		for user := range userSet2.Iter() {
+			met, positive := isStringCriterionMet(crit2, user.(string))
+			if met != true || positive != false {
+				t.Errorf("Unexpected isStringCriterionMet[4] result(value=%+v, crit=%+v, met=%+v, positive=%+v)\n", user, crit2, met, positive)
+				break
+			}
+		}
+	}
+
+	{
+		crit1 := &share.CLUSAdmRuleCriterion{
+			Name:  share.CriteriaKeyK8sGroups,
+			Op:    share.CriteriaOpRegexContainsAny,
+			Value: "^group-(1[0-9]|[2-9][0-9]|1[0-9]{2}|200)$,  ^subject-(3[0-9]|4[0-9]|50)$",
+		} // any in group-10 ~ group-200, subject-30 ~ subject-50
+		crit2 := &share.CLUSAdmRuleCriterion{
+			Name:  share.CriteriaKeyK8sGroups,
+			Op:    share.CriteriaOpRegexNotContainsAny,
+			Value: "^group-(1[0-9]|[2-9][0-9]|1[0-9]{2}|200)$,  ^subject-(3[0-9]|4[0-9]|50)$",
+		} // not any in group-10 ~ group-200, subject-30 ~ subject-50
+		crit1.ValueSlice = strings.Split(crit1.Value, setDelim)
+		for i, value := range crit1.ValueSlice {
+			crit1.ValueSlice[i] = strings.TrimSpace(value)
+		}
+		crit2.ValueSlice = strings.Split(crit2.Value, setDelim)
+		for i, value := range crit2.ValueSlice {
+			crit2.ValueSlice[i] = strings.TrimSpace(value)
+		}
+
+		groupSets1 := []utils.Set{
+			utils.NewSet("group-10"),
+			utils.NewSet("group-1", "group-15"),
+			utils.NewSet("group-10", "group-101"),
+			utils.NewSet("group-10", "group-20", "group-200"),
+			utils.NewSet("group-10a", "subject-30"),
+			utils.NewSet("group-10", "subject-300"),
+		} // any in group-10 ~ group-200, subject-30 ~ subject-50
+		groupSets2 := []utils.Set{
+			utils.NewSet("Group-11"),
+			utils.NewSet("group-011", "group-020"),
+			utils.NewSet("ugroup-0200", "group-2000"),
+			utils.NewSet("org-0200", "subject-2000"),
+			utils.NewSet(),
+		} // not any in group-10 ~ group-200, subject-30 ~ subject-50
+
+		for idx, group := range groupSets1 {
+			met, positive := isSetCriterionMet(crit1, group)
+			if met != true || positive != true {
+				t.Errorf("Unexpected isSetCriterionMet[11:%d] result(value=%+v, crit=%+v, met=%+v, positive=%+v)\n", idx, group, crit1, met, positive)
+				break
+			}
+		}
+
+		for idx, group := range groupSets2 {
+			met, positive := isSetCriterionMet(crit1, group)
+			if met != false || positive != true {
+				t.Errorf("Unexpected isSetCriterionMet[12:%d] result(value=%+v, crit=%+v, met=%+v, positive=%+v)\n", idx, group, crit1, met, positive)
+				break
+			}
+		}
+
+		for idx, group := range groupSets1 {
+			met, positive := isSetCriterionMet(crit2, group)
+			if met != false || positive != false {
+				t.Errorf("Unexpected isSetCriterionMet[13:%d] result(value=%+v, crit=%+v, met=%+v, positive=%+v)\n", idx, group, crit2, met, positive)
+				break
+			}
+		}
+
+		for idx, group := range groupSets2 {
+			met, positive := isSetCriterionMet(crit2, group)
+			if met != true || positive != false {
+				t.Errorf("Unexpected isSetCriterionMet[13:%d] result(value=%+v, crit=%+v, met=%+v, positive=%+v)\n", idx, group, crit2, met, positive)
 				break
 			}
 		}
@@ -1386,6 +1524,183 @@ func TestIsLabelCriterionMet5(t *testing.T) {
 				}*/
 				tag++
 			}
+		}
+	}
+
+	postTest()
+}
+
+func TestIsAnnotationCriterionMet(t *testing.T) {
+	preTest()
+
+	expected := []struct {
+		rule []*share.CLUSAdmRuleCriterion
+		tcs  []struct {
+			obj     nvsysadmission.AdmResObject
+			matched bool
+		}
+	}{
+		{
+			rule: []*share.CLUSAdmRuleCriterion{
+				{
+					Name: share.CriteriaKeyAnnotations, Op: share.CriteriaOpContainsAny, Value: "owner,app", ValueSlice: strings.Split("owner,app", ","),
+				},
+			},
+			tcs: []struct {
+				obj     nvsysadmission.AdmResObject
+				matched bool
+			}{
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{
+							"owner": "joe",
+						},
+					},
+					matched: true,
+				},
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{},
+					},
+					matched: false,
+				},
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{
+							"neighbor": "joe",
+						},
+					},
+					matched: false,
+				},
+			},
+		},
+		{
+			rule: []*share.CLUSAdmRuleCriterion{
+				{
+					Name: share.CriteriaKeyAnnotations, Op: share.CriteriaOpContainsAll, Value: "owner,app", ValueSlice: strings.Split("owner,app", ","),
+				},
+			},
+			tcs: []struct {
+				obj     nvsysadmission.AdmResObject
+				matched bool
+			}{
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{
+							"owner": "joe",
+						},
+					},
+					matched: false,
+				},
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{},
+					},
+					matched: false,
+				},
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{
+							"neighbor": "joe",
+						},
+					},
+					matched: false,
+				},
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{
+							"owner": "joe",
+							"app":   "ubuntu",
+						},
+					},
+					matched: true,
+				},
+			},
+		},
+		{
+			rule: []*share.CLUSAdmRuleCriterion{
+				{
+					Name: share.CriteriaKeyAnnotations, Op: share.CriteriaOpNotContainsAny, Value: "owner,app", ValueSlice: strings.Split("owner,app", ","),
+				},
+			},
+			tcs: []struct {
+				obj     nvsysadmission.AdmResObject
+				matched bool
+			}{
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{
+							"owner": "joe",
+						},
+					},
+					matched: false,
+				},
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{},
+					},
+					matched: true,
+				},
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{
+							"neighbor": "joe",
+						},
+					},
+					matched: true,
+				},
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{
+							"owner": "joe",
+							"app":   "ubuntu",
+						},
+					},
+					matched: false,
+				},
+			},
+		},
+		{
+			rule: []*share.CLUSAdmRuleCriterion{
+				{
+					Name: share.CriteriaKeyAnnotations, Op: share.CriteriaOpContainsOtherThan, Value: "owner,app", ValueSlice: strings.Split("owner,app", ","),
+				},
+			},
+			tcs: []struct {
+				obj     nvsysadmission.AdmResObject
+				matched bool
+			}{
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{
+							"owner": "joe",
+						},
+					},
+					matched: false,
+				},
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{},
+					},
+					matched: false,
+				},
+				{
+					obj: nvsysadmission.AdmResObject{
+						Annotations: map[string]string{
+							"neighbor": "joe",
+						},
+					},
+					matched: true,
+				},
+			},
+		},
+	}
+	cs := []*nvsysadmission.AdmContainerInfo{&nvsysadmission.AdmContainerInfo{}}
+	for _, rule_tcs := range expected {
+		for _, tc := range rule_tcs.tcs {
+			matched, _ := isAdmissionRuleMet(&tc.obj, cs[0], nil, rule_tcs.rule, false, nil, 0)
+			t.Log(rule_tcs, rule_tcs.rule[0].Name, rule_tcs.rule[0].Op, tc.obj)
+			assert.Equal(t, tc.matched, matched)
 		}
 	}
 

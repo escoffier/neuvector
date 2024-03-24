@@ -31,6 +31,7 @@
 #define ENV_FED_SERVER_PORT    "FED_SERVER_PORT"
 #define ENV_CTRL_PATH_DEBUG    "CTRL_PATH_DEBUG"
 #define ENV_CTRL_NOT_RM_NSGRPS "CTRL_NOT_PRUNE_NSGROUPS"
+#define ENV_CTRL_EN_ICMP_POL   "CTRL_EN_ICMP_POLICY"
 #define ENV_DEBUG_LEVEL        "DEBUG_LEVEL"
 #define ENV_TAP_INTERFACE      "TAP_INTERFACE"
 #define ENV_TAP_ALL_CONTAINERS "TAP_ALL_CONTAINERS"
@@ -55,6 +56,8 @@
 #define ENV_NO_DEFAULT_ADMIN   "NO_DEFAULT_ADMIN"
 #define ENV_CSP_ENV            "CSP_ENV"
 #define ENV_CSP_PAUSE_INTERVAL "CSP_PAUSE_INTERVAL"
+#define ENV_AUTOPROFILE_CLT    "AUTO_PROFILE_COLLECT"
+#define ENV_SET_CUSTOM_BENCH   "CUSTOM_CHECK_CONTROL"
 
 #define ENV_SCANNER_DOCKER_URL  "SCANNER_DOCKER_URL"
 #define ENV_SCANNER_LICENSE     "SCANNER_LICENSE"
@@ -69,9 +72,11 @@
 #define ENV_SCANNER_CTRL_USER   "SCANNER_CTRL_API_USERNAME"
 #define ENV_SCANNER_CTRL_PASS   "SCANNER_CTRL_API_PASSWORD"
 
+#define ENV_THRT_SSL_TLS_1DOT0  "THRT_SSL_TLS_1DOT0"
+#define ENV_THRT_SSL_TLS_1DOT1  "THRT_SSL_TLS_1DOT1"
+
 #define DP_MISS_HB_MAX 60
-#define PROC_SHORT_LIVE_SECOND 8
-#define PROC_SHORT_LIVE_LIMIT  10
+#define PROC_EXIT_LIMIT  10
 
 enum {
     PROC_CTRL = 0,
@@ -98,8 +103,8 @@ typedef struct proc_info_ {
     int active  : 1,
         running : 1;
     pid_t pid;
-    int short_live_count;
     struct timeval start;
+    int exit_count;
     int exit_status;
 } proc_info_t;
 
@@ -210,6 +215,7 @@ static pid_t fork_exec(int i)
     char *license, *registry, *repository, *tag, *user, *pass, *base, *api_user, *api_pass, *enable;
     char *on_demand, *pwd_valid_unit, *rancher_ep, *debug_level, *policy_pull_period;
     char *telemetry_neuvector_ep, *telemetry_current_ver, *telemetry_freq, *csp_env, *csp_pause_interval;
+    char *custom_check_control;
     int a;
 
     switch (i) {
@@ -223,11 +229,21 @@ static pid_t fork_exec(int i)
             args[a ++] = "-i";
             args[a ++] = iface;
         }
-
         if (g_pipe_driver == RC_CONFIG_NOTC) {
             args[a ++] = "-c";
         }
-
+        if ((enable = getenv(ENV_THRT_SSL_TLS_1DOT0)) != NULL) {
+            if (checkImplicitEnableFlag(enable) == 1) {
+                args[a ++] = "-v";
+                args[a ++] = "thrt_tls_1dot0";
+            }
+        }
+        if ((enable = getenv(ENV_THRT_SSL_TLS_1DOT1)) != NULL) {
+            if (checkImplicitEnableFlag(enable) == 1) {
+                args[a ++] = "-v";
+                args[a ++] = "thrt_tls_1dot1";
+            }
+        }
         args[a] = NULL;
         break;
     case PROC_SCANNER:
@@ -405,6 +421,11 @@ static pid_t fork_exec(int i)
                 args[a ++] = "-no_rm_nsgroups";
             }
         }
+        if ((enable = getenv(ENV_CTRL_EN_ICMP_POL)) != NULL) {
+            if (checkImplicitEnableFlag(enable) == 1) {
+                args[a ++] = "-en_icmp_policy";
+            }
+        }
         if ((csp_env = getenv(ENV_CSP_ENV)) != NULL) {
             args[a++] = "-csp_env";
             args[a++] = csp_env;
@@ -412,6 +433,14 @@ static pid_t fork_exec(int i)
         if ((csp_pause_interval = getenv(ENV_CSP_PAUSE_INTERVAL)) != NULL) {
             args[a++] = "-csp_pause_interval";
             args[a++] = csp_pause_interval;
+        }
+        if ((enable = getenv(ENV_AUTOPROFILE_CLT)) != NULL) {
+            args[a++] = "-apc";
+            args[a++] = enable;
+        }
+        if ((custom_check_control = getenv(ENV_SET_CUSTOM_BENCH)) != NULL) {
+            args[a++] = "-cbench";
+            args[a++] = custom_check_control;
         }
         args[a] = NULL;
         break;
@@ -492,7 +521,14 @@ static pid_t fork_exec(int i)
             args[a ++] = "-policy_puller";
             args[a ++] = policy_pull_period;
         }
-
+        if ((enable = getenv(ENV_AUTOPROFILE_CLT)) != NULL) {
+            args[a++] = "-apc";
+            args[a++] = enable;
+        }
+        if ((custom_check_control = getenv(ENV_SET_CUSTOM_BENCH)) != NULL) {
+            args[a++] = "-cbench";
+            args[a++] = custom_check_control;
+        }
         args[a] = NULL;
         break;
 
@@ -722,6 +758,7 @@ static void proc_exit_handler(int signal)
             }
 
             g_procs[i].exit_status = exit_status;
+            g_procs[i].exit_count ++;
             g_procs[i].running = false;
         }
     }
@@ -898,6 +935,17 @@ int main (int argc, char **argv)
                           g_procs[i].name, g_procs[i].exit_status, g_procs[i].pid);
 
                     g_procs[i].pid = 0;
+
+                    switch (i) {
+                    case PROC_CTRL:
+                    case PROC_AGENT:
+                    case PROC_DP:
+                        if (g_procs[i].exit_count > PROC_EXIT_LIMIT) {
+                            exit_monitor();
+                            exit(g_procs[i].exit_status & 0xff);
+                        }
+                        break;
+                    }
 
                     if (g_exit_monitor_on_proc_exit == 1) {
                         debug("Process %s exit. Monitor Exit.\n",

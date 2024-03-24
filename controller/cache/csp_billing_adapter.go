@@ -8,6 +8,7 @@ import (
 	metav1 "github.com/neuvector/k8s/apis/meta/v1"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/neuvector/neuvector/controller/access"
 	"github.com/neuvector/neuvector/controller/api"
 	"github.com/neuvector/neuvector/controller/common"
 	"github.com/neuvector/neuvector/controller/resource"
@@ -77,17 +78,24 @@ func (m CacheMethod) GetNvUsage(fedRole string) api.RESTNvUsage {
 }
 
 func ConfigCspUsages(addOnly, forceConfig bool, fedRole, masterClusterID string) error {
-	if !isLeader() || cctx.CspType == share.CSP_NONE {
+	if localDev.Host.Platform == share.PlatformDocker {
+		acc := access.NewAdminAccessControl()
+		// The pricing generally should be based on total node count in the cluster, not enforcer count, even though those two are usually the same.
+		// However, for NV deployment on native docker (as downstream cluster in multi-cluster env), downstream nv reports its enforcer count as node count to master cluster.
+		clusterUsage.nodes = cacher.GetAgentCount(acc, "")
+	} else {
+		if objs, err := global.ORCH.ListResource(resource.RscTypeNode); err == nil {
+			clusterUsage.nodes = len(objs)
+		} else {
+			clusterUsage.nodes = 1
+		}
+	}
+
+	if cctx.CspType == share.CSP_NONE {
 		return nil
 	}
 
 	var totalNodes int
-
-	if objs, err := global.ORCH.ListResource(resource.RscTypeNode); err == nil {
-		clusterUsage.nodes = len(objs)
-	} else {
-		clusterUsage.nodes = 1
-	}
 
 	if fedRole == api.FedRoleMaster {
 		nvUsage := cacher.GetNvUsage(fedRole)
@@ -108,30 +116,39 @@ func ConfigCspUsages(addOnly, forceConfig bool, fedRole, masterClusterID string)
 	var err error
 	var obj interface{}
 	rscName := resource.RscCspUsageName
-	t := time.Now().Format(time.RFC3339)
+	nvSemanticVersion := cctx.NvSemanticVersion
+	if strings.HasPrefix(nvSemanticVersion, "v") {
+		nvSemanticVersion = nvSemanticVersion[1:]
+	}
+	// nvSemanticVersion is in the format {major}.{minor}.{patch}
+	// baseProduct is in the format cpe:/o:suse:neuvector:{major}.{minor}.{patch}
+	baseProduct := fmt.Sprintf("cpe:/o:suse:neuvector:%s", nvSemanticVersion)
+	t := time.Now().Format("2006-01-02T15:04:05.000000-07:00")
 	if obj, err = global.ORCH.GetResource(resource.RscTypeCrdNvCspUsage, "", rscName); err == nil {
-		if !addOnly {
-			if crCspUsage, ok := obj.(*resource.NvCspUsage); ok {
-				crCspUsage.ManagedNodeCount = totalNodes
-				crCspUsage.ReportingTime = t
-				err = global.ORCH.UpdateResource(resource.RscTypeCrdNvCspUsage, crCspUsage)
-			} else {
-				err = fmt.Errorf("unsupported type")
-			}
+		if crCspUsage, ok := obj.(*resource.NvCspUsage); ok {
+			crCspUsage.ManagedNodeCount = totalNodes
+			crCspUsage.ReportingTime = t
+			crCspUsage.BaseProduct = baseProduct
+			err = global.ORCH.UpdateResource(resource.RscTypeCrdNvCspUsage, crCspUsage)
+		} else {
+			err = fmt.Errorf("unsupported type")
 		}
 	} else if strings.Contains(err.Error(), " 404 ") {
-		kind := resource.NvCspUsageKind
-		apiVersion := fmt.Sprintf("%s/%s", common.OEMClusterSecurityRuleGroup, resource.NvCrdV1)
-		crCspUsage := &resource.NvCspUsage{
-			Kind:       &kind,
-			ApiVersion: &apiVersion,
-			Metadata: &metav1.ObjectMeta{
-				Name: &rscName,
-			},
-			ManagedNodeCount: totalNodes,
-			ReportingTime:    t,
+		if addOnly {
+			kind := resource.NvCspUsageKind
+			apiVersion := "susecloud.net/v1"
+			crCspUsage := &resource.NvCspUsage{
+				Kind:       &kind,
+				ApiVersion: &apiVersion,
+				Metadata: &metav1.ObjectMeta{
+					Name: &rscName,
+				},
+				ManagedNodeCount: totalNodes,
+				ReportingTime:    t,
+				BaseProduct:      baseProduct,
+			}
+			err = global.ORCH.AddResource(resource.RscTypeCrdNvCspUsage, crCspUsage)
 		}
-		err = global.ORCH.AddResource(resource.RscTypeCrdNvCspUsage, crCspUsage)
 	}
 	if err != nil {
 		log.WithFields(log.Fields{"rscName": rscName, "addOnly": addOnly, "err": err}).Error()

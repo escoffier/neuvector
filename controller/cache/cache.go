@@ -25,6 +25,7 @@ import (
 	"github.com/neuvector/neuvector/controller/rpc"
 	"github.com/neuvector/neuvector/controller/ruleid"
 	"github.com/neuvector/neuvector/controller/scan"
+	"github.com/neuvector/neuvector/db"
 	"github.com/neuvector/neuvector/share"
 	"github.com/neuvector/neuvector/share/cluster"
 	"github.com/neuvector/neuvector/share/global"
@@ -166,6 +167,7 @@ var hostCacheMap map[string]*hostCache = make(map[string]*hostCache)         // 
 var k8sHostInfoMap map[string]*k8sHostCache = make(map[string]*k8sHostCache) // key is the host name seen by enforcer. only used in k8s/oc env
 var agentCacheMap map[string]*agentCache = make(map[string]*agentCache)
 var ctrlCacheMap map[string]*ctrlCache = make(map[string]*ctrlCache)
+var nvwlCacheMap map[string]*workloadCache = make(map[string]*workloadCache)
 var wlCacheMap map[string]*workloadCache = make(map[string]*workloadCache)
 var ipHostMap map[string]*hostDigest = make(map[string]*hostDigest)
 var tunnelHostMap map[string]string = make(map[string]string)
@@ -194,13 +196,18 @@ type Context struct {
 	TimerWheel               *utils.TimerWheel
 	DebugCPath               bool
 	EnableRmNsGroups         bool
+	EnableIcmpPolicy         bool
 	ConnLog                  *log.Logger
 	MutexLog                 *log.Logger
 	ScanLog                  *log.Logger
+	K8sResLog                *log.Logger
 	CspType                  share.TCspType
 	CtrlerVersion            string
+	NvSemanticVersion        string
 	StartStopFedPingPollFunc func(cmd, interval uint32, param1 interface{}) error
 	RestConfigFunc           func(cmd, interval uint32, param1 interface{}, param2 interface{}) error
+	CreateQuerySessionFunc   func(qsr *api.QuerySessionRequest) error
+	DeleteQuerySessionFunc   func(queryToken string) error
 }
 
 type k8sProbeCmd struct {
@@ -260,6 +267,9 @@ func isScanner() bool {
 func ScannerChangeNotify(isScanner bool) {
 	log.WithFields(log.Fields{"isScanner": isScanner}).Info()
 
+	if cacher.isScanner != isScanner {
+		autoScaleHistory = tAutoScaleHistory{}
+	}
 	cacher.isScanner = isScanner
 	if isScanner {
 		scanBecomeScanner()
@@ -584,6 +594,15 @@ func getNvName(id string) *workloadNames {
 		return names
 	}
 
+	if cache, ok := nvwlCacheMap[id]; ok {
+		wl := cache.workload
+		names := &workloadNames{
+			name:   cache.podName,
+			domain: wl.Domain,
+			image:  wl.Image,
+		}
+		return names
+	}
 	return nil
 }
 
@@ -1646,11 +1665,13 @@ const unManagedWlProcDelayFast = time.Duration(time.Minute * 2)
 const unManagedWlProcDelaySlow = time.Duration(time.Minute * 8)
 const pruneKVPeriod = time.Duration(time.Minute * 30)
 const pruneGroupPeriod = time.Duration(time.Minute * 1)
+const rmEmptyGroupPeriod = time.Duration(time.Minute * 1)
 
 var unManagedWlTimer *time.Timer
 
 func startWorkerThread(ctx *Context) {
 	ephemeralTicker := time.NewTicker(workloadEphemeralPeriod)
+	emptyGrpTicker := time.NewTicker(rmEmptyGroupPeriod)
 	scannerTicker := time.NewTicker(scannerCleanupPeriod)
 	usageReportTicker := time.NewTicker(usageReportPeriod)
 	unManagedWlTimer = time.NewTimer(unManagedWlProcDelaySlow)
@@ -1659,9 +1680,9 @@ func startWorkerThread(ctx *Context) {
 		pruneTicker.Stop()
 	}
 
-	wlSuspected := utils.NewSet()	// supicious workload ids
+	wlSuspected := utils.NewSet() // supicious workload ids
 	pruneKvTicker := time.NewTicker(pruneKVPeriod)
-	pruneWorkloadKV(wlSuspected)  // the first scan
+	pruneWorkloadKV(wlSuspected) // the first scan
 
 	noTelemetry := false
 	telemetryFreq := ctx.TelemetryFreq
@@ -1701,6 +1722,8 @@ func startWorkerThread(ctx *Context) {
 				}
 			case <-pruneTicker.C:
 				pruneGroupsByNamespace()
+			case <-emptyGrpTicker.C:
+				rmEmptyGroupsFromCluster()
 			case <-unManagedWlTimer.C:
 				cacheMutexRLock()
 				refreshInternalIPNet()
@@ -1767,7 +1790,7 @@ func startWorkerThread(ctx *Context) {
 					}
 				}
 			case ev := <-cctx.OrchChan:
-				log.WithFields(log.Fields{"event": ev.Event, "type": ev.ResourceType}).Debug("Event received")
+				cctx.K8sResLog.WithFields(log.Fields{"event": ev.Event, "type": ev.ResourceType}).Debug("Event received")
 				if shouldExit() {
 					break
 				}
@@ -1841,16 +1864,18 @@ func startWorkerThread(ctx *Context) {
 					if ev.ResourceOld != nil {
 						o = ev.ResourceOld.(*resource.Namespace)
 					}
-					if n != nil {
-						// ignore neuvector domain
-						if n.Name != localDev.Ctrler.Domain {
-							domainAdd(n.Name, n.Labels)
-						} else {
-							// for the upgrade cas
-							domainDelete(n.Name)
+					if isLeader() {
+						if n != nil {
+							// ignore neuvector domain
+							if n.Name != localDev.Ctrler.Domain {
+								domainAdd(n.Name, n.Labels)
+							} else {
+								// for the upgrade case
+								domainDelete(n.Name)
+							}
+						} else if o != nil {
+							domainDelete(o.Name)
 						}
-					} else if o != nil {
-						domainDelete(o.Name)
 					}
 					if n != nil {
 						if skip := atomic.LoadUint32(&nvDeployDeleted); skip == 0 && isLeader() && admission.IsNsSelectorSupported() {
@@ -2041,6 +2066,7 @@ func startWorkerThread(ctx *Context) {
 // [2021-02-15] CRD-related resource changes do not call this function.
 //              If they need to in the future, re-work the calling of SyncAdmCtrlStateToK8s()
 func refreshK8sAdminWebhookStateCache(oldConfig, newConfig *resource.AdmissionWebhookConfiguration) {
+	updateDetected := false
 	config := newConfig
 	if oldConfig != nil && newConfig == nil {
 		config = oldConfig
@@ -2048,13 +2074,22 @@ func refreshK8sAdminWebhookStateCache(oldConfig, newConfig *resource.AdmissionWe
 	if config == nil {
 		return
 	}
-	log.WithFields(log.Fields{"name": config.Name, "old": oldConfig, "new": newConfig}).Info("ValidatingWebhookConfiguration is changed")
+	if oldConfig != nil && newConfig != nil {
+		updateDetected = true
+	}
+	log.WithFields(log.Fields{"name": config.Name, "old": oldConfig, "new": newConfig}).Debug("ValidatingWebhookConfiguration is changed")
+	if isLeader() && config.Name == resource.NvPruneValidatingName {
+		// for manually fixing orphan crd groups only
+		if oldConfig != nil && newConfig == nil {
+			pruneOrphanGroups()
+		}
+	}
 	if config.Name != resource.NvAdmValidatingName {
 		return
 	}
 
 	if isLeader() {
-		skip, err := cacher.SyncAdmCtrlStateToK8s(resource.NvAdmSvcName, config.Name)
+		skip, err := cacher.SyncAdmCtrlStateToK8s(resource.NvAdmSvcName, config.Name, updateDetected)
 		if skip && err == nil {
 			// meaning nv resource in k8s sync with nv's cluster status. do nothing
 		} else if !skip {
@@ -2101,6 +2136,7 @@ func Init(ctx *Context, leader bool, leadAddr, restoredFedRole string) CacheInte
 	startWorkerThread(ctx) // timer and orch channel
 	startPolicyThread()
 
+	configIcmpPolicy(ctx)
 	configInit()
 	scanInit()
 
@@ -2112,6 +2148,9 @@ func Init(ctx *Context, leader bool, leadAddr, restoredFedRole string) CacheInte
 	ruleid.SetGetGroupWithoutLockFunc(getGroupWithoutLock)
 	clusHelper.SetCtrlState(share.CLUSCtrlNodeAdmissionKey)
 	automode_init(ctx)
+
+	// pass function to db so it can use it
+	db.InitGetCVERecord(GetCVERecord)
 
 	go ProcReportBkgSvc()
 	go FileReportBkgSvc()
@@ -2182,11 +2221,11 @@ func lookupPurgeWorkloadEntries(keys []string, nIndex int, curr, suspected, conf
 	var removed []string
 	for _, key := range keys {
 		id := share.CLUSKeyNthToken(key, nIndex)
-		if !strings.Contains(id, ":") {	// filter out non-id case, like "nodeID"
-			if !updated.Contains(id) {	// allow one updated missing per round
+		if !strings.Contains(id, ":") { // filter out non-id case, like "nodeID"
+			if !updated.Contains(id) { // allow one updated missing per round
 				if !curr.Contains(id) {
 					if suspected.Contains(id) {
-						confirm.Add(id)		// confirmed
+						confirm.Add(id) // confirmed
 						removed = append(removed, key)
 					} else {
 						suspected.Add(id)
@@ -2202,12 +2241,12 @@ func lookupPurgeWorkloadEntries(keys []string, nIndex int, curr, suspected, conf
 func pruneWorkloadKV(suspected utils.Set) {
 	ids := utils.NewSet()
 	confirmed := utils.NewSet()
-	updated := utils.NewSet()	// allow one update per round
+	updated := utils.NewSet() // allow one update per round
 
 	cacheMutexRLock()
 	for id, _ := range wlCacheMap {
 		ids.Add(id)
-		suspected.Remove(id)	// remove the missing id
+		suspected.Remove(id) // remove the missing id
 	}
 	cacheMutexRUnlock()
 
@@ -2222,17 +2261,17 @@ func pruneWorkloadKV(suspected utils.Set) {
 	// log.WithFields(log.Fields{"keys": keys, "suspected": suspected}).Debug("bench reports")
 
 	// (2) bench scan state: scan/state/bench/workload/<id>
-	keys, _ = cluster.GetKeys(share.CLUSScanStateKey("bench/workload"), " ")  // last element
-	removed  = append(removed, lookupPurgeWorkloadEntries(keys, 4, ids, suspected, confirmed, updated)...)
+	keys, _ = cluster.GetKeys(share.CLUSScanStateKey("bench/workload"), " ") // last element
+	removed = append(removed, lookupPurgeWorkloadEntries(keys, 4, ids, suspected, confirmed, updated)...)
 	// log.WithFields(log.Fields{"keys": keys, "confirmed": confirmed, "suspected": suspected}).Debug("bench wl state")
 
 	// (3) auto scan reports: scan/data/report/workload/<id>
-	keys, _ = cluster.GetKeys(fmt.Sprintf("%sreport/workload", share.CLUSScanDataStore), " ")  // last element
+	keys, _ = cluster.GetKeys(fmt.Sprintf("%sreport/workload", share.CLUSScanDataStore), " ") // last element
 	removed = append(removed, lookupPurgeWorkloadEntries(keys, 4, ids, suspected, confirmed, updated)...)
 	// log.WithFields(log.Fields{"keys": keys, "confirmed": confirmed, "suspected": suspected}).Debug("auto scan reports")
 
 	// (4) scan state records: scan/state/report/workload/<id>
-	keys, _ = cluster.GetKeys(fmt.Sprintf("%sreport/workload", share.CLUSScanStateStore), " ")  // last element
+	keys, _ = cluster.GetKeys(fmt.Sprintf("%sreport/workload", share.CLUSScanStateStore), " ") // last element
 	removed = append(removed, lookupPurgeWorkloadEntries(keys, 4, ids, suspected, confirmed, updated)...)
 
 	// remove confirmed ids from the missing ids and pass into the next round
@@ -2256,4 +2295,91 @@ func pruneWorkloadKV(suspected utils.Set) {
 			log.WithFields(log.Fields{"pruned": len(removed), "removed": removed}).Info()
 		}
 	}
+}
+
+func (m CacheMethod) GetAllWorkloadsID(acc *access.AccessControl, filteredMap map[string]bool) []string {
+	cacheMutexRLock()
+	defer cacheMutexRUnlock()
+
+	workloadIDs := make([]string, 0)
+	for _, cache := range wlCacheMap {
+		if !acc.Authorize(cache.workload, nil) {
+			continue
+		}
+		if common.OEMIgnoreWorkload(cache.workload) {
+			continue
+		}
+		if !cache.workload.Running {
+			continue
+		}
+
+		if cache.workload.ShareNetNS == "" {
+			workloadIDs = append(workloadIDs, cache.workload.ID)
+			getFilteredVulTraits(cache.workload.ID, cache.vulTraits, filteredMap)
+
+			for child := range cache.children.Iter() {
+				if childCache, ok := wlCacheMap[child.(string)]; ok {
+					workloadIDs = append(workloadIDs, childCache.workload.ID)
+					getFilteredVulTraits(childCache.workload.ID, childCache.vulTraits, filteredMap)
+				}
+			}
+		}
+	}
+	return workloadIDs
+}
+
+func (m CacheMethod) GetAllHostsID(acc *access.AccessControl, filteredMap map[string]bool) []string {
+	cacheMutexRLock()
+	defer cacheMutexRUnlock()
+
+	hostIDs := make([]string, 0)
+	for _, cache := range hostCacheMap {
+		if !acc.Authorize(cache.host, nil) || isDummyHostCache(cache) {
+			continue
+		}
+
+		hostIDs = append(hostIDs, cache.host.ID)
+		getFilteredVulTraits(cache.host.ID, cache.vulTraits, filteredMap)
+	}
+	return hostIDs
+}
+
+func (m CacheMethod) GetPlatformID(acc *access.AccessControl, filteredMap map[string]bool) string {
+	scanMutexRLock()
+	defer scanMutexRUnlock()
+
+	if acc.Authorize(&share.CLUSHost{}, nil) {
+		if info, ok := scanMap[common.ScanPlatformID]; ok {
+			getFilteredVulTraits(common.ScanPlatformID, info.vulTraits, filteredMap)
+			return common.ScanPlatformID
+		}
+	}
+
+	return ""
+}
+
+func getFilteredVulTraits(id string, vulTraits []*scanUtils.VulTrait, filteredMap map[string]bool) {
+	for _, v := range vulTraits {
+		if v.IsFiltered() {
+			key := fmt.Sprintf("%s;%s", id, v.Name)
+			filteredMap[key] = true
+			filteredMap[v.Name] = true
+		}
+	}
+}
+
+func GetCVERecord(name, dbKey, baseOS string) *db.DbVulAsset {
+	cve := scanUtils.GetCVERecord(name, dbKey, baseOS)
+	vul := &db.DbVulAsset{
+		Severity:    cve.Severity,
+		Description: cve.Description,
+		Link:        cve.Link,
+		Score:       int(cve.Score * 10),
+		Vectors:     cve.Vectors,
+		ScoreV3:     int(cve.ScoreV3 * 10),
+		VectorsV3:   cve.VectorsV3,
+		PublishedTS: cve.PublishedTS,
+		LastModTS:   cve.LastModTS,
+	}
+	return vul
 }

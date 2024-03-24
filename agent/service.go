@@ -4,6 +4,7 @@ package main
 import "C"
 
 import (
+	"encoding/json"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -270,9 +271,7 @@ func (rs *RPCService) GetSessionList(f *share.CLUSFilter, stream share.EnforcerS
 	// If workload is specified, check if it's host-mode container, to return the result faster.
 	if f.Workload != "" {
 		var pods utils.Set
-
-		gInfoRLock()
-		if c, ok := gInfo.activeContainers[f.Workload]; ok {
+		if c, ok := gInfoReadActiveContainer(f.Workload); ok {
 			_, parent := getSharedContainer(c.info)
 			if isContainerNetHostMode(c.info, parent) {
 				// Return child's session if querying the children;
@@ -281,7 +280,6 @@ func (rs *RPCService) GetSessionList(f *share.CLUSFilter, stream share.EnforcerS
 				pods.Add(c.info.ID)
 			}
 		}
-		gInfoRUnlock()
 
 		if pods != nil {
 			// host mode
@@ -599,20 +597,16 @@ func (rs *RPCService) GetStats(ctx context.Context, f *share.CLUSFilter) (*share
 	}
 
 	if f.Workload != "" {
-		gInfoRLock()
-		if c, ok := gInfo.activeContainers[f.Workload]; ok {
+		if c, ok := gInfoReadActiveContainer(f.Workload); ok {
 			var macs []*net.HardwareAddr
 			for _, pair := range c.intcpPairs {
 				macs = append(macs, &pair.MAC)
 			}
-			gInfoRUnlock()
 
 			dp.DPCtrlStatsMAC(macs, cbContainerStats, &stats)
 
 			gInfoRLock()
 			system.PopulateSystemStats(&stats, &c.stats)
-			gInfoRUnlock()
-		} else {
 			gInfoRUnlock()
 		}
 	} else {
@@ -628,6 +622,45 @@ func (rs *RPCService) GetStats(ctx context.Context, f *share.CLUSFilter) (*share
 	return &stats, nil
 }
 
+func (rs *RPCService) GetGroupStats(ctx context.Context, f *share.CLUSWlIDArray) (*share.CLUSStats, error) {
+	log.WithFields(log.Fields{"filter": f}).Debug("")
+
+	stats := share.CLUSStats{
+		Total:  &share.CLUSMetry{},
+		Span1:  &share.CLUSMetry{},
+		Span12: &share.CLUSMetry{},
+		Span60: &share.CLUSMetry{},
+	}
+
+	if f.WlID != nil && len(f.WlID) > 0 {
+		var macs []*net.HardwareAddr
+		for _, wld := range f.WlID {
+			tstats := share.CLUSStats{
+				Total:  &share.CLUSMetry{},
+				Span1:  &share.CLUSMetry{},
+				Span12: &share.CLUSMetry{},
+				Span60: &share.CLUSMetry{},
+			}
+			if c, ok := gInfoReadActiveContainer(wld); ok {
+				for _, pair := range c.intcpPairs {
+					macs = append(macs, &pair.MAC)
+				}
+				gInfoRLock()
+				system.PopulateSystemStats(&tstats, &c.stats)
+				gInfoRUnlock()
+				stats.Span1.CPU += tstats.Span1.CPU
+				stats.Span1.Memory += tstats.Span1.Memory
+				stats.Span12.CPU += tstats.Span12.CPU
+				stats.Span12.Memory += tstats.Span12.Memory
+				stats.Span60.CPU += tstats.Span60.CPU
+				stats.Span60.Memory += tstats.Span60.Memory
+			}
+		}
+		dp.DPCtrlStatsMAC(macs, cbContainerStats, &stats)
+	}
+
+	return &stats, nil
+}
 // --
 
 func (rs *RPCService) cbSessionCount(buf []byte, param interface{}) bool {
@@ -807,7 +840,10 @@ func (rs *RPCService) GetDerivedPolicyRules(ctx context.Context, f *share.CLUSFi
 			ruleMap[pInfo.Policy.WlID] = rs.convertIPPolicy(&pInfo.Policy)
 		}
 	}
-	return &share.CLUSDerivedPolicyRuleMap{RuleMap: ruleMap}, nil
+
+	value, _ := json.Marshal(ruleMap)
+	zb := utils.GzipBytes(value)
+	return &share.CLUSDerivedPolicyRuleMap{RuleByte: zb}, nil
 }
 
 func (rs *RPCService) ProbeSummary(ctx context.Context, v *share.RPCVoid) (*share.CLUSProbeSummary, error) {
@@ -923,10 +959,7 @@ func (rs *RPCService) GetFileMonitorFile(ctx context.Context, f *share.CLUSFilte
 		res := &share.CLUSFileMonitorFileArray{Files: files}
 		return res, nil
 	} else {
-		gInfoRLock()
-		c, ok := gInfo.activeContainers[f.Workload]
-		gInfoRUnlock()
-
+		c, ok := gInfoReadActiveContainer(f.Workload)
 		if !ok {
 			return nil, grpc.Errorf(codes.NotFound, "Container not found")
 		}
@@ -1159,10 +1192,7 @@ func (rs *RPCService) GetContainerIntercept(ctx context.Context, f *share.CLUSFi
 		return nil, fmt.Errorf("container not found")
 	}
 
-	gInfoRLock()
-	defer gInfoRUnlock()
-
-	if c, ok := gInfo.activeContainers[f.Workload]; ok {
+	if c, ok := gInfoReadActiveContainer(f.Workload); ok {
 		l := make([]*share.CLUSWorkloadInterceptPort, 0, len(c.intcpPairs))
 		for _, pair := range c.intcpPairs {
 			l = append(l, pipe.GetPortPairDebug(pair))
@@ -1174,6 +1204,6 @@ func (rs *RPCService) GetContainerIntercept(ctx context.Context, f *share.CLUSFi
 }
 
 func (rs *RPCService) ProfilingCmd(ctx context.Context, req *share.CLUSProfilingRequest) (*share.RPCVoid, error) {
-	go utils.PerfProfile(req, "enf.")
+	go utils.PerfProfile(req, share.ProfileFolder, "enf.")
 	return &share.RPCVoid{}, nil
 }

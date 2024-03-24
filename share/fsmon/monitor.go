@@ -31,13 +31,13 @@ const inodeChangeMask = syscall.IN_CLOSE_WRITE |
 	syscall.IN_MOVE_SELF |
 	syscall.IN_MOVED_TO
 
-const inodeMovedMask = 	syscall.IN_MOVE | syscall.IN_MOVE_SELF | syscall.IN_MOVED_TO
+const inodeMovedMask = syscall.IN_MOVE | syscall.IN_MOVE_SELF | syscall.IN_MOVED_TO
 
 var packageFile utils.Set = utils.NewSet(
 	"/var/lib/dpkg/status",
 	"/var/lib/rpm/Packages",
 	"/var/lib/rpm/Packages.db",
-	"/lib/apk/db/installed",)
+	"/lib/apk/db/installed")
 
 type SendAggregateReportCallback func(fsmsg *MonitorMessage) bool
 
@@ -135,7 +135,7 @@ type groupInfo struct {
 
 type FileWatch struct {
 	mux        sync.Mutex
-	bEnable    bool		// profile function is enabled, default: true
+	bEnable    bool // profile function is enabled, default: true
 	aufs       bool
 	fanotifier *FaNotify
 	inotifier  *Inotify
@@ -263,7 +263,7 @@ func NewFileWatcher(config *FileMonitorConfig) (*FileWatch, error) {
 	go ni.MonitorFileEvents()
 
 	fw.fanotifier = n
-	fw.inotifier= ni
+	fw.inotifier = ni
 
 	go fw.loop()
 	return fw, nil
@@ -348,17 +348,27 @@ func (w *FileWatch) reportLearningRules() {
 	for _, grp := range w.groups {
 		if len(grp.learnRules) > 0 {
 			for flt, rule := range grp.learnRules {
+				group := grp.profile.Group
+				// It enables to correlate its derived groups, like federal groups
+				//for _, fltp := range grp.profile.Filters {
+				//	if fltp.CustomerAdd && flt == filterIndexKey(fltp) {
+				//		group = fltp.DerivedGroup
+				//		mLog.WithFields(log.Fields{"group": group}).Debug("FMON:")
+				//		break
+				//	}
+				//}
+
 				for itr := range rule.Iter() {
 					prf := itr.(string)
 					rl := &share.CLUSFileAccessRuleReq{
-						GroupName: grp.profile.Group,
+						GroupName: group,
 						Filter:    flt,
 						Path:      prf,
 					}
 					learnRules = append(learnRules, rl)
 				}
 			}
-			grp.learnRules = make(map[string]utils.Set)
+			grp.learnRules = make(map[string]utils.Set)	// reset
 		}
 	}
 	w.mux.Unlock()
@@ -371,7 +381,44 @@ func filterIndexKey(filter share.CLUSFileMonitorFilter) string {
 	return fmt.Sprintf("%s/%s", filter.Path, filter.Regex)
 }
 
-func (w *FileWatch) learnFromEvents(rootPid int, fmod *fileMod, path string, event uint32) {
+func filterPathMatch(path string, flt share.CLUSFileMonitorFilter) bool {
+	if flt.Regex == "" {
+		return flt.Path == path
+	} else {
+		fstr := fmt.Sprintf("%s/%s", filepath.Dir(path), flt.Regex)
+		log.WithFields(log.Fields{"fstr": fstr}).Debug("FMON: fstr")
+		if regx, err := regexp.Compile(fmt.Sprintf("^%s$", fstr)); err == nil {
+			return regx.MatchString(path)
+		}
+	}
+	return false
+}
+
+func addLearnedRules(grp *groupInfo, flt share.CLUSFileMonitorFilter, pInfo []*ProcInfo) {
+	index := filterIndexKey(flt)
+	if applyRules, ok := grp.applyRules[index]; ok {
+		learnRules, ok := grp.learnRules[index]
+		if !ok {
+			learnRules = utils.NewSet()
+		}
+		for _, pf := range pInfo {
+			// only use the process name/path as profile
+			if pf != nil && pf.Path != "" {
+				if !applyRules.Contains(pf.Path) && !learnRules.Contains(pf.Path) {
+					learnRules.Add(pf.Path)
+				}
+			}
+		}
+
+		if learnRules.Cardinality() > 0 {
+			grp.learnRules[index] = learnRules	// update grp
+		}
+	} else {
+		log.WithFields(log.Fields{"index": index}).Debug("FMON: no access rules")
+	}
+}
+
+func (w *FileWatch) learnFromEvents(rootPid int, fmod fileMod, path string, event uint32) {
 	// mLog.WithFields(log.Fields{"rootpid": rootPid, "path": path, "event": event}).Debug()
 	w.mux.Lock()
 	grp, ok := w.groups[rootPid]
@@ -381,34 +428,36 @@ func (w *FileWatch) learnFromEvents(rootPid int, fmod *fileMod, path string, eve
 		return
 	}
 	mode := grp.mode
-	if mode == share.PolicyModeLearn {
-		flt := fmod.finfo.Filter.(*filterRegex)
-		if applyRules, ok := grp.applyRules[flt.path]; ok {
-			learnRules, ok := grp.learnRules[flt.path]
-			if !ok {
-				learnRules = utils.NewSet()
+	if mode == share.PolicyModeLearn && len(fmod.pInfo) > 0 {	// inotify has no process info
+		for _, flt := range grp.profile.Filters {
+			if flt.CustomerAdd && filterPathMatch(path, flt) {
+				addLearnedRules(grp, flt, fmod.pInfo)
 			}
-			for _, pf := range fmod.pInfo {
-				// only use the process name/path as profile
-				if pf != nil && pf.Path != "" {
-					if !applyRules.Contains(pf.Path) && !learnRules.Contains(pf.Path) {
-						learnRules.Add(pf.Path)
-						// mLog.WithFields(log.Fields{"rule": pf.Path, "filter": flt}).Debug("FMON:")
-					}
-				}
+		}
+
+		for _, flt := range grp.profile.FiltersCRD {
+			if flt.CustomerAdd && filterPathMatch(path, flt) {
+				addLearnedRules(grp, flt, fmod.pInfo)
 			}
-			// for inotify, cannot learn
-			if learnRules.Cardinality() > 0 {
-				grp.learnRules[flt.path] = learnRules
-			}
-		} else {
-			log.WithFields(log.Fields{"path": path}).Debug("FMON: no access rules")
 		}
 	}
 	w.mux.Unlock()
 
+	if event == fileEventAttr {
+		// it depends on the init conditions by runtime engine
+		if isRunTimeAddedFile(filepath.Join("/root", path)) {
+			return
+		}
+	}
+
 	if event != fileEventAccessed ||
 		(mode == share.PolicyModeEnforce || mode == share.PolicyModeEvaluate) {
+		if fmod.finfo.Link != "" {
+			path = fmod.finfo.Link
+			if index := strings.Index(path, "/root/"); index > 0 {
+				path = path[index+5:]
+			}
+		}
 		w.sendMsg(fmod.finfo.ContainerId, path, event, fmod.pInfo, mode)
 	}
 }
@@ -468,16 +517,27 @@ func (w *FileWatch) cbNotify(filePath string, mask uint32, params interface{}, p
 	if fm, ok := w.fileEvents[filePath]; ok {
 		fm.mask |= mask
 		fm.delay = 0
-		fm.pInfo = append(fm.pInfo, pInfo)
-	} else {
-		pi := make([]*ProcInfo, 1)
-		pi[0] = pInfo
-		w.fileEvents[filePath] = &fileMod{
-			mask:  mask,
-			delay: 0,
-			finfo: params.(*osutil.FileInfoExt),
-			pInfo: pi,
+		if pInfo != nil {
+			var found bool
+			for _, p := range fm.pInfo {
+				if p.Pid == pInfo.Pid {
+					found = true
+					break
+				}
+			}
+			if !found {
+				fm.pInfo = append(fm.pInfo, pInfo)
+			}
 		}
+	} else {
+		fmod := &fileMod {
+			mask:  mask,
+			finfo: params.(*osutil.FileInfoExt),
+		}
+		if pInfo != nil {
+			fmod.pInfo = append(fmod.pInfo, pInfo)
+		}
+		w.fileEvents[filePath] = fmod
 	}
 }
 
@@ -489,13 +549,13 @@ func (w *FileWatch) addFile(bIncInotify bool, finfo *osutil.FileInfoExt) {
 	w.fanotifier.AddMonitorFile(finfo.Path, finfo.Filter, finfo.Protect, finfo.UserAdded, w.cbNotify, finfo)
 	//if _, path := global.SYS.ParseContainerFilePath(finfo.Path); packageFile.Contains(path) {
 	flt := finfo.Filter.(*filterRegex)
-	if bIncInotify && !strings.HasSuffix(flt.path, "/.*")	{ // this wildcard has established its directory for all
+	if bIncInotify && !strings.HasSuffix(flt.path, "/.*") { // this wildcard has established its directory for all
 		w.inotifier.AddMonitorFile(finfo.Path, w.cbNotify, finfo)
 	}
 }
 
 func (w *FileWatch) removeFile(fullpath string) {
-	w.fanotifier.RemoveMonitorFile(fullpath)		// should not
+	w.fanotifier.RemoveMonitorFile(fullpath) // should not
 	w.inotifier.RemoveMonitorFile(fullpath)
 }
 
@@ -585,7 +645,7 @@ func (w *FileWatch) addCoreFile(bIncINotify bool, cid string, dirList map[string
 		if ok && !isRunTimeAddedFile(finfo.Path) {
 			finfo.Filter = di.Filter
 			di.Children = append(di.Children, finfo)
-		} else  {
+		} else {
 			finfo.ContainerId = cid
 			w.addFile(bIncINotify, finfo)
 		}
@@ -672,14 +732,14 @@ func (w *FileWatch) StartWatch(id string, rootPid int, conf *FsmonConfig, capBlo
 }
 
 func (w *FileWatch) HandleWatchedFiles() {
-	events := make(map[string]*fileMod)
+	events := make(map[string]fileMod)
 
 	// clone events
 	w.mux.Lock()
 	for filePath, fmod := range w.fileEvents {
-		events[filePath] = fmod
-		delete(w.fileEvents, filePath)
+		events[filePath] = *fmod
 	}
+	w.fileEvents = make(map[string]*fileMod) // reset
 	w.mux.Unlock()
 
 	for fullPath, fmod := range events {
@@ -697,6 +757,7 @@ func (w *FileWatch) HandleWatchedFiles() {
 			} else {
 				event = w.handleFileEvents(fmod, info, fullPath, pid)
 			}
+
 			if event != 0 {
 				w.learnFromEvents(pid, fmod, path, event)
 			}
@@ -705,7 +766,7 @@ func (w *FileWatch) HandleWatchedFiles() {
 }
 
 // Decide the directory event priority here
-func (w *FileWatch) handleDirEvents(fmod *fileMod, info os.FileInfo, fullPath, path string, pid int) uint32 {
+func (w *FileWatch) handleDirEvents(fmod fileMod, info os.FileInfo, fullPath, path string, pid int) uint32 {
 	var event uint32
 	// handle files inside directory
 	// log.WithFields(log.Fields{"info": info, "fullPath": fullPath, "path": path, "fmod": fmod}).Debug()
@@ -721,7 +782,7 @@ func (w *FileWatch) handleDirEvents(fmod *fileMod, info os.FileInfo, fullPath, p
 			} else {
 				if bIsDir {
 					event = fileEventDirCreate
-					fmod.finfo.Path = fullPath		// new subdir
+					fmod.finfo.Path = fullPath // new subdir
 					fmod.finfo.FileMode = info.Mode()
 					flt := fmod.finfo.Filter.(*filterRegex)
 					if !flt.recursive {
@@ -729,7 +790,7 @@ func (w *FileWatch) handleDirEvents(fmod *fileMod, info os.FileInfo, fullPath, p
 						return event
 					}
 				} else {
-					if (info.Mode() & os.ModeSymlink != 0) {
+					if info.Mode()&os.ModeSymlink != 0 {
 						// a new symbolic link
 						event = fileEventSymCreate
 						if link_to, err := os.Readlink(fullPath); err == nil {
@@ -747,7 +808,8 @@ func (w *FileWatch) handleDirEvents(fmod *fileMod, info os.FileInfo, fullPath, p
 							}
 						}
 					} else {
-						event = fileEventCreate
+						w.addFile(false, fmod.finfo)
+						return fileEventCreate
 					}
 				}
 			}
@@ -764,7 +826,7 @@ func (w *FileWatch) handleDirEvents(fmod *fileMod, info os.FileInfo, fullPath, p
 		} else if (fmod.mask & syscall.IN_ATTRIB) > 0 {
 			if bIsDir {
 				event = fileEventDirAttr
-			} else{
+			} else {
 				event = fileEventAttr
 			}
 			// fmod.finfo.FileMode: keep its original flag
@@ -777,6 +839,10 @@ func (w *FileWatch) handleDirEvents(fmod *fileMod, info os.FileInfo, fullPath, p
 						event = fileEventModified
 						fmod.finfo.Hash = hash
 					}
+				}
+
+				if (fmod.mask & syscall.IN_MODIFY) > 0 {
+					event = fileEventModified
 				}
 			}
 		} else {
@@ -803,7 +869,7 @@ func (w *FileWatch) handleDirEvents(fmod *fileMod, info os.FileInfo, fullPath, p
 }
 
 // Decide the file event priority here
-func (w *FileWatch) handleFileEvents(fmod *fileMod, info os.FileInfo, fullPath string, pid int) uint32 {
+func (w *FileWatch) handleFileEvents(fmod fileMod, info os.FileInfo, fullPath string, pid int) uint32 {
 	var event uint32
 	if info != nil {
 		log.WithFields(log.Fields{"fullPath": fullPath, "fmod": fmod, "finfo": fmod.finfo}).Debug()
@@ -815,13 +881,16 @@ func (w *FileWatch) handleFileEvents(fmod *fileMod, info os.FileInfo, fullPath s
 			//attribute is changed
 			event = fileEventAttr
 			fmod.finfo.FileMode = info.Mode()
-		} else if (fmod.mask & (syscall.IN_ACCESS|syscall.IN_CLOSE_WRITE)) > 0 {
+		} else if (fmod.mask & (syscall.IN_ACCESS | syscall.IN_CLOSE_WRITE | syscall.IN_MODIFY)) > 0 {
 			// check the hash existing and match
 			event = fileEventAccessed
 			if hash, err := osutil.GetFileHash(fullPath); err == nil {
 				if hash != fmod.finfo.Hash {
 					event = fileEventModified
 					fmod.finfo.Hash = hash
+				}
+				if (fmod.mask & syscall.IN_MODIFY) > 0 {
+					event = fileEventModified
 				}
 			}
 		} else {
@@ -846,8 +915,14 @@ func (w *FileWatch) ContainerCleanup(rootPid int) {
 	}
 	w.fanotifier.ContainerCleanup(rootPid)
 	w.inotifier.ContainerCleanup(rootPid)
+
 	w.mux.Lock()
 	defer w.mux.Unlock()
+	for path, _ := range w.fileEvents {
+		if pid, _ := global.SYS.ParseContainerFilePath(path); pid == rootPid {
+			delete( w.fileEvents, path)
+		}
+	}
 	delete(w.groups, rootPid)
 }
 
@@ -1019,7 +1094,7 @@ func (w *FileWatch) getDirFileList(pid int, base, regexStr, cid string, flt inte
 		}
 		dirs.Remove(any)
 
-		if !recur {	// only 1st layer of directory
+		if !recur { // only 1st layer of directory
 			break
 		}
 	}

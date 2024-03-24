@@ -4,7 +4,6 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"math"
@@ -13,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"errors"
 
 	"github.com/dgrijalva/jwt-go"
 	"github.com/julienschmidt/httprouter"
@@ -35,6 +36,8 @@ type loginSession struct {
 	mainSessionUser string // From master token claim, i.e. master cluster login's fullname. Empty otherwise
 	token           string
 	fullname        string
+	nameid          string // Used by SAML Single Logout
+	sessionIndex    string // Used by SAML Single Logout
 	domain          string
 	server          string
 	timeout         uint32
@@ -45,7 +48,7 @@ type loginSession struct {
 	eolAt           time.Time // end of life
 	timer           *time.Timer
 	domainRoles     access.DomainRole // map: domain -> role
-	loginType       int       // 0=user (default), 1=apikey
+	loginType       int               // 0=user (default), 1=apikey
 
 	nvPage string // could change in every request even in the same login session
 }
@@ -61,6 +64,8 @@ type tokenClaim struct {
 	MainSessionUser string            `json:"main_session_user"` // from fullname in master login token's claim. empty when the token is generated for local cluster login
 	Timeout         uint32            `json:"timeout"`
 	Roles           access.DomainRole `json:"roles"`
+	NameID          string            `json:"nameId,omitempty"`       // Used by SAML Single Logout
+	SessionIndex    string            `json:"sessionIndex,omitempty"` // Used by SAML Single Logout
 	jwt.StandardClaims
 }
 
@@ -83,6 +88,12 @@ type tRancherUser struct {
 	domainRoles access.DomainRole
 }
 
+// Extra information of Single Sign-On session
+type SsoSession struct {
+	SAMLNameID       string
+	SAMLSessionIndex string
+}
+
 var errTokenExpired error = errors.New("token expired")
 var recordFedAuthSessions bool = false                                      // set to true for testing: handlerDumpAuthData
 var loginFedSessions map[string]utils.Set = make(map[string]utils.Set)      // for testing: key is mainSessionID, value is a set of regular tokens
@@ -100,8 +111,20 @@ const jwtIbmSaTokenLife = time.Minute * 30
 const jwtImportStatusTokenLife = time.Minute * 10
 const syncTokenTimerTimeout = time.Duration(120) * time.Second
 
-var jwtPublicKey *rsa.PublicKey
-var jwtPrivateKey *rsa.PrivateKey
+// JWT token related
+type JWTCertificateState struct {
+	jwtPublicKey            *rsa.PublicKey
+	jwtPublicKeyNotAfter    *time.Time
+	jwtPrivateKey           *rsa.PrivateKey
+	jwtOldPublicKey         *rsa.PublicKey // Only used in transition period
+	jwtOldPublicKeyNotAfter *time.Time
+}
+
+var (
+	jwtCertState JWTCertificateState
+	jwtKeyMutex  sync.RWMutex
+)
+
 var jwtLastExpiredTokenSession cluster.SessionInterface
 var jwtLastExpiredTokenSessionCreatedAt time.Time
 
@@ -132,8 +155,18 @@ const (
 	jwtFedMasterTokenType
 )
 
+const loginTypeApikey int = 1
+
 var rancherCookieCache = make(map[string]int64) // key is rancher cookie, value is seconds since the epoch(ValidUntil)
 var rancherCookieMutex sync.RWMutex
+
+var installID *string
+
+func GetJWTSigningKey() JWTCertificateState {
+	jwtKeyMutex.RLock()
+	defer jwtKeyMutex.RUnlock()
+	return jwtCertState
+}
 
 // With userMutex locked when calling this because it does loginSession lookup first
 func newLoginSessionFromToken(token string, claims *tokenClaim, now time.Time) (*loginSession, int) {
@@ -150,6 +183,8 @@ func newLoginSessionFromToken(token string, claims *tokenClaim, now time.Time) (
 		lastAt:          now,
 		eolAt:           time.Unix(claims.ExpiresAt, 0),
 		domainRoles:     claims.Roles,
+		nameid:          claims.NameID,
+		sessionIndex:    claims.SessionIndex,
 	}
 	if rc := _registerLoginSession(s); rc != userOK {
 		updateFedLoginSession(s)
@@ -159,14 +194,10 @@ func newLoginSessionFromToken(token string, claims *tokenClaim, now time.Time) (
 	}
 }
 
-func newLoginSessionFromUser(user *share.CLUSUser, roles access.DomainRole, remote, mainSessionID, mainSessionUser string) (*loginSession, int) {
-	if jwtPrivateKey == nil || jwtPublicKey == nil {
-		if err := jwtReadKeys(); err != nil {
-			return nil, userKeyError
-		}
-	}
+func newLoginSessionFromUser(user *share.CLUSUser, roles access.DomainRole, remote, mainSessionID, mainSessionUser string, sso *SsoSession) (*loginSession, int) {
+	// Note: JWT keys should be loaded in initJWTSignKey() before calling this function.
 
-	id, token, claims := jwtGenerateToken(user, roles, remote, mainSessionID, mainSessionUser)
+	id, token, claims := jwtGenerateToken(user, roles, remote, mainSessionID, mainSessionUser, sso)
 	now := user.LastLoginAt // Already updated
 	s := &loginSession{
 		id:              id,
@@ -185,6 +216,10 @@ func newLoginSessionFromUser(user *share.CLUSUser, roles access.DomainRole, remo
 	// for federal login, give it longer timeout so it doesn't time out as easily as interactive login
 	if mainSessionID != _interactiveSessionID && !strings.HasPrefix(mainSessionID, _rancherSessionPrefix) {
 		s.timeout = s.timeout * 8
+	}
+	if sso != nil {
+		s.nameid = sso.SAMLNameID
+		s.sessionIndex = sso.SAMLSessionIndex
 	}
 
 	var rc int
@@ -530,6 +565,8 @@ func checkRancherUserRole(cfg *api.RESTSystemConfig, rsessToken string, acc *acc
 
 // with userMutex locked when calling this
 func restReq2User(r *http.Request) (*loginSession, int, string) {
+	// Note: JWT keys should be loaded in initJWTSignKey() before calling this function.
+
 	var rsessToken string
 	if localDev.Host.Platform == share.PlatformKubernetes && localDev.Host.Flavor == share.FlavorRancher {
 		if header, ok := r.Header[api.RESTRancherTokenHeader]; ok && len(header) == 1 {
@@ -539,7 +576,7 @@ func restReq2User(r *http.Request) (*loginSession, int, string) {
 
 	token, ok := r.Header[api.RESTTokenHeader]
 	if !ok || len(token) != 1 {
-		// "X-Auth-Token" header not exist, check apikey "X-Auth-Apikey" 
+		// "X-Auth-Token" header not exist, check apikey "X-Auth-Apikey"
 		apikey, ok2 := r.Header[api.RESTAPIKeyHeader]
 		if !ok2 || len(apikey) != 1 {
 			return nil, userInvalidRequest, rsessToken
@@ -560,7 +597,7 @@ func restReq2User(r *http.Request) (*loginSession, int, string) {
 
 				// check timeout
 				now := time.Now()
-				if now.UTC().Unix() >= apikeyAccount.ExpirationTimestamp  {
+				if now.UTC().Unix() >= apikeyAccount.ExpirationTimestamp {
 					return nil, userTimeout, rsessToken
 				}
 
@@ -582,7 +619,7 @@ func restReq2User(r *http.Request) (*loginSession, int, string) {
 					fullname:    apikeyAccount.Name,
 					remote:      r.RemoteAddr,
 					domainRoles: roles,
-					loginType:   1,
+					loginType:   loginTypeApikey,
 				}
 
 				return s, userOK, rsessToken
@@ -590,12 +627,6 @@ func restReq2User(r *http.Request) (*loginSession, int, string) {
 		}
 
 		return nil, userInvalidRequest, rsessToken
-	}
-
-	if jwtPrivateKey == nil || jwtPublicKey == nil {
-		if err := jwtReadKeys(); err != nil {
-			return nil, userKeyError, rsessToken
-		}
 	}
 
 	// Validate token
@@ -669,7 +700,11 @@ func restReq2User(r *http.Request) (*loginSession, int, string) {
 	if !ok {
 		if claims.MainSessionID == "" || strings.HasPrefix(claims.MainSessionID, _rancherSessionPrefix) { // meaning it's not a master token issued by master cluster
 			// Check if the token is from the same "installation"
-			installID, _ := clusHelper.GetInstallationID()
+			installID, err := clusHelper.GetInstallationID()
+			if err != nil {
+				log.WithError(err).Error("failed to get installation ID")
+				return nil, userTimeout, rsessToken
+			}
 			if installID != claims.Subject {
 				log.Debug("Token from different installation")
 				return nil, userTimeout, rsessToken
@@ -873,7 +908,7 @@ func lookupShadowUser(server, username, userid, email, role string, roleDomains 
 	return newUser, true
 }
 
-func loginUser(user *share.CLUSUser, masterRoles access.DomainRole, remote, mainSessionID, mainSessionUser, fedRole string) (*loginSession, int) {
+func loginUser(user *share.CLUSUser, masterRoles access.DomainRole, remote, mainSessionID, mainSessionUser, fedRole string, sso *SsoSession) (*loginSession, int) {
 	// 1. When a cluster is promoted to master cluster, the default admin user is automatically assigned fedAdmin role
 	// 2. When a master cluster is demoted, users with fed role(fedAdmin) are downgraded to with admin/reader role
 	// 3. On master cluster, only users with fedAdmin role can assign fed roles to other users
@@ -899,7 +934,7 @@ func loginUser(user *share.CLUSUser, masterRoles access.DomainRole, remote, main
 		roles[access.AccessDomainGlobal] = user.Role
 	}
 
-	return newLoginSessionFromUser(user, roles, remote, mainSessionID, mainSessionUser)
+	return newLoginSessionFromUser(user, roles, remote, mainSessionID, mainSessionUser, sso)
 }
 
 func compareUserWithLogin(user *share.CLUSUser, login *loginSession) bool {
@@ -1109,38 +1144,6 @@ func changeTimeoutLoginSessions(user *share.CLUSUser) {
 		}
 	}
 }
-
-func rsaReadKeys(certFile, keyFile string) (error, *rsa.PublicKey, *rsa.PrivateKey) {
-	var rsaPublicKey *rsa.PublicKey
-	var rsaPrivateKey *rsa.PrivateKey
-	if certFile != "" {
-		if key, err := ioutil.ReadFile(certFile); err != nil {
-			return err, nil, nil
-		} else if rsaPublicKey, err = jwt.ParseRSAPublicKeyFromPEM(key); err != nil {
-			return err, nil, nil
-		}
-	}
-	if keyFile != "" {
-		if key, err := ioutil.ReadFile(keyFile); err != nil {
-			return err, nil, nil
-		} else if rsaPrivateKey, err = jwt.ParseRSAPrivateKeyFromPEM(key); err != nil {
-			return err, nil, nil
-		}
-	}
-
-	return nil, rsaPublicKey, rsaPrivateKey
-}
-
-func jwtReadKeys() error {
-	var err error
-	err, jwtPublicKey, jwtPrivateKey = rsaReadKeys(defaultSSLCertFile, defaultSSLKeyFile)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 func resetFedJointKeys() {
 	_httpClientMutex.Lock()
 	v, ok := _proxyOptionHistory["rancher"]
@@ -1215,13 +1218,24 @@ func reloadJointPubPrivKey(callerFedRole, clusterID string) {
 	}
 }
 
+// Validate a JWT token.
+// If secret is not specified, default secret and default JWT key will be used.
+// If secret is specified, specified secret and rsaPublicKey/FedJoint JWT key will be used.
 func jwtValidateToken(encryptedToken, secret string, rsaPublicKey *rsa.PublicKey) (*tokenClaim, error) {
 	// rsaPublicKey being non-nil is for validating new public/private keys purpose
 	var tokenString string
 	var publicKey *rsa.PublicKey
+	var alternativeKey *rsa.PublicKey
+
+	jwtCert := GetJWTSigningKey()
+	installID, err := clusHelper.GetInstallationID()
+	if err != nil {
+		log.WithError(err).Error("failed to get installation ID")
+		return nil, fmt.Errorf("failed to get installation ID: %w", err)
+	}
 
 	if secret == "" {
-		tokenString = utils.DecryptUserToken(encryptedToken)
+		tokenString = utils.DecryptUserToken(encryptedToken, []byte(installID))
 	} else {
 		tokenString = utils.DecryptSensitive(encryptedToken, []byte(secret))
 	}
@@ -1229,7 +1243,8 @@ func jwtValidateToken(encryptedToken, secret string, rsaPublicKey *rsa.PublicKey
 		return nil, fmt.Errorf("unrecognized token")
 	}
 	if secret == "" {
-		publicKey = jwtPublicKey
+		publicKey = jwtCert.jwtPublicKey
+		alternativeKey = jwtCert.jwtOldPublicKey
 	} else {
 		if rsaPublicKey == nil {
 			if publicKey = _getFedJointPublicKey(); publicKey == nil {
@@ -1251,8 +1266,26 @@ func jwtValidateToken(encryptedToken, secret string, rsaPublicKey *rsa.PublicKey
 		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
 			return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
 		}
+		if jwtCert.jwtPublicKeyNotAfter != nil && time.Now().After(*jwtCert.jwtPublicKeyNotAfter) {
+			return nil, fmt.Errorf("jwt certificate expired: %v", jwtCert.jwtPublicKeyNotAfter)
+		}
 		return publicKey, nil
 	})
+
+	// Try with old cert if it's available.
+	// Note: Ideally we should use extra info stored in claims to do a lookup below.
+	//       Luckily jwt verification normally only takes a few ms.  We can revisit when we see abnormal performance impact here.
+	if err != nil && alternativeKey != nil {
+		token, err = jwt.ParseWithClaims(tokenString, &tokenClaim{}, func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+				return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+			}
+			if jwtCert.jwtOldPublicKeyNotAfter != nil && time.Now().After(*jwtCert.jwtOldPublicKeyNotAfter) {
+				return nil, fmt.Errorf("jwt certificate expired: %v", jwtCert.jwtOldPublicKeyNotAfter)
+			}
+			return alternativeKey, nil
+		})
+	}
 
 	if err != nil {
 		// if it's a joint cluster and rsa verfication of the token from master cluster fails,
@@ -1295,9 +1328,13 @@ func jwtValidateFedJoinTicket(encryptedTicket, secret string) error {
 	return validateEncryptedData(encryptedTicket, secret, true)
 }
 
-func jwtGenerateToken(user *share.CLUSUser, roles access.DomainRole, remote, mainSessionID, mainSessionUser string) (string, string, *tokenClaim) {
+func jwtGenerateToken(user *share.CLUSUser, roles access.DomainRole, remote, mainSessionID, mainSessionUser string, sso *SsoSession) (string, string, *tokenClaim) {
 	id := utils.GetRandomID(idLength, "")
-	installID, _ := clusHelper.GetInstallationID()
+	installID, err := clusHelper.GetInstallationID()
+	if err != nil {
+		log.WithError(err).Error("failed to get installation ID")
+		return "", "", &tokenClaim{}
+	}
 	now := time.Now()
 	c := tokenClaim{
 		Remote:          remote,
@@ -1317,6 +1354,10 @@ func jwtGenerateToken(user *share.CLUSUser, roles access.DomainRole, remote, mai
 			ExpiresAt: now.Add(jwtTokenLife).Unix(),
 		},
 	}
+	if sso != nil {
+		c.NameID = sso.SAMLNameID
+		c.SessionIndex = sso.SAMLSessionIndex
+	}
 	if r, ok := roles[access.AccessDomainGlobal]; ok && (r == api.UserRoleIBMSA || r == api.UserRoleImportStatus) && len(roles) == 1 {
 		if r == api.UserRoleIBMSA {
 			c.Timeout = uint32(30 * 60) // jwtIbmSaTokenLife, 30 minutes
@@ -1327,9 +1368,15 @@ func jwtGenerateToken(user *share.CLUSUser, roles access.DomainRole, remote, mai
 		}
 	}
 	c.StandardClaims.IssuedAt = now.Add(_halfHourBefore).Unix() // so that token won't be invalidated among controllers because of system time diff & iat
+
+	// Validate token
+	jwtCert := GetJWTSigningKey()
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, c)
-	tokenString, _ := token.SignedString(jwtPrivateKey)
-	return id, utils.EncryptUserToken(tokenString), &c
+	tokenString, err := token.SignedString(jwtCert.jwtPrivateKey)
+	if tokenString == "" || err != nil {
+		log.WithFields(log.Fields{"err": err}).Error()
+	}
+	return id, utils.EncryptUserToken(tokenString, []byte(installID)), &c
 }
 
 func jwtGenFedJoinToken(masterCluster *api.RESTFedMasterClusterInfo, duration time.Duration) []byte {
@@ -1818,13 +1865,22 @@ func platformPasswordAuth(pw *api.RESTAuthPassword) (*share.CLUSUser, error) {
 	return nil, fmt.Errorf("%s user is not authorized", server)
 }
 
-func localPasswordAuth(pw *api.RESTAuthPassword, acc *access.AccessControl) (*share.CLUSUser, bool, bool, bool, int, error) {
-	// returns (user, blockedForFailedLogin, blockedForExpiredPwd, userFound, blockAfterFailedCount, err)
+type tLocalPwdAuthResult struct {
+	blockedForFailedLogin bool
+	blockedForExpiredPwd  bool
+	userFound             bool
+	blockAfterFailedCount int
+	newPwdWeak            bool
+	newPwdError           string
+	pwdProfileBasic       api.RESTPwdProfileBasic
+}
+
+func localPasswordAuth(pw *api.RESTAuthPassword, acc *access.AccessControl) (*share.CLUSUser, tLocalPwdAuthResult, error) {
 	var user *share.CLUSUser
-	var blockAfterFailedCount int
+	var result tLocalPwdAuthResult
 
 	if pw.Username == "" || pw.Username[0] == '~' {
-		return nil, false, false, false, 0, errors.New("User not found")
+		return nil, result, errors.New("User not found")
 	}
 	now := time.Now()
 
@@ -1835,18 +1891,19 @@ func localPasswordAuth(pw *api.RESTAuthPassword, acc *access.AccessControl) (*sh
 
 		user, rev, _ = clusHelper.GetUserRev(pw.Username, acc)
 		if user == nil {
-			return nil, false, false, false, 0, errors.New("User not found")
+			return nil, result, errors.New("User not found")
 		}
 
 		if user.Server != "" {
-			return nil, false, false, false, 0, errors.New("User not found")
+			return nil, result, errors.New("User not found")
 		}
 
+		result.userFound = true
 		origFailedLoginCount := user.FailedLoginCount
 		origBlockLoginSince := user.BlockLoginSince
 		pwdProfile, _ := cacher.GetPwdProfile(share.CLUSSysPwdProfileName)
 		if pwdProfile.EnableBlockAfterFailedLogin {
-			blockAfterFailedCount = pwdProfile.BlockAfterFailedCount
+			result.blockAfterFailedCount = pwdProfile.BlockAfterFailedCount
 		}
 		if pwdProfile.EnableBlockAfterFailedLogin && !user.BlockLoginSince.IsZero() {
 			if time.Now().UTC().Before(user.BlockLoginSince.Add(time.Minute * time.Duration(pwdProfile.BlockMinutes))) {
@@ -1856,8 +1913,8 @@ func localPasswordAuth(pw *api.RESTAuthPassword, acc *access.AccessControl) (*sh
 				}
 				user.BlockLoginSince = time.Now().UTC()
 				clusHelper.PutUserRev(user, rev)
-				return nil, true, false, true, blockAfterFailedCount,
-					fmt.Errorf("User %s is temporarily blocked from login because of too many failed login attempts", pw.Username)
+				result.blockedForFailedLogin = true
+				return nil, result, fmt.Errorf("User %s is temporarily blocked from login because of too many failed login attempts", pw.Username)
 			} else {
 				// user.BlockLoginSince is not zero time but current time is past user.BlockLoginSince
 				// it means this is the 1st time the user tries to login beyond the blocked time window. Giva user a new start for failed login count.
@@ -1873,18 +1930,17 @@ func localPasswordAuth(pw *api.RESTAuthPassword, acc *access.AccessControl) (*sh
 		// Validate password
 		hash := utils.HashPassword(pw.Password)
 		if hash != user.PasswordHash {
-			userBlocked := false
 			if pwdProfile.EnableBlockAfterFailedLogin {
 				user.FailedLoginCount++
 				if int(user.FailedLoginCount) >= pwdProfile.BlockAfterFailedCount {
 					user.BlockLoginSince = time.Now().UTC()
-					userBlocked = true
+					result.blockedForFailedLogin = true
 				}
 			}
 			if user.FailedLoginCount != origFailedLoginCount || user.BlockLoginSince != origBlockLoginSince {
 				clusHelper.PutUserRev(user, rev)
 			}
-			return nil, userBlocked, false, true, blockAfterFailedCount, errors.New("Wrong password")
+			return nil, result, errors.New("Wrong password")
 		} else {
 			if pwdProfile.EnablePwdExpiration && pwdProfile.PwdExpireAfterDays > 0 && !user.PwdResetTime.IsZero() {
 				pwdValidUnit := _pwdValidUnit
@@ -1893,8 +1949,33 @@ func localPasswordAuth(pw *api.RESTAuthPassword, acc *access.AccessControl) (*sh
 				}
 				pwdExpireTime := user.PwdResetTime.Add(time.Duration(time.Minute * pwdValidUnit * time.Duration(pwdProfile.PwdExpireAfterDays)))
 				if now.After(pwdExpireTime) {
-					return nil, false, true, true, blockAfterFailedCount,
-						fmt.Errorf("User %s is blocked from login because of expired password", pw.Username)
+					result.blockedForExpiredPwd = true
+					return nil, result, fmt.Errorf("User %s is blocked from login because of expired password", pw.Username)
+				}
+			}
+
+			if user.ResetPwdInNextLogin {
+				if pw.NewPassword == nil {
+					return user, result, nil
+				}
+				if weak, pwdHistoryToKeep, pwdProfileBasic, e := isWeakPassword(*pw.NewPassword, user.PasswordHash, user.PwdHashHistory, nil); weak {
+					log.WithFields(log.Fields{"create": pw.Username}).Error(e)
+					result.newPwdWeak = true
+					result.newPwdError = e
+					result.pwdProfileBasic = pwdProfileBasic
+					return nil, result, fmt.Errorf("New password is too weak")
+				} else {
+					if pwdHistoryToKeep <= 1 { // because user.PasswordHash remembers one password hash
+						user.PwdHashHistory = nil
+					} else {
+						user.PwdHashHistory = append(user.PwdHashHistory, user.PasswordHash)
+						if i := len(user.PwdHashHistory) - pwdHistoryToKeep; i >= 0 { // len(user.PwdHashHistory) + 1(current password hash) should be <= pwdHistoryToKeep
+							user.PwdHashHistory = user.PwdHashHistory[i+1:]
+						}
+					}
+					user.PasswordHash = utils.HashPassword(*pw.NewPassword)
+					user.PwdResetTime = time.Now().UTC()
+					user.ResetPwdInNextLogin = false
 				}
 			}
 		}
@@ -1920,7 +2001,7 @@ func localPasswordAuth(pw *api.RESTAuthPassword, acc *access.AccessControl) (*sh
 		log.WithFields(log.Fields{"user": user.Username}).Error("Failed to update user in cluster")
 	}
 
-	return user, false, false, true, 0, nil
+	return user, result, nil
 }
 
 func fedMasterTokenAuth(userName, masterToken, secret string) (*share.CLUSUser, *tokenClaim, error) {
@@ -1947,7 +2028,7 @@ func fedMasterTokenAuth(userName, masterToken, secret string) (*share.CLUSUser, 
 			PasswordHash: utils.HashPassword(secret),
 			Domain:       "",
 			Role:         api.UserRoleAdmin, // HiddenFedUser is admin role
-			Timeout:      common.DefaultIdleTimeout,
+			Timeout:      common.DefIdleTimeoutInternal,
 			RoleDomains:  make(map[string][]string),
 			Locale:       common.OEMDefaultUserLocale,
 			PwdResetTime: time.Now().UTC(),
@@ -2093,20 +2174,19 @@ func handlerAuthLogin(w http.ResponseWriter, r *http.Request, ps httprouter.Para
 
 		var errLocalAuth error
 		var localAuthEnabled bool
-		var blockedForFailedLogin, blockedForExpiredPwd, userFound bool
-		var blockAfterFailedCount int
+		var localAuthResult tLocalPwdAuthResult
 
 		servers := getAuthServersInOrder(accReadAll)
 
 		// Succeed if one server authenticates the user
 		for _, cs := range servers {
-			log.WithFields(log.Fields{"server": cs.Name}).Debug("")
+			log.WithFields(log.Fields{"server": cs.Name}).Debug()
 			if cs.Name == api.AuthServerLocal {
 				localAuthEnabled = true
-				if user, blockedForFailedLogin, blockedForExpiredPwd, userFound, blockAfterFailedCount, err = localPasswordAuth(auth.Password, accReadAll); err == nil {
+				if user, localAuthResult, err = localPasswordAuth(auth.Password, accReadAll); err == nil {
 					localAuthed = true
 					break
-				} else if userFound {
+				} else if localAuthResult.userFound {
 					// when a user exists in local & ldap, 'err' will records the ldap auth result. 'errLocalAuth' is for the local auth result
 					errLocalAuth = err
 				}
@@ -2126,7 +2206,7 @@ func handlerAuthLogin(w http.ResponseWriter, r *http.Request, ps httprouter.Para
 		// lock-out in case the remote server is mis-configured
 		if user == nil && !localAuthEnabled && auth.Password.Username == common.DefaultAdminUser {
 			log.Debug("Attempt to login with default admin user")
-			if user, blockedForFailedLogin, blockedForExpiredPwd, userFound, blockAfterFailedCount, err = localPasswordAuth(auth.Password, accReadAll); err != nil {
+			if user, localAuthResult, err = localPasswordAuth(auth.Password, accReadAll); err != nil {
 				log.WithFields(log.Fields{"user": auth.Password.Username, "error": err}).Info()
 			} else {
 				localAuthed = true
@@ -2137,35 +2217,39 @@ func handlerAuthLogin(w http.ResponseWriter, r *http.Request, ps httprouter.Para
 			code := api.RESTErrUnauthorized
 			var ev share.TLogEvent = share.CLUSEvAuthLoginFailed
 			var msg string
-			if userFound {
+			if localAuthResult.userFound {
 				if errLocalAuth != nil {
 					// when a user exists in local & ldap and both auth failed, we adop the errot message from local auth
 					msg = errLocalAuth.Error()
 				} else if err != nil {
 					msg = err.Error()
 				}
-				if blockedForFailedLogin {
+				if localAuthResult.blockedForFailedLogin {
 					ev = share.CLUSEvAuthLoginBlocked
 					code = api.RESTErrUserLoginBlocked
-				} else if blockedForExpiredPwd {
+				} else if localAuthResult.blockedForExpiredPwd {
 					ev = share.CLUSEvAuthLoginBlocked
 					code = api.RESTErrPasswordExpired
 				}
 			}
 			log.WithFields(log.Fields{"user": auth.Password.Username, "msg": msg}).Error("User login failed")
 			authLog(ev, auth.Password.Username, remote, "", nil, msg) // when msg is empty, authLog() will compose the msg
-			restRespError(w, http.StatusUnauthorized, code)
+			if localAuthResult.newPwdWeak {
+				restRespErrorMessageEx(w, http.StatusBadRequest, api.RESTErrWeakPassword, localAuthResult.newPwdError, localAuthResult.pwdProfileBasic)
+			} else {
+				restRespError(w, http.StatusUnauthorized, code)
+			}
 			return
 		} else {
 			// user password passes auth (could be local or remote auth)
-			if !localAuthed && userFound && blockAfterFailedCount > 0 {
+			if !localAuthed && localAuthResult.userFound && localAuthResult.blockAfterFailedCount > 0 {
 				// user password passes remote auth but not local auth(user found in local). do not increase local user's FailedLoginCount
 				retry := 0
 				for retry < retryClusterMax {
 					if user, rev, _ := clusHelper.GetUserRev(auth.Password.Username, accReadAll); user != nil {
 						if user.FailedLoginCount > 0 {
 							user.FailedLoginCount--
-							if user.FailedLoginCount < uint32(blockAfterFailedCount) {
+							if user.FailedLoginCount < uint32(localAuthResult.blockAfterFailedCount) {
 								// case: after restoring user's FailedLoginCount, it doesn't match the "block M minutes after N failed login attemps"
 								user.BlockLoginSince = time.Time{}
 							}
@@ -2191,6 +2275,13 @@ func handlerAuthLogin(w http.ResponseWriter, r *http.Request, ps httprouter.Para
 		mainSessionID = _interactiveSessionID
 	}
 
+	if user != nil && localAuthed && user.ResetPwdInNextLogin {
+		// do not login user when the user needs to reset password first
+		resp := api.RESTTokenData{NeedToResetPassword: true}
+		restRespSuccess(w, r, &resp, nil, nil, nil, "")
+		return
+	}
+
 	var rc int
 	var err error
 	var login *loginSession
@@ -2201,7 +2292,7 @@ func handlerAuthLogin(w http.ResponseWriter, r *http.Request, ps httprouter.Para
 		rc = userInvalidRequest
 	} else {
 		// Login user accounting
-		login, rc = loginUser(user, nil, remote, mainSessionID, "", fedRole)
+		login, rc = loginUser(user, nil, remote, mainSessionID, "", fedRole, nil)
 	}
 	if rc != userOK {
 		if rc == userTimeout {
@@ -2314,7 +2405,7 @@ func handlerFedAuthLogin(w http.ResponseWriter, r *http.Request, ps httprouter.P
 	}
 
 	// Login user accounting
-	login, rc := loginUser(user, claims.Roles, remote, claims.MainSessionID, claims.MainSessionUser, api.FedRoleJoint)
+	login, rc := loginUser(user, claims.Roles, remote, claims.MainSessionID, claims.MainSessionUser, api.FedRoleJoint, nil)
 	if rc != userOK {
 		log.WithFields(log.Fields{"user": auth.JointUsername, "rc": rc}).Error("Fed master login failed")
 		authLog(share.CLUSEvAuthLoginFailed, auth.JointUsername, remote, "", nil, "")
@@ -2377,6 +2468,8 @@ func handlerAuthLoginServer(w http.ResponseWriter, r *http.Request, ps httproute
 	var user *share.CLUSUser
 	var defaultPW bool
 	var localAuthed bool
+	var localAuthResult tLocalPwdAuthResult
+	var sso SsoSession
 
 	if data.Password != nil {
 		if len(data.Password.Password) == 0 {
@@ -2387,11 +2480,10 @@ func handlerAuthLoginServer(w http.ResponseWriter, r *http.Request, ps httproute
 		}
 
 		username := data.Password.Username
-		var blockedForFailedLogin, blockedForExpiredPwd, userFound bool
 
 		log.WithFields(log.Fields{"server": server}).Debug()
 		if server == api.AuthServerLocal {
-			user, blockedForFailedLogin, blockedForExpiredPwd, userFound, _, err = localPasswordAuth(data.Password, accReadAll)
+			user, localAuthResult, err = localPasswordAuth(data.Password, accReadAll)
 			if user != nil && err == nil {
 				localAuthed = true
 			}
@@ -2409,22 +2501,27 @@ func handlerAuthLoginServer(w http.ResponseWriter, r *http.Request, ps httproute
 		}
 
 		if err != nil {
-			log.WithFields(log.Fields{"server": server, "user": data.Password.Username, "blockedLogin": blockedForFailedLogin, "blockedPwd": blockedForExpiredPwd, "error": err}).Error("User login failed")
-			code := api.RESTErrUnauthorized
-			var ev share.TLogEvent = share.CLUSEvAuthLoginFailed
-			var msg string
-			if userFound {
-				msg = err.Error()
-				if blockedForFailedLogin {
-					ev = share.CLUSEvAuthLoginBlocked
-					code = api.RESTErrUserLoginBlocked
-				} else if blockedForExpiredPwd {
-					ev = share.CLUSEvAuthLoginBlocked
-					code = api.RESTErrPasswordExpired
+			log.WithFields(log.Fields{"server": server, "user": data.Password.Username, "blockedLogin": localAuthResult.blockedForFailedLogin,
+				"blockedPwd": localAuthResult.blockedForExpiredPwd, "error": err}).Error("User login failed")
+			if server == api.AuthServerLocal && localAuthResult.newPwdWeak {
+				restRespErrorMessageEx(w, http.StatusBadRequest, api.RESTErrWeakPassword, localAuthResult.newPwdError, localAuthResult.pwdProfileBasic)
+			} else {
+				code := api.RESTErrUnauthorized
+				var ev share.TLogEvent = share.CLUSEvAuthLoginFailed
+				var msg string
+				if localAuthResult.userFound {
+					msg = err.Error()
+					if localAuthResult.blockedForFailedLogin {
+						ev = share.CLUSEvAuthLoginBlocked
+						code = api.RESTErrUserLoginBlocked
+					} else if localAuthResult.blockedForExpiredPwd {
+						ev = share.CLUSEvAuthLoginBlocked
+						code = api.RESTErrPasswordExpired
+					}
 				}
+				authLog(ev, data.Password.Username, remote, "", nil, msg)
+				restRespError(w, http.StatusUnauthorized, code)
 			}
-			authLog(ev, data.Password.Username, remote, "", nil, msg)
-			restRespError(w, http.StatusUnauthorized, code)
 			return
 		}
 
@@ -2445,7 +2542,7 @@ func handlerAuthLoginServer(w http.ResponseWriter, r *http.Request, ps httproute
 		}
 
 		if cs.SAML != nil {
-			attrs, err := remoteAuther.SAMLSPAuth(cs.SAML, data.Token)
+			nameid, sessionIndex, attrs, err := remoteAuther.SAMLSPAuth(cs.SAML, data.Token)
 			if err != nil || attrs == nil {
 				log.WithFields(log.Fields{"server": server, "error": err}).Error("User login failed")
 				authLog(share.CLUSEvAuthLoginFailed, "", remote, "", nil, "")
@@ -2453,7 +2550,7 @@ func handlerAuthLoginServer(w http.ResponseWriter, r *http.Request, ps httproute
 				return
 			}
 
-			log.WithFields(log.Fields{"server": server, "attrs": attrs}).Error("Token validation succeeded")
+			log.WithFields(log.Fields{"server": server, "attrs": attrs}).Debug("Token validation succeeded")
 
 			username, email, groups := getSAMLUserFromAttrs(attrs, cs.SAML.GroupClaim)
 			if username == "" {
@@ -2468,6 +2565,8 @@ func handlerAuthLoginServer(w http.ResponseWriter, r *http.Request, ps httproute
 				restRespError(w, http.StatusUnauthorized, api.RESTErrUnauthorized)
 				return
 			}
+			sso.SAMLNameID = nameid
+			sso.SAMLSessionIndex = sessionIndex
 		} else if cs.OIDC != nil {
 			claims, err := remoteAuther.OIDCAuth(cs.OIDC, data.Token)
 			if err != nil || claims == nil {
@@ -2499,9 +2598,16 @@ func handlerAuthLoginServer(w http.ResponseWriter, r *http.Request, ps httproute
 		}
 	}
 
+	if user != nil && localAuthed && user.ResetPwdInNextLogin {
+		// do not login user when the user needs to reset password first
+		resp := api.RESTTokenData{NeedToResetPassword: true}
+		restRespSuccess(w, r, &resp, nil, nil, nil, "")
+		return
+	}
+
 	fedRole, _ := cacher.GetFedMembershipRole(accReadAll)
 	// Login user accounting
-	login, rc := loginUser(user, nil, remote, _interactiveSessionID, "", fedRole)
+	login, rc := loginUser(user, nil, remote, _interactiveSessionID, "", fedRole, &sso)
 	if rc != userOK {
 		if rc == userTimeout {
 			log.WithFields(log.Fields{"user": user.Fullname}).Error("User login timeout")
@@ -2567,7 +2673,7 @@ func handlerAuthLogout(w http.ResponseWriter, r *http.Request, ps httprouter.Par
 		fedRole, err := cacher.GetFedMembershipRole(acc)
 		if err == nil && fedRole == api.FedRoleMaster {
 			ids := cacher.GetFedJoinedClusterIdMap(acc)
-			for id, _ := range ids {
+			for id := range ids {
 				joinedCluster := cacher.GetFedJoinedCluster(id, acc)
 				if joinedCluster.ID != "" {
 					var token string

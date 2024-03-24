@@ -29,6 +29,8 @@ type mockResponseWriter struct {
 	body   []byte
 }
 
+var ctx Context
+
 func (m *mockResponseWriter) Header() (h http.Header) {
 	return http.Header{}
 }
@@ -408,7 +410,7 @@ func (m *mockCache) GetComplianceProfile(name string, acc *access.AccessControl)
 		}
 
 		// Add checks that are not in the override list
-		_, metaMap := scanUtils.GetComplianceMeta()
+		_, metaMap := scanUtils.InitComplianceMeta("", "", false)
 		for _, m := range metaMap {
 			if _, ok := filter[m.TestNum]; !ok {
 				filter[m.TestNum] = m.Tags
@@ -465,6 +467,14 @@ func (m *mockCache) GetAllControllerRPCEndpoints(acc *access.AccessControl) []*c
 	return []*common.RPCEndpoint{}
 }
 
+func (m *mockCache) GetNewServicePolicyMode() string {
+	return share.PolicyModeLearn
+}
+
+func (m *mockCache) GetNewServiceProfileBaseline() string {
+	return share.ProfileZeroDrift
+}
+
 // --
 
 func mockLoginUser(name, role, fedRole string, roleDomains map[string][]string) *loginSession {
@@ -476,7 +486,7 @@ func mockLoginUser(name, role, fedRole string, roleDomains map[string][]string) 
 		RoleDomains: roleDomains,
 	}
 
-	login, _ := loginUser(user, nil, "", _interactiveSessionID, "", fedRole)
+	login, _ := loginUser(user, nil, "", _interactiveSessionID, "", fedRole, nil)
 	return login
 }
 
@@ -501,6 +511,7 @@ func preTest() {
 }
 
 func initTest() {
+	cctx = &ctx
 	localDev = &common.LocalDevice{
 		Host:   &share.CLUSHost{ID: "h1"},
 		Ctrler: &share.CLUSController{CLUSDevice: share.CLUSDevice{ID: "c1"}},
@@ -508,8 +519,8 @@ func initTest() {
 	evqueue = &cluster.MockEvQueue{}
 
 	// Fake the jwt key pair
-	jwtPrivateKey, _ = rsa.GenerateKey(rand.Reader, 2048)
-	jwtPublicKey = &jwtPrivateKey.PublicKey
+	jwtCertState.jwtPrivateKey, _ = rsa.GenerateKey(rand.Reader, 2048)
+	jwtCertState.jwtPublicKey = &jwtCertState.jwtPrivateKey.PublicKey
 
 	router = httprouter.New()
 	router.GET("/v1/system/config", handlerSystemGetConfig)
@@ -535,6 +546,7 @@ func initTest() {
 	router.PATCH("/v1/server/:name/group/:group", handlerServerGroupRoleDomainsConfig) // For 4.3(+)
 	router.PATCH("/v1/server/:name/groups", handlerServerGroupsOrderConfig)            // For 4.3(+)
 	router.DELETE("/v1/server/:name", handlerServerDelete)
+	router.GET("/v1/token_auth_server/:server/slo", handlerGenerateSLORequest)
 
 	router.POST("/v1/scan/registry", handlerRegistryCreate)
 	router.PATCH("/v1/scan/registry/:name", handlerRegistryConfig)
@@ -728,6 +740,18 @@ func loginServerToken(token, server string) *mockResponseWriter {
 	data := api.RESTAuthData{Token: &api.RESTAuthToken{Token: token}}
 	body, _ := json.Marshal(data)
 	r, _ := http.NewRequest("POST", "/v1/auth/"+server, bytes.NewBuffer(body))
+	router.ServeHTTP(w, r)
+	return w
+}
+
+func loginServerGetSLORedirectURL(token, server string) *mockResponseWriter {
+	w := new(mockResponseWriter)
+	data := api.RESTTokenRedirect{
+		Redirect: "https://localhost/samlslo",
+	}
+	body, _ := json.Marshal(data)
+	r, _ := http.NewRequest("GET", "/v1/token_auth_server/"+server+"/slo", bytes.NewBuffer(body))
+	r.Header.Add("X-Auth-Token", token)
 	router.ServeHTTP(w, r)
 	return w
 }
