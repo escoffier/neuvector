@@ -1661,10 +1661,12 @@ func StartRESTServer() {
 	r.PATCH("/v1/scan/config", handlerScanConfig)
 	r.GET("/v1/scan/config", handlerScanConfigGet)
 	r.GET("/v1/scan/status", handlerScanStatus)
+	r.GET("/v1/scan/cache_stat/:id", handlerScanCacheStat)
+	r.GET("/v1/scan/cache_data/:id", handlerScanCacheData)
 	r.POST("/v1/scan/workload/:id", handlerScanWorkloadReq)
 	r.GET("/v1/scan/workload/:id", handlerScanWorkloadReport)
-	r.GET("/v1/scan/image", handlerScanImageSummary)
-	r.GET("/v1/scan/image/:id", handlerScanImageReport)
+	r.GET("/v1/scan/image", handlerScanImageSummary)    // Returns all workload's scan result summary by images
+	r.GET("/v1/scan/image/:id", handlerScanImageReport) // Returns workload scan result by workload's image ID
 	r.POST("/v1/scan/host/:id", handlerScanHostReq)
 	r.GET("/v1/scan/host/:id", handlerScanHostReport)
 	r.POST("/v1/scan/platform/platform", handlerScanPlatformReq)
@@ -1809,6 +1811,11 @@ func StartRESTServer() {
 	}
 	for {
 		if err := server.ListenAndServeTLS(defaultSSLCertFile, defaultSSLKeyFile); err != nil {
+			if err == http.ErrServerClosed {
+				if cfgmapRetryTimer != nil {
+					cfgmapRetryTimer.Stop()
+				}
+			}
 			log.WithFields(log.Fields{"error": err}).Error("Fail to start SSL rest")
 			time.Sleep(time.Second * 5)
 		} else {
@@ -2077,7 +2084,8 @@ func doExport(filename, exportType string, remoteExportOptions *api.RESTRemoteEx
 
 // api version is always the first path element
 // Ex: /v1/scan/registry
-//      ^^
+//
+//	^^
 func getRequestApiVersion(r *http.Request) ApiVersion {
 	if r.URL == nil || len(r.URL.Path) == 0 {
 		return ApiVersion1

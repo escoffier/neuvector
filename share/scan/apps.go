@@ -26,7 +26,7 @@ const (
 	nodeModules2 = "/usr/local/lib/node_modules"
 	nodeModules  = "node_modules"
 	nodePackage  = "package.json"
-	nodeJs       = "node.js"
+	nodeJs       = "npm"
 
 	wpname           = "Wordpress"
 	WPVerFileSuffix  = "wp-includes/version.php"
@@ -55,12 +55,18 @@ const (
 	dotnetDepsMaxSize = 10 * 1024 * 1024
 
 	golang = "golang"
+
+	// R language
+	rlang           = "r"
+	rDefaultPath    = "usr/lib/R/library/"
+	rDefaultPath2   = "usr/local/lib/R/library/"
+	rRepositoryPath = "usr/local/lib/R/site-library/"
+	rDescFileName   = "DESCRIPTION"
 )
 
 var verRegexp = regexp.MustCompile(`<([a-zA-Z0-9\.]+)>([0-9\.]+)</([a-zA-Z0-9\.]+)>`)
 var pyRegexp = regexp.MustCompile(`/([a-zA-Z0-9_\.]+)-([a-zA-Z0-9\.]+)[\-a-zA-Z0-9\.]*\.(egg-info\/PKG-INFO|dist-info\/WHEEL)$`)
 var rubyRegexp = regexp.MustCompile(`/([a-zA-Z0-9_\-]+)-([0-9\.]+)\.gemspec$`)
-var javaInvalidVendorIds = map[string]bool{"%providerName": true}
 
 type ComposerLock struct {
 	Packages    []ComposerPackage `json:"packages"`
@@ -113,18 +119,17 @@ type dotnetPackage struct {
 }
 
 type ScanApps struct {
-	dedup   utils.Set               // Used by some apps to remove duplicated modules
 	pkgs    map[string][]AppPackage // AppPackage set
 	replace bool
 }
 
 func NewScanApps(v2 bool) *ScanApps {
-	return &ScanApps{pkgs: make(map[string][]AppPackage), dedup: utils.NewSet(), replace: v2}
+	return &ScanApps{pkgs: make(map[string][]AppPackage), replace: v2}
 }
 
 func IsAppsPkgFile(filename, fullpath string) bool {
 	if isNodejs(filename) || IsJava(filename) || isPython(filename) ||
-		isRuby(filename) || isDotNet(filename) || isWordpress(filename) || isPhpComposer(filename) {
+		isRuby(filename) || isDotNet(filename) || isWordpress(filename) || isPhpComposer(filename) || IsRlangPackage(filename) {
 		return true
 	}
 	// Keep golang check at last as it requires reading file data
@@ -171,7 +176,8 @@ func (s *ScanApps) ExtractAppPkg(filename, fullpath string) {
 		s.parseNodePackage(filename, fullpath)
 	} else if IsJava(filename) {
 		if r, err := zip.OpenReader(fullpath); err == nil {
-			s.parseJarPackage(r.Reader, filename, filename, fullpath, 0)
+			dedup := utils.NewSet()
+			s.parseJarPackage(r.Reader, filename, filename, fullpath, 0, dedup)
 			r.Close()
 		} else {
 			log.WithFields(log.Fields{"err": err}).Error("open jar file fail")
@@ -186,6 +192,8 @@ func (s *ScanApps) ExtractAppPkg(filename, fullpath string) {
 		s.parseWordpressPackage(filename, fullpath)
 	} else if isPhpComposer(filename) {
 		s.parsePhpComposerJson(filename, fullpath)
+	} else if IsRlangPackage(filename) {
+		s.parseRLangPackage(filename, fullpath)
 	} else {
 		s.parseGolangPackage(filename, fullpath)
 	}
@@ -343,15 +351,15 @@ func parseJarManifestFile(path string, rc io.Reader) (*AppPackage, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 
+		if len(line) == 0 && lineCount > 0 {
+			// if we reach an empty line, the first section is done
+			break
+		}
 		if !strings.HasPrefix(line, " ") {
 			lineCount++
 			if lineCount > javaMnfstMaxLines {
 				break
 			}
-		}
-		if len(line) == 0 && version != "" && vendorId != "" && title != "" {
-			// if we have all the info and reach an empty line, the first section is done
-			break
 		}
 
 		switch {
@@ -387,25 +395,33 @@ func parseJarManifestFile(path string, rc io.Reader) (*AppPackage, error) {
 		}
 	}
 
-	if len(vendorId) == 0 || javaInvalidVendorIds[vendorId] {
+	if symName != "" {
+		if s := strings.LastIndex(symName, ";"); s > 0 {
+			symName = symName[:s]
+		}
+		if symName == "org.apache.tomcat-embed-core" {
+			// NVSHAS-8730
+			vendorId = "org.apache.tomcat.embed"
+			title = "tomcat-embed-core"
+		} else if symName == "org.postgresql.jdbc" && title == "PostgreSQL JDBC Driver" {
+			// NVSHAS-8757
+			vendorId = "org.postgresql"
+			title = "postgresql"
+		} else if len(vendorId) == 0 || vendorId[0] == '%' || len(title) == 0 || title[0] == '%' {
+			if dot := strings.LastIndex(symName, "."); dot > 0 {
+				vendorId = symName[:dot]
+				title = symName[dot+1:]
+			}
+		}
+	}
+
+	if len(vendorId) == 0 || vendorId[0] == '%' {
 		vendorId = "jar"
 	}
 
 	// Suppress incomplete entries as we can't use them later.
-	if title == "" || version == "" {
-		// log.WithFields(log.Fields{"path": path}).Info("Missing title, vendorId, or version")
-		return nil, errors.New("Unable to parse the package name")
-	}
-
-	// NVSHAS-8730
-	if symName == "org.apache.tomcat-embed-core" {
-		vendorId = "org.apache.tomcat.embed"
-		title = "tomcat-embed-core"
-	}
-	// NVSHAS-8757
-	if symName == "org.postgresql.jdbc" && title == "PostgreSQL JDBC Driver" {
-		vendorId = "org.postgresql"
-		title = "postgresql"
+	if title == "" || title == "jar" || version == "" {
+		return nil, errors.New("Missing title or version")
 	}
 
 	pkg := AppPackage{
@@ -418,8 +434,9 @@ func parseJarManifestFile(path string, rc io.Reader) (*AppPackage, error) {
 	return &pkg, nil
 }
 
-func (s *ScanApps) parseJarPackage(r zip.Reader, tfile, filename, fullpath string, depth int) {
-	tempDir, err := ioutil.TempDir(filepath.Dir(fullpath), "")
+func (s *ScanApps) parseJarPackage(r zip.Reader, origJar, filename, fullpath string, depth int, dedup utils.Set) {
+	// in-memory unzip the jar file then walk through.
+	tempDir, err := ioutil.TempDir("", "")
 	if err == nil {
 		defer os.RemoveAll(tempDir)
 	} else {
@@ -429,24 +446,27 @@ func (s *ScanApps) parseJarPackage(r zip.Reader, tfile, filename, fullpath strin
 	// the real filepath
 	path := filename
 	if depth > 0 {
-		path = tfile + ":" + filename
+		path = origJar + ":" + filename
 	}
 
+	doneWithFileParsing := false
 	pkgs := make(map[string][]AppPackage)
 	for _, f := range r.File {
 		if f.FileInfo().IsDir() {
 			continue
 		}
-		if depth+1 < jarMaxDepth && IsJava(f.Name) {
+		if IsJava(f.Name) {
+			if depth+1 >= jarMaxDepth {
+				continue
+			}
 			// Parse jar file recursively
 			if jarFile, err := f.Open(); err == nil {
-				// Unzip the jar file to disk then walk through. Can we unzip on the fly?
 				dstPath := filepath.Join(tempDir, filepath.Base(f.Name)) // retain the filename
 				if dstFile, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode()); err == nil {
 					if _, err := io.Copy(dstFile, jarFile); err == nil {
 						dstFile.Close()
 						if jarReader, err := zip.OpenReader(dstPath); err == nil {
-							s.parseJarPackage(jarReader.Reader, tfile, f.Name, dstPath, depth+1)
+							s.parseJarPackage(jarReader.Reader, origJar, f.Name, dstPath, depth+1, dedup)
 							jarReader.Close()
 						}
 					} else {
@@ -464,7 +484,7 @@ func (s *ScanApps) parseJarPackage(r zip.Reader, tfile, filename, fullpath strin
 			} else {
 				log.WithFields(log.Fields{"fullpath": fullpath, "filename": filename, "depth": depth, "err": err}).Error("open jar file fail")
 			}
-		} else if strings.HasSuffix(f.Name, javaPOMproperty) {
+		} else if !doneWithFileParsing && strings.HasSuffix(f.Name, javaPOMproperty) {
 			var groupId, version, artifactId string
 			rc, err := f.Open()
 			if err != nil {
@@ -491,7 +511,7 @@ func (s *ScanApps) parseJarPackage(r zip.Reader, tfile, filename, fullpath strin
 
 			rc.Close()
 
-			if groupId == "" || version == "" || artifactId == "" {
+			if groupId == "" || version == "" || artifactId == "" || artifactId == "jar" {
 				log.WithFields(log.Fields{"path": path}).Info("Missing artifactId, groupId, or version")
 				continue
 			}
@@ -502,35 +522,31 @@ func (s *ScanApps) parseJarPackage(r zip.Reader, tfile, filename, fullpath strin
 				ModuleName: fmt.Sprintf("%s:%s", groupId, artifactId),
 				Version:    version,
 			}
-			pkgs[path] = []AppPackage{pkg}
-			continue //higher priority
-		} else if strings.HasSuffix(f.Name, javaManifest) {
+
+			key := fmt.Sprintf("%s-%s-%s", pkg.FileName, pkg.ModuleName, pkg.Version)
+			dedup.Add(key)                 // reference
+			pkgs[path] = []AppPackage{pkg} // higher priority: replace others
+			doneWithFileParsing = true     // No need to parse other manifest files of the same jar file
+		} else if !doneWithFileParsing && strings.HasSuffix(f.Name, javaManifest) {
 			rc, err := f.Open()
 			if err != nil {
 				log.WithFields(log.Fields{"err": err}).Error("open manifest file fail")
 				continue
 			}
-			rc.Close()
 
 			if pkg, err := parseJarManifestFile(path, rc); err == nil {
-				pkgs[path] = []AppPackage{*pkg}
+				key := fmt.Sprintf("%s-%s-%s", pkg.FileName, pkg.ModuleName, pkg.Version)
+				if !dedup.Contains(key) {
+					dedup.Add(key)
+					if _, ok := pkgs[path]; !ok {
+						pkgs[path] = []AppPackage{*pkg}
+					} else {
+						pkgs[path] = append(pkgs[path], *pkg)
+					}
+				}
 			}
-		}
-	}
 
-	// If no package found, use filename
-	if len(pkgs) == 0 && isJavaJar(filename) {
-		fn := filepath.Base(filename)
-		dash := strings.LastIndex(fn, "-")
-		dot := strings.LastIndex(fn, ".")
-		if dash > 0 && dash+1 < dot {
-			pkg := AppPackage{
-				AppName:    jar,
-				ModuleName: fmt.Sprintf("jar:%s", fn[:dash]),
-				Version:    fn[dash+1 : dot],
-				FileName:   path,
-			}
-			pkgs[path] = []AppPackage{pkg}
+			rc.Close()
 		}
 	}
 
@@ -559,6 +575,13 @@ func isPhpComposer(filename string) bool {
 	return strings.HasSuffix(filename, ComposerFile)
 }
 
+func IsRlangPackage(filename string) bool {
+	if filepath.Base(filename) != rDescFileName {
+		return false
+	}
+	return strings.HasPrefix(filename, rDefaultPath) || strings.HasPrefix(filename, rRepositoryPath) || strings.HasPrefix(filename, rDefaultPath2)
+}
+
 func (s *ScanApps) parsePhpComposerJson(filename string, filepath string) {
 	data := ComposerLock{}
 	//extract json data
@@ -583,10 +606,10 @@ func (s *ScanApps) parsePhpComposerJson(filename string, filepath string) {
 			FileName:   filename,
 		}
 		//add each AppPackage to s.pkgs map, append if entry already exists.
-		if _, ok := s.pkgs[appPackage.ModuleName]; !ok {
-			s.pkgs[appPackage.ModuleName] = []AppPackage{appPackage}
+		if _, ok := s.pkgs[filename]; !ok {
+			s.pkgs[filename] = []AppPackage{appPackage}
 		} else {
-			s.pkgs[appPackage.ModuleName] = append(s.pkgs[appPackage.ModuleName], appPackage)
+			s.pkgs[filename] = append(s.pkgs[filename], appPackage)
 		}
 	}
 }
@@ -687,7 +710,7 @@ func (s *ScanApps) parseDotNetPackage(filename, fullpath string) {
 	}
 
 	var coreVersion string
-
+	dedup := utils.NewSet()
 	pkgs := make([]AppPackage, 0)
 	/*
 		// Not reliable
@@ -721,7 +744,10 @@ func (s *ScanApps) parseDotNetPackage(filename, fullpath string) {
 	if targets, ok := dotnet.Targets[dotnet.Runtime.Name]; ok {
 		for target, dep := range targets {
 			// "Microsoft.NETCore.App/3.1.15-servicing.21214.3"
-			if strings.HasPrefix(target, "Microsoft.NETCore.App") || strings.HasPrefix(target, "Microsoft.AspNetCore.App") {
+			// it is possible that there are multiple core versions in different dependencies
+			//    Microsoft.NETCore.App/2.2.8   ==> 2.2.8
+			//    Microsoft.AspNetCore.ApplicationInsights.HostingStartup/2.2.0 ==> 2.2.0 (x)
+			if strings.HasPrefix(target, "Microsoft.NETCore.App/") || strings.HasPrefix(target, "Microsoft.AspNetCore.App/") {
 				if o := strings.Index(target, "/"); o != -1 {
 					version := target[o+1:]
 					if o = strings.Index(version, "-"); o != -1 {
@@ -732,17 +758,15 @@ func (s *ScanApps) parseDotNetPackage(filename, fullpath string) {
 			}
 
 			for app, v := range dep.Deps {
-				pkg := AppPackage{
-					AppName:    ".NET",
-					ModuleName: ".NET:" + app,
-					Version:    v,
-					FileName:   filename,
-				}
-
-				// There can be several files that list the same dependency, such as .NET Core, so to dedup them
-				key := fmt.Sprintf("%s-%s-%s", pkg.AppName, pkg.ModuleName, pkg.Version)
-				if !s.dedup.Contains(key) {
-					s.dedup.Add(key)
+				key := fmt.Sprintf("%s-%s", ".NET:"+app, v)
+				if !dedup.Contains(key) {
+					dedup.Add(key)
+					pkg := AppPackage{
+						AppName:    ".NET",
+						ModuleName: ".NET:" + app,
+						Version:    v,
+						FileName:   filename,
+					}
 					pkgs = append(pkgs, pkg)
 				}
 			}
@@ -750,22 +774,64 @@ func (s *ScanApps) parseDotNetPackage(filename, fullpath string) {
 	}
 
 	if coreVersion != "" {
-		pkg := AppPackage{
-			AppName:    ".NET",
-			ModuleName: ".NET:Core",
-			Version:    coreVersion,
-			FileName:   filename,
-		}
-
-		// There can be several files that list the same dependency, such as .NET Core, so to dedup them
-		key := fmt.Sprintf("%s-%s-%s", pkg.AppName, pkg.ModuleName, pkg.Version)
-		if !s.dedup.Contains(key) {
-			s.dedup.Add(key)
+		key := fmt.Sprintf("%s-%s", ".NET:Core", coreVersion)
+		if !dedup.Contains(key) {
+			dedup.Add(key)
+			pkg := AppPackage{
+				AppName:    ".NET",
+				ModuleName: ".NET:Core",
+				Version:    coreVersion,
+				FileName:   filename,
+			}
 			pkgs = append(pkgs, pkg)
 		}
 	}
 
 	if len(pkgs) > 0 {
 		s.pkgs[filename] = pkgs
+	}
+}
+
+func (s *ScanApps) parseRLangPackage(filename, fullpath string) {
+	if _, err := os.Stat(fullpath); err != nil {
+		log.WithFields(log.Fields{"err": err, "fullpath": fullpath, "filename": filename}).Error("Failed to stat file")
+		return
+	}
+
+	var name, version, repository string
+
+	inputFile, err := os.Open(fullpath)
+	if err != nil {
+		log.WithFields(log.Fields{"err": err, "fullpath": fullpath, "filename": filename}).Debug("Open file fail")
+		return
+	}
+	defer inputFile.Close()
+
+	scanner := bufio.NewScanner(inputFile)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "Package: ") {
+			name = strings.TrimSpace(strings.TrimPrefix(line, "Package: "))
+		} else if strings.HasPrefix(line, "Version: ") {
+			version = strings.TrimSpace(strings.TrimPrefix(line, "Version: "))
+		} else if strings.HasPrefix(line, "Repository:") {
+			repository = strings.TrimSpace(strings.TrimPrefix(line, "Repository: "))
+		}
+	}
+
+	if name != "" {
+		var rname string
+		if repository == "" {
+			rname = name
+		} else {
+			rname = fmt.Sprintf("%s-%s", repository, name)
+		}
+		pkg := AppPackage{
+			AppName:    rlang,
+			ModuleName: strings.ToLower(rname),
+			Version:    version,
+			FileName:   strings.TrimSuffix(filename, "/"+rDescFileName),
+		}
+		s.pkgs[filename] = []AppPackage{pkg}
 	}
 }

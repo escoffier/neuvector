@@ -78,6 +78,20 @@ var scanErrString = []string{
 	share.ScanErrorCode_ScanErrArgument:            "invalid input arguments",
 }
 
+type CacheRecord struct {
+	Layer   string    `json:"layerID,omitempty"`
+	Size    uint64    `json:"size,omitempty"`
+	RefCnt  uint32    `json:"ref_cnt,omitempty"`
+	RefLast time.Time `json:"ref_last,omitempty"`
+}
+
+type CacherData struct {
+	CacheRecords  []CacheRecord `json:"cache_records,omitempty"`
+	MissCnt       uint64        `json:"cache_misses,omitempty"`
+	HitCnt        uint64        `json:"cache_hits,omitempty"`
+	CurRecordSize uint64        `json:"current_record_size"`
+}
+
 func ScanErrorToStr(e share.ScanErrorCode) string {
 	if e >= 0 && int(e) < len(scanErrString) {
 		return scanErrString[e]
@@ -212,8 +226,8 @@ func (s *ScanUtil) GetAppPackages(path string) ([]AppPackage, []byte, share.Scan
 }
 
 func (s *ScanUtil) getContainerAppPkg(pid int) ([]byte, error) {
-	apps := NewScanApps(true)
-	exclDirs := utils.NewSet("bin", "boot", "dev", "proc", "run", "sys", "tmp")
+	apps := NewScanApps(false) // no need to scan the same file twice
+	exclDirs := utils.NewSet("boot", "dev", "proc", "run", "sys")
 	rootPath := s.sys.ContainerFilePath(pid, "/")
 	rootLen := len(rootPath)
 

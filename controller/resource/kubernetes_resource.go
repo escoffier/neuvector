@@ -67,6 +67,7 @@ const (
 	K8sResRbacClusterRoles        = "clusterroles.rbac.authorization.k8s.io"
 	K8sResRbacRolebindings        = "rolebindings.rbac.authorization.k8s.io"
 	K8sResRbacClusterRolebindings = "clusterrolebindings.rbac.authorization.k8s.io"
+	K8sResPersistentVolumeClaims  = "persistentvolumeclaims"
 )
 
 const (
@@ -241,7 +242,7 @@ var rbacApiGroups = utils.NewSet(k8sRbacApiGroup)
 
 var opCreateDelete = utils.NewSet(Create, Update)
 
-var admResForCreateSet = utils.NewSet(K8sResCronjobs, K8sResDaemonsets, K8sResDeployments, K8sResJobs, K8sResPods, K8sResReplicasets, K8sResReplicationControllers, K8sResStatefulSets)
+var admResForCreateSet = utils.NewSet(K8sResCronjobs, K8sResDaemonsets, K8sResDeployments, K8sResJobs, K8sResPods, K8sResReplicasets, K8sResReplicationControllers, K8sResStatefulSets, K8sResPersistentVolumeClaims)
 var admResForUpdateSet = utils.NewSet(K8sResDaemonsets, K8sResDeployments, K8sResReplicationControllers, K8sResStatefulSets, K8sResPods)
 var admRbacResForCreateUpdate1 = utils.NewSet(K8sResRoles, K8sResRolebindings)
 var admRbacResForCreateUpdate2 = utils.NewSet(K8sResClusterRoles, K8sResClusterRolebindings)
@@ -691,6 +692,18 @@ var resourceMakers map[string]k8sResource = map[string]k8sResource{
 			},
 		},
 	},
+	RscTypePersistentVolumeClaim: k8sResource{
+		apiGroup: "",
+		makers: []*resourceMaker{
+			&resourceMaker{
+				"v1",
+				func() k8s.Resource { return new(corev1.PersistentVolumeClaim) },
+				func() k8s.ResourceList { return new(corev1.PersistentVolumeClaimList) },
+				xlatePersistentVolumeClaim,
+				nil,
+			},
+		},
+	},
 }
 
 const (
@@ -854,24 +867,31 @@ func xlatePod(obj k8s.Resource) (string, interface{}) {
 			}
 		}
 
+		r.Containers = make([]Container, 0)
 		if o.Spec != nil {
 			r.Node = o.Spec.GetNodeName()
 			r.HostNet = o.Spec.GetHostNetwork()
 			for _, c := range o.Spec.GetContainers() {
+				var ctr Container
+				ctr.Name = c.GetName()
 				liveness := c.GetLivenessProbe()
 				readiness := c.GetReadinessProbe()
 				if liveness != nil || readiness != nil {
 					if handler := liveness.GetHandler(); handler != nil {
 						if exec := handler.GetExec(); exec != nil {
-							r.LivenessCmds = append(r.LivenessCmds, exec.GetCommand())
+							ctr.LivenessCmds = exec.GetCommand()
 						}
 					}
 					if handler := readiness.GetHandler(); handler != nil {
 						if exec := handler.GetExec(); exec != nil {
-							r.ReadinessCmds = append(r.ReadinessCmds, exec.GetCommand())
+							ctr.ReadinessCmds = exec.GetCommand()
 						}
 					}
 				}
+				if secContext := c.GetSecurityContext(); secContext != nil {
+					ctr.Privileged = secContext.GetPrivileged()
+				}
+				r.Containers = append(r.Containers, ctr)
 			}
 			if r.SA = o.Spec.GetServiceAccountName(); r.SA == "" {
 				r.SA = o.Spec.GetServiceAccount()
@@ -893,13 +913,20 @@ func xlatePod(obj k8s.Resource) (string, interface{}) {
 			}
 
 			if r.Domain != NvAdmSvcNamespace && len(o.Status.ContainerStatuses) > 0 {
-				for _, cs := range o.Status.GetContainerStatuses() {
+				for i, cs := range o.Status.GetContainerStatuses() {
 					if cs != nil {
+						var id string
 						containerID := cs.GetContainerID()
 						for _, prefix := range []string{"docker://", "containerd://", "cri-o://"} {
 							if strings.HasPrefix(containerID, prefix) {
-								r.ContainerIDs = append(r.ContainerIDs, containerID[len(prefix):])
+								id = containerID[len(prefix):]
+								r.ContainerIDs = append(r.ContainerIDs, id)
 							}
+						}
+						if i < len(r.Containers) {
+							r.Containers[i].Id = id
+						} else {
+							log.WithFields(log.Fields{"id": id, "containers": r.Containers}).Error("Not matched")
 						}
 					}
 				}
@@ -1695,7 +1722,7 @@ func (d *kubernetes) GetResource(rt, namespace, name string) (interface{}, error
 	//case RscTypeMutatingWebhookConfiguration:
 	case RscTypeNamespace, RscTypeService, K8sRscTypeClusRole, K8sRscTypeClusRoleBinding, k8sRscTypeRole, k8sRscTypeRoleBinding, RscTypeValidatingWebhookConfiguration,
 		RscTypeCrd, RscTypeConfigMap, RscTypeCrdSecurityRule, RscTypeCrdClusterSecurityRule, RscTypeCrdAdmCtrlSecurityRule, RscTypeCrdDlpSecurityRule, RscTypeCrdWafSecurityRule,
-		RscTypeDeployment, RscTypeReplicaSet, RscTypeStatefulSet, RscTypeCrdNvCspUsage, RscTypeCrdVulnProfile, RscTypeCrdCompProfile:
+		RscTypeDeployment, RscTypeReplicaSet, RscTypeStatefulSet, RscTypeCrdNvCspUsage, RscTypeCrdVulnProfile, RscTypeCrdCompProfile, RscTypePersistentVolumeClaim:
 		return d.getResource(rt, namespace, name)
 	case RscTypePod, RscTypeNode, RscTypeCronJob, RscTypeDaemonSet:
 		if r, err := d.getResource(rt, namespace, name); err == nil {
@@ -1866,7 +1893,8 @@ func (d *kubernetes) SetFlavor(flavor string) error {
 }
 
 // revertCount: how many times the ValidatingWebhookConfiguration resource has been reverted by this controller.
-//              if it's >= 1, do not revert the ValidatingWebhookConfiguration resource just becuase of unknown matchExpressions keys
+//
+//	if it's >= 1, do not revert the ValidatingWebhookConfiguration resource just becuase of unknown matchExpressions keys
 func IsK8sNvWebhookConfigured(whName, failurePolicy string, wh *K8sAdmRegWebhook, checkNsSelector bool, revertCount *uint32,
 	unexpectedMatchKeys utils.Set) bool {
 
@@ -2126,4 +2154,8 @@ func getNeuvectorSvcAccount(resInfo map[string]string) {
 		log.WithFields(log.Fields{"name": objName, "sa": sa}).Info()
 		continue
 	}
+}
+
+func xlatePersistentVolumeClaim(obj k8s.Resource) (string, interface{}) {
+	return "", nil
 }

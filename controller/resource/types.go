@@ -46,6 +46,7 @@ const (
 	RscTypeDaemonSet                      = "daemonset"
 	RscTypeReplicaSet                     = "replicaset"
 	RscTypeStatefulSet                    = "statefulset"
+	RscTypePersistentVolumeClaim          = "persistentvolumeclaims"
 )
 
 const (
@@ -64,8 +65,8 @@ const (
 const RscCspUsageName = "neuvector-usage"
 
 // ValidatingWebhookConfiguration resource instance (neuvector-validating-admission-webhook) contains 2 webhooks:
-// 	1. neuvector-validating-admission-webhook.neuvector.svc
-// 	2. neuvector-validating-status-webhook.neuvector.svc
+//  1. neuvector-validating-admission-webhook.neuvector.svc
+//  2. neuvector-validating-status-webhook.neuvector.svc
 var NvAdmMutatingName = "neuvector-mutating-admission-webhook"     // ValidatingWebhookConfiguration resource instance metadata name
 var NvAdmValidatingName = "neuvector-validating-admission-webhook" // ValidatingWebhookConfiguration resource instance metadata name
 var NvCrdValidatingName = "neuvector-validating-crd-webhook"       // ValidatingWebhookConfiguration resource instance metadata name
@@ -111,22 +112,29 @@ type Service struct {
 	ExternalIPs []net.IP
 }
 
-type Pod struct {
-	UID           string
+type Container struct {
+	Id            string
 	Name          string
-	Domain        string
-	Node          string
-	IPNet         net.IPNet
-	HostNet       bool
-	Running       bool
-	OwnerUID      string
-	OwnerName     string
-	OwnerType     string
-	LivenessCmds  [][]string
-	ReadinessCmds [][]string
-	SA            string   // service account of this pod
-	ContainerIDs  []string // all workload id
-	Labels        map[string]string
+	Privileged    bool
+	LivenessCmds  []string
+	ReadinessCmds []string
+}
+
+type Pod struct {
+	UID          string
+	Name         string
+	Domain       string
+	Node         string
+	IPNet        net.IPNet
+	HostNet      bool
+	Running      bool
+	OwnerUID     string
+	OwnerName    string
+	OwnerType    string
+	Containers   []Container
+	SA           string   // service account of this pod
+	ContainerIDs []string // all workload id
+	Labels       map[string]string
 }
 
 type Deployment struct {

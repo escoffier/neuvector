@@ -3319,7 +3319,7 @@ func (h *nvCrdHandler) crdDeleteRecordEx(kvCrdKind, recordName, profileName stri
 	}
 }
 
-//// utility functions for process and file profiles
+// utility functions for process and file profiles
 func (h *nvCrdHandler) crdGetProcessRules(profile *api.RESTProcessProfile) []share.CLUSCrdProcessRule {
 	rules := make([]share.CLUSCrdProcessRule, 0)
 	for _, proc := range profile.ProcessList {
@@ -3798,6 +3798,8 @@ func CrossCheckCrd(kind, rscType, kvCrdKind, lockKey string, kvOnly bool) error 
 		var mdNameDisplay string
 		var recordName string
 		var metaData *cmetav1.ObjectMeta
+		var gfwRule resource.NvSecurityRule
+		var objOrig interface{}
 
 		switch kind {
 		case resource.NvSecurityRuleKind:
@@ -3835,6 +3837,12 @@ func CrossCheckCrd(kind, rscType, kvCrdKind, lockKey string, kvOnly bool) error 
 		if crdMd5, _, _, skip, _ = crdHandler.getCrInfo(kind, obj, metaData); skip {
 			continue
 		}
+		if kind == resource.NvClusterSecurityRuleKind {
+			objOrig = obj
+			r := obj.(*resource.NvClusterSecurityRule)
+			gfwRule = resource.NvSecurityRule(*r)
+			obj = &gfwRule
+		}
 		if !crdHandler.AcquireLock(clusterLockWait) {
 			continue
 		}
@@ -3844,7 +3852,12 @@ func CrossCheckCrd(kind, rscType, kvCrdKind, lockKey string, kvOnly bool) error 
 				log.WithFields(log.Fields{"error": errMsg, "name": mdNameDisplay}).Error()
 				e := fmt.Sprintf("%s deleted due to error: %s", mdNameDisplay, errMsg)
 				deleted = append(deleted, e)
-				global.ORCH.DeleteResource(rscType, obj)
+				if kind == resource.NvClusterSecurityRuleKind {
+					obj = objOrig
+				}
+				if err := global.ORCH.DeleteResource(rscType, obj); err != nil {
+					log.WithFields(log.Fields{"rscType": rscType, "name": gfwRule.Metadata.GetName(), "err": err}).Error()
+				}
 			}
 		} else {
 			switch kind {

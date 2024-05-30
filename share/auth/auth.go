@@ -64,12 +64,14 @@ type remoteAuth struct {
 
 const defaultLDAPAuthTimeout = time.Second * 10
 const oidcUserInfoTimeout = time.Duration(time.Second * 20)
+const oidcGroupInfoTimeout = time.Duration(time.Second * 20)
 
 // 1. Refer to https://github.com/grafana/grafana/issues/2441 about why we set UseSSL and SkipTLS this way
 // 2. When running in a container, use --env LDAP_TLS_VERIFY_CLIENT=try to disable client certificate validation
 func (a *remoteAuth) LDAPAuth(cldap *share.CLUSServerLDAP, username, password string) (map[string]string, []string, error) {
 	client := &LDAPClient{
-		Base:               cldap.BaseDN,
+		BaseDN:             cldap.BaseDN,
+		GroupDN:            cldap.GroupDN,
 		Host:               cldap.Hostname,
 		Port:               int(cldap.Port),
 		UseSSL:             cldap.SSL,
@@ -80,6 +82,10 @@ func (a *remoteAuth) LDAPAuth(cldap *share.CLUSServerLDAP, username, password st
 		Attributes:         []string{"dn", "gidNumber"},
 		Timeout:            defaultLDAPAuthTimeout,
 	}
+	if client.GroupDN == "" {
+		client.GroupDN = cldap.BaseDN
+	}
+
 	defer client.Close()
 
 	username = ldap.EscapeFilter(username)
@@ -401,6 +407,17 @@ func (a *remoteAuth) OIDCAuth(coidc *share.CLUSServerOIDC, tokenData *api.RESTAu
 	if err2 != nil {
 		log.WithFields(log.Fields{"error": err2}).Error("Failed on UserInfo request")
 		return claims, err
+	}
+
+	// Check group info
+	if claims["groups"] == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), oidcGroupInfoTimeout)
+		defer cancel()
+		if groups, err := oidc.GetAzureGroupInfo(ctx, claims, oauth2.StaticTokenSource(token)); err != nil {
+			log.WithError(err).Debug("oidc: failed to fallback to distrubited group info")
+		} else {
+			claims["groups"] = groups
+		}
 	}
 
 	// Merge claims from UserInfo call
